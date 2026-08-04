@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "todo": {
+      "command": "sh",
+      "args": ["-c", "exec node \"$PLUGIN_ROOT/scripts/mcp-server.mjs\""]
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "scabr",
+  "interface": {
+    "displayName": "Scabr"
+  },
+  "plugins": [
+    {
+      "name": "todo",
+      "source": {
+        "source": "local",
+        "path": "./plugins/todo"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Run"
+  short_description: "Run a task interactively in the current thread"
+  default_prompt: "Use $todo:run to execute the referenced ToDo task in this thread."
+policy:
+  allow_implicit_invocation: true

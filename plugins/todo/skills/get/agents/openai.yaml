@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Get"
+  short_description: "Inspect one queued or completed task"
+  default_prompt: "Use $todo:get to inspect a specific ToDo task."
+policy:
+  allow_implicit_invocation: false

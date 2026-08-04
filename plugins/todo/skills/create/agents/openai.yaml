@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Create"
+  short_description: "Create a queued implementation task"
+  default_prompt: "Use $todo:create to queue this implementation task."
+policy:
+  allow_implicit_invocation: false

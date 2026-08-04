@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Status"
+  short_description: "Show complete task and worker status"
+  default_prompt: "Use $todo:status to show the current ToDo state."
+policy:
+  allow_implicit_invocation: false

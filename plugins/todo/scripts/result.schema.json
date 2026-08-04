@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["completed", "failed"]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "validation": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "requiresInteractive": {
+      "type": "boolean"
+    },
+    "interactiveReason": {
+      "anyOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ]
+    },
+    "externalSync": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "properties": {
+          "service": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          },
+          "resourceId": { "type": "string", "minLength": 1 },
+          "startedStatus": { "type": "string", "minLength": 1 },
+          "finalStatus": { "type": "string", "minLength": 1 },
+          "commentId": { "type": "string", "minLength": 1 },
+          "commentUrl": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 8000,
+                "pattern": "^https?://"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "commentText": { "type": "string", "minLength": 1 },
+          "aiDisclosure": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "required": [
+          "service",
+          "resourceId",
+          "startedStatus",
+          "finalStatus",
+          "commentId",
+          "commentUrl",
+          "commentText",
+          "aiDisclosure"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "externalSyncError": {
+      "anyOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ]
+    }
+  },
+  "required": [
+    "status",
+    "summary",
+    "error",
+    "validation",
+    "requiresInteractive",
+    "interactiveReason",
+    "externalSync",
+    "externalSyncError"
+  ],
+  "additionalProperties": false
+}

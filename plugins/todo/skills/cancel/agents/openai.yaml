@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Cancel"
+  short_description: "Cancel an unclaimed queued or failed task"
+  default_prompt: "Use $todo:cancel to cancel a ToDo task."
+policy:
+  allow_implicit_invocation: false

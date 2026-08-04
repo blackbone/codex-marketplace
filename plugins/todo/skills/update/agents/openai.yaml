@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Update"
+  short_description: "Revise an existing unclaimed task"
+  default_prompt: "Use $todo:update to revise a specific ToDo task."
+policy:
+  allow_implicit_invocation: false

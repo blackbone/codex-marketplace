@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Retry"
+  short_description: "Retry a failed task after its error is fixed"
+  default_prompt: "Use $todo:retry to retry a failed ToDo task."
+policy:
+  allow_implicit_invocation: false

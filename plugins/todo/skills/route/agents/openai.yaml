@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Route"
+  short_description: "Route repository mutations through ToDo"
+  default_prompt: "Use $todo:route to route this repository change through ToDo."
+policy:
+  allow_implicit_invocation: true

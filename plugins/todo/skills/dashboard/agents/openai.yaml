@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Dashboard"
+  short_description: "Show the local task dashboard URL"
+  default_prompt: "Use $todo:dashboard to show the ToDo dashboard URL."
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,11 @@
+{
+  "name": "scabr-codex-plugins",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "npm run test:contract && npm run test:smoke",
+    "test:contract": "node --test tests/*.test.mjs",
+    "test:smoke": "node plugins/todo/scripts/smoke-test.mjs"
+  }
+}

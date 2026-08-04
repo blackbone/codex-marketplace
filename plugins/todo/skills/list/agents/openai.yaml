@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo List"
+  short_description: "List queued and recently closed tasks"
+  default_prompt: "Use $todo:list to list ToDo tasks."
+policy:
+  allow_implicit_invocation: false

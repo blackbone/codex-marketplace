@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Stop"
+  short_description: "Stop the local ToDo background runner"
+  default_prompt: "Use $todo:stop to stop ToDo for this repository."
+policy:
+  allow_implicit_invocation: false

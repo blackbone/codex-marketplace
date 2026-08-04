@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Workers"
+  short_description: "List background worker states and assignments"
+  default_prompt: "Use $todo:workers to list ToDo worker states."
+policy:
+  allow_implicit_invocation: false

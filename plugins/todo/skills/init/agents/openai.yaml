@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Init"
+  short_description: "Initialize durable ToDo repository routing"
+  default_prompt: "Use $todo:init to initialize durable ToDo routing in this Git repository."
+policy:
+  allow_implicit_invocation: false
