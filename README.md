@@ -1,40 +1,74 @@
-# scabr Codex plugins
+# blackbone Codex plugins
 
-Git-backed Codex marketplace for plugins maintained by scabr.
+A Git-backed Codex marketplace for plugins maintained by [blackbone](https://github.com/blackbone).
 
-## Install from GitHub
+[![Tests](https://github.com/blackbone/codex-marketplace/actions/workflows/test.yml/badge.svg)](https://github.com/blackbone/codex-marketplace/actions/workflows/test.yml)
 
-After this repository is pushed to GitHub:
+## Plugins
+
+| Plugin | What it does | Package |
+| --- | --- | --- |
+| ToDo | Durable repository task routing, background workers, execution history, and external-workflow synchronization. | [Documentation](plugins/todo/README.md) |
+
+![ToDo plugin details](plugins/todo/assets/screenshots/plugin-details.png)
+
+## Install
+
+From GitHub:
 
 ```bash
-codex plugin marketplace add <owner>/codex-plugins --ref main
-codex plugin add todo@scabr
+codex plugin marketplace add blackbone/codex-marketplace --ref main
+codex plugin add todo@blackbone
 ```
 
-For a private repository, use an HTTPS or SSH Git URL that works with the
-recipient's existing Git credentials.
-
-## Install from this checkout
+For a private repository, use an HTTPS or SSH Git URL available through the
+recipient's existing Git credentials. To install directly from a checkout:
 
 ```bash
-cd /path/to/codex-plugins
+git clone git@github.com:blackbone/codex-marketplace.git
+cd codex-marketplace
 codex plugin marketplace add .
-codex plugin add todo@scabr
+codex plugin add todo@blackbone
 ```
 
-## Update
+Update the marketplace and reinstall a plugin with:
 
 ```bash
-codex plugin marketplace upgrade scabr
-codex plugin add todo@scabr
+codex plugin marketplace upgrade blackbone
+codex plugin add todo@blackbone
 ```
 
-## Test
+## Repository layout
+
+```text
+.agents/plugins/marketplace.json  Marketplace catalog
+plugins/<name>/                   Self-contained plugin packages
+docs/ARCHITECTURE.md              Packaging and runtime boundaries
+tests/                            Marketplace contract tests
+```
+
+Each plugin owns its manifest, documentation, screenshots, skills, servers,
+hooks, and runtime code. The root README is only the marketplace index.
+
+## Development
+
+Requirements: Node.js 22 or newer, Git, and the Codex CLI.
 
 ```bash
-npm test
+make test
 ```
 
-The test suite validates the marketplace/package contract and runs the ToDo
-runtime smoke test, including its MCP tools, routing, task lifecycle, retries,
-metrics, dashboard, hooks, and external-workflow behavior.
+Individual targets are available as `make test-contract` and
+`make test-smoke`. GitHub Actions runs the same `make test` entry point on every
+push to `main`, pull request, and manual dispatch.
+
+The suite validates the marketplace and documentation contracts, then runs the
+ToDo runtime smoke test across MCP tools, task lifecycle, retries, metrics,
+dashboard, hooks, and external-workflow behavior.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), [repository architecture](docs/ARCHITECTURE.md),
+and [AGENTS.md](AGENTS.md) before changing a package.
+
+## License
+
+[MIT](LICENSE)
