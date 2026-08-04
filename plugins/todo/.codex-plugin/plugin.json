@@ -1,6 +1,6 @@
 {
   "name": "todo",
-  "version": "0.1.0+codex.20260804132009",
+  "version": "0.1.0+codex.20260804115237",
   "description": "Durable repository and external-workflow routing through mode-independent ToDo tasks.",
   "author": {
     "name": "blackbone"

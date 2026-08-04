@@ -302,6 +302,42 @@ function taskBlockerNumbers(task) {
   return (task.blockers || task.existingBlockers || []).map(taskNumber);
 }
 
+function dashboardStatus(status) {
+  return status === "canceled" || status === "cancelled" ? "rejected" : status || "";
+}
+
+function filterAlternatives(value) {
+  const normalized = String(value || "").trim();
+  const unwrapped =
+    normalized.startsWith("(") && normalized.endsWith(")")
+      ? normalized.slice(1, -1)
+      : normalized;
+  const alternatives = unwrapped
+    .split("|")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return alternatives.length > 0 ? alternatives : [""];
+}
+
+function blockerTask(tasks, blocker) {
+  const direct = tasks.find((task) => task.id === blocker);
+  if (direct) return direct;
+  const number = taskNumber(blocker);
+  const matches = tasks.filter((task) => taskNumber(task.id) === number);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function blockerLinks(task, tasks) {
+  return (task.blockers || task.existingBlockers || [])
+    .map((blocker) => {
+      const number = taskNumber(blocker);
+      const target = blockerTask(tasks, blocker);
+      if (!target?.path) return escapeHtml(number);
+      return `<a href="/api/task?task=${encodeURIComponent(target.id)}" target="_blank" rel="noopener" data-blocker-task="${escapeHtml(target.id)}" title="Open ${escapeHtml(target.id)}.md">${escapeHtml(number)}</a>`;
+    })
+    .join(", ");
+}
+
 function compactDuration(durationMs) {
   const totalSeconds = Math.max(0, Math.round((Number(durationMs) || 0) / 1000));
   const units = [
@@ -372,7 +408,7 @@ function taskFilterValue(task, field) {
     case "title":
       return task.title || "";
     case "status":
-      return task.status || "";
+      return dashboardStatus(task.status);
     case "worker":
       return task.workerId ?? "";
     case "profile":
@@ -406,7 +442,7 @@ function taskSearchText(task) {
     task.id,
     taskNumber(task.id),
     task.title,
-    task.status,
+    dashboardStatus(task.status),
     task.workerId,
     task.execution?.modelProfile,
     ...(task.existingBlockers || task.blockers || []),
@@ -429,9 +465,10 @@ function filterTasks(tasks, query) {
       const field = separator > 0 ? token.slice(0, separator).toLowerCase() : "";
       const value = separator > 0 ? token.slice(separator + 1) : token;
       if (field && FILTER_FIELDS.has(field)) {
-        return String(taskFilterValue(task, field))
-          .toLowerCase()
-          .includes(value.toLowerCase());
+        const fieldValue = String(taskFilterValue(task, field)).toLowerCase();
+        return filterAlternatives(value).some((alternative) =>
+          fieldValue.includes(alternative.toLowerCase()),
+        );
       }
       return searchText.includes(token.toLowerCase());
     });
@@ -494,6 +531,32 @@ const DASHBOARD_SCRIPT = `(() => {
     return (task.blockers || task.existingBlockers || []).map(taskNumber);
   }
 
+  function dashboardStatus(status) {
+    return status === "canceled" || status === "cancelled"
+      ? "rejected"
+      : status || "";
+  }
+
+  function filterAlternatives(value) {
+    const normalized = String(value || "").trim();
+    const unwrapped = normalized.startsWith("(") && normalized.endsWith(")")
+      ? normalized.slice(1, -1)
+      : normalized;
+    const alternatives = unwrapped
+      .split("|")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    return alternatives.length > 0 ? alternatives : [""];
+  }
+
+  function blockerTask(tasks, blocker) {
+    const direct = tasks.find((task) => task.id === blocker);
+    if (direct) return direct;
+    const number = taskNumber(blocker);
+    const matches = tasks.filter((task) => taskNumber(task.id) === number);
+    return matches.length === 1 ? matches[0] : null;
+  }
+
   function compactDuration(durationMs) {
     const totalSeconds = Math.max(
       0,
@@ -548,7 +611,7 @@ const DASHBOARD_SCRIPT = `(() => {
       case "title":
         return task.title || "";
       case "status":
-        return task.status || "";
+        return dashboardStatus(task.status);
       case "worker":
         return task.workerId ?? "";
       case "profile":
@@ -587,7 +650,7 @@ const DASHBOARD_SCRIPT = `(() => {
       task.id,
       taskNumber(task.id),
       task.title,
-      task.status,
+      dashboardStatus(task.status),
       task.workerId,
       task.execution?.modelProfile,
       ...(task.existingBlockers || task.blockers || []),
@@ -612,9 +675,10 @@ const DASHBOARD_SCRIPT = `(() => {
           : "";
         const value = separator > 0 ? token.slice(separator + 1) : token;
         if (field && filterFields.has(field)) {
-          return String(taskFilterValue(task, field))
-            .toLowerCase()
-            .includes(value.toLowerCase());
+          const fieldValue = String(taskFilterValue(task, field)).toLowerCase();
+          return filterAlternatives(value).some((alternative) =>
+            fieldValue.includes(alternative.toLowerCase()),
+          );
         }
         return searchText.includes(token.toLowerCase());
       });
@@ -643,10 +707,37 @@ const DASHBOARD_SCRIPT = `(() => {
       : rawValue;
     const clause = field + ":" + formattedValue;
     const current = filterInput.value.trim();
-    const duplicate = filterTokens(current).some(
+    const tokens = filterTokens(current);
+    const duplicate = tokens.some(
       (token) => token.toLowerCase() === clause.toLowerCase(),
     );
-    setFilter(duplicate ? current : [current, clause].filter(Boolean).join(" "));
+    if (field === "status" || field === "profile") {
+      const alternatives = [];
+      let insertAt = -1;
+      const remaining = [];
+      for (const token of tokens) {
+        const separator = token.indexOf(":");
+        const tokenField = separator > 0
+          ? token.slice(0, separator).toLowerCase()
+          : "";
+        if (tokenField === field) {
+          if (insertAt < 0) insertAt = remaining.length;
+          alternatives.push(...filterAlternatives(token.slice(separator + 1)));
+        } else {
+          remaining.push(token);
+        }
+      }
+      if (!alternatives.some(
+        (alternative) => alternative.toLowerCase() === rawValue.toLowerCase(),
+      )) {
+        alternatives.push(rawValue);
+      }
+      const mergedClause = field + ":" + alternatives.join("|");
+      remaining.splice(insertAt < 0 ? remaining.length : insertAt, 0, mergedClause);
+      setFilter(remaining.join(" "));
+    } else {
+      setFilter(duplicate ? current : [current, clause].filter(Boolean).join(" "));
+    }
     filterInput.focus();
   }
 
@@ -815,7 +906,7 @@ const DASHBOARD_SCRIPT = `(() => {
     }
   }
 
-  function taskRow(task) {
+  function taskRow(task, allTasks) {
     const row = document.createElement("tr");
     row.dataset.taskId = task.id;
     const idCell = document.createElement("td");
@@ -836,12 +927,13 @@ const DASHBOARD_SCRIPT = `(() => {
     const statusCell = document.createElement("td");
     const status = document.createElement("button");
     status.type = "button";
-    const safeStatus = String(task.status || "").replace(/[^a-z0-9_-]/gi, "");
+    const displayStatus = dashboardStatus(task.status);
+    const safeStatus = displayStatus.replace(/[^a-z0-9_-]/gi, "");
     status.className = "filter-token status status-" + safeStatus;
     status.dataset.filterField = "status";
-    status.dataset.filterValue = task.status || "";
+    status.dataset.filterValue = displayStatus;
     status.title = "Add status filter";
-    status.textContent = task.status || "";
+    status.textContent = displayStatus;
     statusCell.append(status);
     row.append(statusCell);
 
@@ -859,7 +951,25 @@ const DASHBOARD_SCRIPT = `(() => {
       profileCell.append(profileButton);
     }
     row.append(profileCell);
-    row.append(cell(taskBlockerNumbers(task).join(", ")));
+    const blockersCell = document.createElement("td");
+    const blockers = task.blockers || task.existingBlockers || [];
+    blockers.forEach((blocker, index) => {
+      if (index > 0) blockersCell.append(", ");
+      const target = blockerTask(allTasks, blocker);
+      if (target?.path) {
+        const link = document.createElement("a");
+        link.href = "/api/task?task=" + encodeURIComponent(target.id);
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.dataset.blockerTask = target.id;
+        link.title = "Open " + target.id + ".md";
+        link.textContent = taskNumber(blocker);
+        blockersCell.append(link);
+      } else {
+        blockersCell.append(taskNumber(blocker));
+      }
+    });
+    row.append(blockersCell);
     row.append(cell(formatTimestamp(task.updatedAt || task.closedAt), "time"));
     row.append(cell(formatTimestamp(task.metrics?.startedAt), "time"));
     row.append(cell(formatTimestamp(task.metrics?.completedAt), "time"));
@@ -910,7 +1020,7 @@ const DASHBOARD_SCRIPT = `(() => {
       row.append(empty);
       fragment.append(row);
     } else {
-      for (const task of tasks) fragment.append(taskRow(task));
+      for (const task of tasks) fragment.append(taskRow(task, allTasks));
     }
 
     const scrollX = window.scrollX;
@@ -1240,15 +1350,16 @@ function renderDashboard(repoRoot, requestUrl) {
       const idMarkup = task.path
         ? `<a href="/api/task?task=${encodeURIComponent(task.id)}" target="_blank" rel="noopener" title="Open ${escapeHtml(task.id)}.md">${escapeHtml(id)}</a>`
         : escapeHtml(id);
-      const safeStatus = String(task.status || "").replace(/[^a-z0-9_-]/gi, "");
+      const displayStatus = dashboardStatus(task.status);
+      const safeStatus = displayStatus.replace(/[^a-z0-9_-]/gi, "");
       const profile = task.execution?.modelProfile || "";
       return `<tr>
   <td>${idMarkup}</td>
   <td>${escapeHtml(task.title)}</td>
-  <td><button type="button" class="filter-token status status-${escapeHtml(safeStatus)}" data-filter-field="status" data-filter-value="${escapeHtml(task.status)}" title="Add status filter">${escapeHtml(task.status)}</button></td>
+  <td><button type="button" class="filter-token status status-${escapeHtml(safeStatus)}" data-filter-field="status" data-filter-value="${escapeHtml(displayStatus)}" title="Add status filter">${escapeHtml(displayStatus)}</button></td>
   <td>${escapeHtml(task.workerId ?? "")}</td>
   <td>${profile ? `<button type="button" class="filter-token" data-filter-field="profile" data-filter-value="${escapeHtml(profile)}" title="Add profile filter">${escapeHtml(profile)}</button>` : ""}</td>
-  <td>${escapeHtml(taskBlockerNumbers(task).join(", "))}</td>
+  <td>${blockerLinks(task, payload.tasks)}</td>
   <td class="time">${escapeHtml(formatTimestamp(updated))}</td>
   <td class="time">${escapeHtml(formatTimestamp(task.metrics?.startedAt))}</td>
   <td class="time">${escapeHtml(formatTimestamp(task.metrics?.completedAt))}</td>
@@ -1288,6 +1399,7 @@ function renderDashboard(repoRoot, requestUrl) {
     .filter-token { padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
     .status-running { color: #d97706; }
     .status-completed { color: #16a34a; }
+    .status-rejected { color: #84cc16; }
     .status-failed { color: #dc2626; }
     .status-blocked { color: #7c3aed; }
     .summary.disconnected { color: #dc2626; opacity: 1; }
@@ -1323,9 +1435,9 @@ function renderDashboard(repoRoot, requestUrl) {
   <p class="summary">${tasks.length}${tasks.length === payload.tasks.length ? "" : ` of ${payload.tasks.length}`} tasks · ${workerCounts.busy || 0} busy · ${workerCounts.idle || 0} idle · ${escapeHtml(payload.runner?.implementation || "unknown runner")} ${escapeHtml(payload.runner?.pluginVersion || "")} · config ${escapeHtml(Math.round((payload.config.configReloadIntervalMs || 5000) / 1000))}s · live 1s</p>
   <div class="filters" role="search">
     <label for="task-filter">Filter</label>
-    <input id="task-filter" type="search" value="${escapeHtml(filterQuery)}" placeholder="crashlytics status:failed" autocomplete="off" spellcheck="false">
+    <input id="task-filter" type="search" value="${escapeHtml(filterQuery)}" placeholder="status:completed|rejected" autocomplete="off" spellcheck="false">
     <button id="filter-clear" type="button" data-filter-clear>Clear</button>
-    <span class="filter-help">Fields: id, task, status, worker, profile, blockers, updated, error, external</span>
+    <span class="filter-help">Fields: id, task, status, worker, profile, blockers, updated, error, external · OR: value|value</span>
   </div>
   <table>
     <thead>

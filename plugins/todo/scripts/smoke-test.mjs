@@ -1054,9 +1054,15 @@ process.stdin.on("end", () => {
     ["task-logs", dashboardHtml.includes("data-log-task=")],
     ["dialog", dashboardHtml.includes('id="log-dialog"')],
     ["filter", dashboardHtml.includes('id="task-filter"')],
-    ["placeholder", dashboardHtml.includes('placeholder="crashlytics status:failed"')],
+    ["placeholder", dashboardHtml.includes('placeholder="status:completed|rejected"')],
     ["status-filter", dashboardHtml.includes('data-filter-field="status"')],
     ["profile-filter", dashboardHtml.includes('data-filter-field="profile"')],
+    [
+      "blocker-link",
+      dashboardHtml.includes(`data-blocker-task="${first.id}"`),
+    ],
+    ["rejected-status", dashboardHtml.includes(">rejected</button>")],
+    ["rejected-color", dashboardHtml.includes(".status-rejected { color: #84cc16; }")],
     [
       "task-link",
       /href="\/api\/task\?task=[0-9]+-[^"]+"[^>]*>[0-9]+<\/a>/.test(
@@ -1097,8 +1103,12 @@ process.stdin.on("end", () => {
       dashboardScript.includes('fetch("/api/logs"') &&
       dashboardScript.includes("function filterTasks") &&
       dashboardScript.includes("function compactDuration") &&
+      dashboardScript.includes("function filterAlternatives") &&
+      dashboardScript.includes('field === "status" || field === "profile"') &&
+      dashboardScript.includes('alternatives.join("|")') &&
       dashboardScript.includes('status.dataset.filterField = "status"') &&
       dashboardScript.includes('profileButton.dataset.filterField = "profile"') &&
+      dashboardScript.includes("link.dataset.blockerTask = target.id") &&
       dashboardScript.includes('setTimeout(() => loadLog(entry, true), 2000)') &&
       dashboardScript.includes("tableBody.replaceChildren(fragment)") &&
       dashboardScript.includes("window.history.replaceState"),
@@ -1121,6 +1131,34 @@ process.stdin.on("end", () => {
       .filter(([, passed]) => !passed)
       .map(([name]) => name)
       .join(", ")}`,
+  );
+  for (const query of [
+    "status:completed|rejected",
+    "status:(completed|rejected)",
+  ]) {
+    const response = await fetch(
+      new URL(`/?q=${encodeURIComponent(query)}`, dashboardUrl),
+    );
+    const html = await response.text();
+    assert(
+      response.status === 200 &&
+        html.includes(`value="${query}"`) &&
+        html.includes("Canceled task") &&
+        html.includes("Completed fixture") &&
+        !html.includes("Failed fixture"),
+      `dashboard OR filter did not support ${query}`,
+    );
+  }
+  const rejectedDashboardResponse = await fetch(
+    new URL("/?q=status%3Arejected", dashboardUrl),
+  );
+  const rejectedDashboardHtml = await rejectedDashboardResponse.text();
+  assert(
+    rejectedDashboardResponse.status === 200 &&
+      rejectedDashboardHtml.includes("Canceled task") &&
+      rejectedDashboardHtml.includes(">rejected</button>") &&
+      !rejectedDashboardHtml.includes(">canceled</button>"),
+    "dashboard did not expose canceled tasks as rejected",
   );
   const defaultDashboardResponse = await fetch(dashboardUrl);
   const defaultDashboardHtml = await defaultDashboardResponse.text();

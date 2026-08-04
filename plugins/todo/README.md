@@ -107,6 +107,12 @@ Its URL and port are ephemeral; query `$todo:dashboard` or `$todo:status` instea
 of bookmarking one. Prompts, readable transcripts, raw JSONL logs, results, and
 metrics remain in `.todo/` for audit and debugging.
 
+Dependency IDs link to their task Markdown when the referenced task is available.
+Canceled lifecycle records are labeled `rejected` in the dashboard. Field filters
+accept OR values as either `status:completed|rejected` or
+`status:(completed|rejected)`; clicking multiple status or profile values builds
+the same `|` expression.
+
 The dashboard is local operational tooling, not an account-quota display. Token
 usage appears only when Codex emits usage records for the task attempt.
 
