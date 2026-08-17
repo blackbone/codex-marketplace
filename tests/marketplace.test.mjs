@@ -143,7 +143,7 @@ test("ToDo MCP server resolves from the installed plugin root", async () => {
   const skills = await readdir(path.join(pluginRoot, "skills"), {
     withFileTypes: true,
   });
-  assert.equal(skills.filter((entry) => entry.isDirectory()).length, 16);
+  assert.equal(skills.filter((entry) => entry.isDirectory()).length, 17);
 });
 
 test("packages exclude local Finder metadata", async () => {

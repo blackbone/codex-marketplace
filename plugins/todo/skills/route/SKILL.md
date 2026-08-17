@@ -26,7 +26,7 @@ Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
    - Set `allowWorkerTaskCreation: true` only when the current user explicitly instructs this task's worker to create one or more follow-up ToDo tasks. Record the exact delegation scope and requested model profiles in the task description. Never infer this permission from an audit, discovery, planning, or implementation workflow.
    - Omit `delivery` to use the repository default. Use `pr` only after an explicit user request.
    - If preflight validation or batch publication fails, fix it interactively and rerun the whole preflight; never fall back to piecemeal `task_create` calls.
-6. Leave tasks queued for background `codex exec` by default and do not implement them in the current thread.
+6. After successful publication, call `supervisor_get`. If a supervisor is configured with `actionRequired: "resume"`, update that exact heartbeat with its stored complete definition and `status: "ACTIVE"`; after host confirmation persist the active definition with `supervisor_bind`. Report a resume error separately without misrepresenting successful task publication. Leave tasks queued for background `codex exec` by default and do not implement them in the current thread.
 7. Use current-thread execution only when the user explicitly requests it, or when a previous background attempt returned `error.kind: "interactive_required"` because it could not proceed without Browser, Chrome, Computer Use, current-thread approval, or user interaction:
    - call `task_run_start` for the newly created task;
    - implement and validate it in the current thread;

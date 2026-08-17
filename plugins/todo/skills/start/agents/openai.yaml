@@ -1,6 +1,6 @@
 interface:
   display_name: "ToDo Start"
-  short_description: "Start the local ToDo background runner"
-  default_prompt: "Use $todo:start to start ToDo for this repository."
+  short_description: "Start runner, monitoring, and dashboard"
+  default_prompt: "Use $todo:start to start ToDo, bind monitoring, and open its dashboard."
 policy:
   allow_implicit_invocation: false

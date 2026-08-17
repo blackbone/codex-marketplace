@@ -27,5 +27,6 @@ Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
    - Omit `delivery` to use the repository default. Set `pr` only when the user explicitly requests a pull request.
 6. Use `runMode: "interactive"` only when the user explicitly requests current-thread execution.
 7. Keep `ephemeral` true unless the user explicitly requires a persisted Codex session.
-8. Do not implement the queued task in the interactive session unless current-thread-only capabilities are independently required or the user explicitly asks for current-thread execution.
-9. Return only the task ID and initial status for the implementation portion.
+8. After successful publication, call `supervisor_get`. If a supervisor is configured with `actionRequired: "resume"`, update that exact heartbeat with its stored complete definition and `status: "ACTIVE"`; after host confirmation persist the active definition with `supervisor_bind`.
+9. Do not implement the queued task in the interactive session unless current-thread-only capabilities are independently required or the user explicitly asks for current-thread execution.
+10. Return only the task ID and initial status for the implementation portion, plus a separate supervisor-resume error if publication succeeded but the heartbeat could not be resumed.

@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Supervise"
+  short_description: "Keep ToDo moving without idle heartbeat runs"
+  default_prompt: "Use $todo:supervise to keep this repository's ToDo queue moving."
+policy:
+  allow_implicit_invocation: false

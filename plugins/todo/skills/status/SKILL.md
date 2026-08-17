@@ -13,4 +13,5 @@ Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
 4. For finished attempts, show attempt count, final completion, cumulative human duration, and cumulative total tokens.
 5. For workers show ID, state, PID, and current task.
 6. Include runner state and the dashboard URL when returned.
-7. Preserve status values exactly as returned.
+7. Include the supervisor's configured status, desired status, required action, and active-task count when returned.
+8. Preserve status values exactly as returned.

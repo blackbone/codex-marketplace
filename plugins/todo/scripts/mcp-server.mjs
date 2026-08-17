@@ -12,7 +12,9 @@ import { spawnSync } from "node:child_process";
 import {
   addTaskArtifacts,
   atomicWriteJson,
+  bindSupervisor,
   cancelTask,
+  clearSupervisor,
   createTaskBatch,
   currentGitBranch,
   DAEMON_IMPLEMENTATION,
@@ -22,6 +24,7 @@ import {
   findLegacyRunner,
   getTaskDetails,
   getTaskStatus,
+  getSupervisorStatus,
   initializeRepo,
   isActivated,
   isCurrentDaemonState,
@@ -514,6 +517,76 @@ const tools = [
     annotations: {
       title: "Todo status",
       readOnlyHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "supervisor_get",
+    description:
+      "Return the repository-bound heartbeat definition and whether ToDo currently needs it active or paused.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repoPath: { type: "string" },
+      },
+      required: ["repoPath"],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Get ToDo supervisor state",
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "supervisor_bind",
+    description:
+      "Persist the repository binding for a Codex heartbeat after the host automation was successfully created, updated, paused, or resumed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repoPath: { type: "string" },
+        automationId: { type: "string", minLength: 1, maxLength: 200 },
+        name: { type: "string", minLength: 1, maxLength: 200 },
+        prompt: { type: "string", minLength: 1, maxLength: 20000 },
+        rrule: { type: "string", minLength: 1, maxLength: 1000 },
+        status: { type: "string", enum: ["ACTIVE", "PAUSED"] },
+      },
+      required: [
+        "repoPath",
+        "automationId",
+        "name",
+        "prompt",
+        "rrule",
+        "status",
+      ],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Bind ToDo supervisor",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "supervisor_clear",
+    description:
+      "Remove the repository heartbeat binding after the host automation was successfully deleted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repoPath: { type: "string" },
+      },
+      required: ["repoPath"],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Clear ToDo supervisor binding",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
       openWorldHint: false,
     },
   },
@@ -1011,6 +1084,7 @@ function todoStatus(repoRoot, args = {}) {
     },
     tasks: { counts, items: tasks },
     workers: runner.workerStates,
+    supervisor: getSupervisorStatus(repoRoot),
   };
 }
 
@@ -1385,6 +1459,12 @@ async function callTool(name, args = {}) {
     }
     case "todo_status":
       return todoStatus(resolveRepo(args), args);
+    case "supervisor_get":
+      return getSupervisorStatus(activatedRepo(args));
+    case "supervisor_bind":
+      return bindSupervisor(activatedRepo(args), args);
+    case "supervisor_clear":
+      return clearSupervisor(activatedRepo(args));
     case "task_retry": {
       const repoRoot = activatedRepo(args);
       const task = retryTask(repoRoot, args.id);

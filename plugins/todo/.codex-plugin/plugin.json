@@ -1,6 +1,6 @@
 {
   "name": "todo",
-  "version": "0.1.0+codex.20260817100424",
+  "version": "0.1.0+codex.20260817115735",
   "description": "Durable repository task routing with persistent per-task Codex threads, isolated Git delivery, and telemetry.",
   "author": {
     "name": "blackbone"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "ToDo",
     "shortDescription": "Persistent-thread durable task execution",
-    "longDescription": "Routes repository mutations through durable local tasks, runs one Codex app-server per repository with a persistent thread per task, archives each thread between worker attempts and restores it for retries or reopen, validates connectors and Git state before atomic publication, executes in runner-owned worktrees, and records attempt telemetry.",
+    "longDescription": "Routes repository mutations through durable local tasks, runs one Codex app-server per repository with a persistent thread per task, opens the current local dashboard in the in-app Browser on start, archives each thread between worker attempts and restores it for retries or reopen, validates connectors and Git state before atomic publication, executes in runner-owned worktrees, and records attempt telemetry.",
     "developerName": "blackbone",
     "category": "Productivity",
     "capabilities": [

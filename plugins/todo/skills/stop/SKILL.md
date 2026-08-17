@@ -10,4 +10,5 @@ Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
 1. Call `runner_stop` for the target repository.
 2. Keep `force` false unless the user explicitly asks to interrupt running tasks.
 3. If active tasks prevent shutdown, report their IDs and leave the daemon running.
-4. Report the confirmed terminal state returned by the tool.
+4. After a confirmed stop, call `supervisor_get`. If a supervisor is configured and active, update that exact heartbeat with its stored complete definition and `status: "PAUSED"`; after host confirmation persist the paused definition with `supervisor_bind`.
+5. Report the confirmed terminal state returned by the tool.

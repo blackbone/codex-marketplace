@@ -16,13 +16,16 @@ import { fileURLToPath } from "node:url";
 import {
   addTaskArtifacts,
   applyGitExcludes,
+  bindSupervisor,
   canAutoRetry,
   cancelTask,
   claimTask,
+  clearSupervisor,
   createTask,
   finishInteractiveTask,
   getTaskDetails,
   getTaskStatus,
+  getSupervisorStatus,
   initializeRepo,
   listTaskStatuses,
   listWorkerStatuses,
@@ -199,6 +202,9 @@ async function callMcp() {
     "runner_start",
     "runner_status",
     "runner_stop",
+    "supervisor_bind",
+    "supervisor_clear",
+    "supervisor_get",
     "task_artifact_add",
     "task_batch_create",
     "task_cancel",
@@ -480,6 +486,37 @@ try {
       repeatedAgents.split(ROUTING_POLICY_START).length === 2,
     "repo initialization routing policy is not idempotent",
   );
+  const unconfiguredSupervisor = getSupervisorStatus(repoRoot);
+  assert(
+    unconfiguredSupervisor.configured === false &&
+      unconfiguredSupervisor.desiredStatus === "PAUSED" &&
+      unconfiguredSupervisor.actionRequired === "configure" &&
+      unconfiguredSupervisor.activeTasks.total === 0,
+    "empty repository did not request a paused supervisor binding",
+  );
+  const supervisorDefinition = {
+    automationId: "todo-smoke-supervisor",
+    name: "Keep smoke ToDo running",
+    prompt: `Use $todo:supervise in scheduled-run mode for ${repoRoot}.`,
+    rrule: "FREQ=MINUTELY;INTERVAL=15",
+    status: "PAUSED",
+  };
+  const boundSupervisor = bindSupervisor(repoRoot, supervisorDefinition);
+  assert(
+    boundSupervisor.configured === true &&
+      boundSupervisor.automation.automationId ===
+        supervisorDefinition.automationId &&
+      boundSupervisor.automation.status === "PAUSED" &&
+      boundSupervisor.actionRequired === null,
+    "paused supervisor binding was not persisted for an idle repository",
+  );
+  const clearedSupervisor = clearSupervisor(repoRoot);
+  assert(
+    clearedSupervisor.configured === false &&
+      clearedSupervisor.actionRequired === "configure",
+    "supervisor binding was not cleared",
+  );
+  bindSupervisor(repoRoot, supervisorDefinition);
   const routingHookEvents = [
     { hook_event_name: "SessionStart", source: "startup" },
     { hook_event_name: "UserPromptSubmit", prompt: "Fix the selected bug." },
@@ -778,6 +815,23 @@ process.stdin.on("end", async () => {
       },
     ],
   });
+  const activeSupervisor = getSupervisorStatus(repoRoot);
+  assert(
+    activeSupervisor.desiredStatus === "ACTIVE" &&
+      activeSupervisor.actionRequired === "resume" &&
+      activeSupervisor.activeTasks.total === 1 &&
+      activeSupervisor.activeTasks.counts.queued === 1,
+    "new task did not request supervisor resume",
+  );
+  const resumedSupervisor = bindSupervisor(repoRoot, {
+    ...supervisorDefinition,
+    status: "ACTIVE",
+  });
+  assert(
+    resumedSupervisor.actionRequired === null &&
+      resumedSupervisor.automation.status === "ACTIVE",
+    "active supervisor state was not persisted",
+  );
   const withAddedArtifact = addTaskArtifacts(repoRoot, first.id, [
     {
       kind: "file",
@@ -1011,6 +1065,7 @@ process.stdin.on("end", async () => {
     "start",
     "status",
     "stop",
+    "supervise",
     "update",
     "workers",
   ];
@@ -1024,6 +1079,36 @@ process.stdin.on("end", async () => {
       `${skill} skill allows implicit invocation`,
     );
   }
+  const superviseSkillText = readFileSync(
+    path.join(scriptDir, "..", "skills", "supervise", "SKILL.md"),
+    "utf8",
+  );
+  assert(
+    superviseSkillText.includes("supervisor_get") &&
+      superviseSkillText.includes('status: "ACTIVE"') &&
+      superviseSkillText.includes("PAUSED") &&
+      superviseSkillText.includes("task_run_start") &&
+      superviseSkillText.includes("exactly one bounded subagent"),
+    "supervise skill does not preserve the active/idle recovery contract",
+  );
+  const startSkillText = readFileSync(
+    path.join(scriptDir, "..", "skills", "start", "SKILL.md"),
+    "utf8",
+  );
+  assert(
+    startSkillText.includes("current invoking chat") &&
+      startSkillText.includes("$browser:control-in-app-browser") &&
+      startSkillText.includes("new in-app Browser tab") &&
+      startSkillText.includes("exact returned URL") &&
+      startSkillText.includes("Never guess a dashboard URL") &&
+      startSkillText.includes("delete that exact host automation") &&
+      startSkillText.includes("supervisor_clear") &&
+      startSkillText.includes("FREQ=MINUTELY;INTERVAL=15") &&
+      startSkillText.includes("destination `thread`") &&
+      startSkillText.includes("idle repository starts as `PAUSED`") &&
+      startSkillText.includes("supervisor_bind"),
+    "start skill does not rebind supervision to the invoking chat",
+  );
   const runSkillDir = path.join(scriptDir, "..", "skills", "run");
   const runSkillText = readFileSync(path.join(runSkillDir, "SKILL.md"), "utf8");
   assert(existsSync(path.join(runSkillDir, "SKILL.md")), "missing run skill");
@@ -2217,7 +2302,7 @@ process.stdin.on("end", async () => {
       dependencyUnlocked: true,
       completionReceipts: 5,
       invalidWorkersFallback: fallback.workers,
-      mcpTools: 18,
+      mcpTools: 21,
       repoInit: true,
       modelProfiles: true,
       taskEphemeralOverride: true,

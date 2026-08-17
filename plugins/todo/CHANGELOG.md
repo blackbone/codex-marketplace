@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-08-12
 
+- Made `$todo:start` open the current runner-provided dashboard URL in a new
+  in-app Browser tab, with runner, Browser, and supervisor outcomes separated.
+- Made every `$todo:start` invocation replace the repository heartbeat with one
+  supervisor bound to the current invoking chat, initially paused when idle.
+- Added `$todo:supervise`, repository-local heartbeat binding, active/paused
+  reconciliation, lifecycle-driven resume, and idle pausing after one terminal
+  queue check so supervision persists without recurring idle model runs.
 - Removed successfully merged runner-owned worktrees and task branches even
   when the worktree contains only ignored build output, while continuing to
   preserve any uncommitted tracked or untracked files.

@@ -66,6 +66,13 @@ Dependencies keep tasks blocked until their prerequisites complete. Failed tasks
 can retry automatically according to configuration or manually through
 `$todo:retry`.
 
+An optional `$todo:supervise` heartbeat keeps the queue moving across failures
+that require interactive diagnosis. It runs every 15 minutes while active task
+files exist, performs one terminal check after the queue becomes empty, then
+pauses instead of deleting itself. Creating, retrying, reopening, or starting
+work resumes the same bound heartbeat, so an idle repository has no recurring
+model runs.
+
 The default execution backend is one long-lived Codex `app-server` process per
 repository. Each task receives its own persistent Codex thread, and its thread
 ID is stored with the task. Retries add turns to that same thread, so Codex can
@@ -108,16 +115,50 @@ the same task body and brief and resumes from the concrete failed fact.
 | `$todo:route` | Route a repository mutation into a durable task. |
 | `$todo:create` | Create an explicit self-contained task. |
 | `$todo:run` | Claim and execute a task in the current thread. |
-| `$todo:start`, `$todo:stop` | Control the detached runner. |
+| `$todo:start` | Start the runner, bind its supervisor, and open its dashboard in the in-app Browser. |
+| `$todo:stop` | Stop the runner and pause its supervisor. |
+| `$todo:supervise` | Bind a persistent, idle-pausing heartbeat to the current chat. |
 | `$todo:status`, `$todo:list`, `$todo:get` | Inspect tasks, workers, and results. |
 | `$todo:dashboard`, `$todo:workers` | Show the dashboard or worker state. |
 | `$todo:update`, `$todo:retry`, `$todo:reopen`, `$todo:cancel` | Manage an unclaimed or closed task. |
 | `$todo:artifact-add` | Attach files, images, URLs, code, or text context. |
 
-The plugin exposes 18 corresponding MCP tools for preflight, atomic batch
+The plugin exposes 21 corresponding MCP tools for preflight, atomic batch
 publication, activation, task lifecycle, interactive claims, runner control,
-artifacts, status, and workers. Skills are the supported user-facing entry
-points; direct tool calls are agent internals.
+artifacts, supervisor binding, status, and workers. Skills are the supported
+user-facing entry points; direct tool calls are agent internals.
+
+## Supervisor lifecycle
+
+Invoke `$todo:start` in the project chat that should own recovery. In addition
+to starting the runner, every invocation replaces any previously bound
+heartbeat with one 15-minute heartbeat owned by the current chat. An empty
+queue creates it paused; active work creates it active. The host automation ID
+and non-secret definition are stored in ignored `.todo/supervisor.json` only
+after the host confirms creation. `$todo:supervise` can also configure or
+synchronize the heartbeat directly. Scheduled runs leave healthy work alone.
+For a failed task, the supervisor claims the original task and delegates
+bounded diagnosis or repair to one subagent inside that existing task worktree
+without creating a helper ToDo task.
+
+The host scheduler exposes recurring active and paused states, not a repository
+event trigger. The heartbeat therefore makes one final run to observe that the
+queue became empty and pause itself. Later task publication, retry, or reopen
+resumes the same binding. A later `$todo:start` intentionally moves ownership
+to its invoking chat by deleting the exact old heartbeat before creating and
+binding the replacement. `$todo:stop` pauses it. Disabling the supervisor
+deletes the exact host automation first and clears the local binding only after
+confirmed deletion.
+
+Supervisor automation requires the Codex desktop host. Core queue execution and
+transient retry remain independent of it, and a failure to resume the heartbeat
+is reported separately from successful task publication.
+
+After startup status resolves the current dynamic dashboard URL, `$todo:start`
+opens that exact URL in a new in-app Browser tab. It does not guess a port,
+reuse a URL from an earlier runner session, substitute Chrome, or inspect the
+dashboard unless requested. Browser opening, runner startup, and supervisor
+binding are reported as separate outcomes.
 
 ## Git execution
 
@@ -262,6 +303,12 @@ or invalid configuration reports `update-blocked` instead of interrupting work.
 - The local dashboard can expose repository context, prompts, logs, and errors.
 - Do not commit `.todo/` runtime state or place secrets in task descriptions.
 - Stopping the runner does not interrupt active tasks unless explicitly forced.
+- A configured supervisor needs one terminal scheduled run to observe an empty
+  queue before it can pause; it performs no recurring runs after that pause.
+- `$todo:start` cannot move supervision to its current chat if deletion of the
+  previously bound host heartbeat fails; runner startup is reported separately.
+- Opening the dashboard from `$todo:start` requires the bundled in-app Browser;
+  Browser failure does not roll back an otherwise successful runner start.
 - Archiving a Codex thread hides it from the active thread list but does not
   securely erase its persisted Codex rollout record.
 - `app-server` is still an experimental Codex CLI surface; protocol failures are

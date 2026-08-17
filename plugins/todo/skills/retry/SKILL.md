@@ -13,4 +13,5 @@ Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
 4. Call `task_retry`. A failed Git delivery resumes the runner-owned delivery phase without spending another model attempt; other failures create a linked `manual_retry` model attempt.
 5. Preserve the task's configured execution mode.
 6. If the task was changed to `interactive` after a background failure with `error.kind: "interactive_required"`, continue with `$todo:run` in the current thread. Otherwise leave the retry to the daemon.
-7. Report the returned task status and model/delivery retry counts.
+7. Call `supervisor_get`. If a supervisor is configured with `actionRequired: "resume"`, update that exact heartbeat with its stored complete definition and `status: "ACTIVE"`; after host confirmation persist the active definition with `supervisor_bind`.
+8. Report the returned task status and model/delivery retry counts, plus any separate supervisor-resume error.

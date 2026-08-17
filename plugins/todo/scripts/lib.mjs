@@ -189,6 +189,10 @@ export function todoDir(repoRoot) {
   return path.join(repoRoot, ".todo");
 }
 
+export function supervisorConfigPath(repoRoot) {
+  return path.join(todoDir(repoRoot), "supervisor.json");
+}
+
 export function taskBatchLockPath(repoRoot) {
   return path.join(todoDir(repoRoot), ".task-batch.lock");
 }
@@ -2514,6 +2518,103 @@ export function listTaskStatuses(
     .filter(Boolean);
   const tasks = [...active, ...closed];
   return unlimited ? tasks : tasks.slice(0, limit);
+}
+
+function supervisorTaskCounts(tasks) {
+  const counts = {};
+  for (const task of tasks) {
+    counts[task.status] = (counts[task.status] || 0) + 1;
+  }
+  return counts;
+}
+
+function supervisorDefinition(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("supervisor definition must be an object");
+  }
+  const automationId = String(value.automationId || "").trim();
+  const name = String(value.name || "").trim();
+  const prompt = String(value.prompt || "").trim();
+  const rrule = String(value.rrule || "").trim();
+  const status = String(value.status || "").trim().toUpperCase();
+  if (!automationId || automationId.length > 200 || /[\r\n]/.test(automationId)) {
+    throw new Error("supervisor automationId must be a single-line string");
+  }
+  if (!name || name.length > 200 || /[\r\n]/.test(name)) {
+    throw new Error("supervisor name must be a single-line string");
+  }
+  if (!prompt || prompt.length > 20000) {
+    throw new Error("supervisor prompt must be 1-20000 characters");
+  }
+  if (
+    !rrule ||
+    rrule.length > 1000 ||
+    /[\r\n]/.test(rrule) ||
+    !/^(?:RRULE:)?FREQ=/.test(rrule)
+  ) {
+    throw new Error("supervisor rrule must be a single RFC 5545 recurrence rule");
+  }
+  if (!new Set(["ACTIVE", "PAUSED"]).has(status)) {
+    throw new Error("supervisor status must be ACTIVE or PAUSED");
+  }
+  return {
+    schemaVersion: 1,
+    automationId,
+    name,
+    prompt,
+    rrule,
+    status,
+    updatedAt:
+      typeof value.updatedAt === "string" &&
+      Number.isFinite(Date.parse(value.updatedAt))
+        ? new Date(value.updatedAt).toISOString()
+        : new Date().toISOString(),
+  };
+}
+
+export function getSupervisorStatus(repoRoot) {
+  const file = supervisorConfigPath(repoRoot);
+  const tasks = listTaskStatuses(repoRoot);
+  const desiredStatus = tasks.length > 0 ? "ACTIVE" : "PAUSED";
+  let automation = null;
+  let readError = null;
+  if (existsSync(file)) {
+    try {
+      automation = supervisorDefinition(readJson(file));
+    } catch (error) {
+      readError = error.message;
+    }
+  }
+  return {
+    configured: automation !== null,
+    path: file,
+    automation,
+    desiredStatus,
+    actionRequired: !automation
+      ? "configure"
+      : automation.status === desiredStatus
+        ? null
+        : desiredStatus === "ACTIVE"
+          ? "resume"
+          : "pause",
+    activeTasks: {
+      total: tasks.length,
+      counts: supervisorTaskCounts(tasks),
+    },
+    readError,
+  };
+}
+
+export function bindSupervisor(repoRoot, value) {
+  const file = supervisorConfigPath(repoRoot);
+  atomicWriteJson(file, supervisorDefinition(value));
+  return getSupervisorStatus(repoRoot);
+}
+
+export function clearSupervisor(repoRoot) {
+  const file = supervisorConfigPath(repoRoot);
+  if (existsSync(file)) unlinkSync(file);
+  return getSupervisorStatus(repoRoot);
 }
 
 function workerCounts(items) {
