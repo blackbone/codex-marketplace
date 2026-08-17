@@ -27,24 +27,30 @@ import {
   listTaskStatuses,
   listWorkerStatuses,
   loadConfig,
-  normalizeExternalTaskOutcome,
   processIsAlive,
   readDaemonState,
   releaseClaim,
   startInteractiveTask,
   taskArtifactDir,
   taskArtifactManifestPath,
+  taskBatchLockPath,
   updateTask,
   writeHistory,
 } from "./lib.mjs";
 import { ensureDaemon } from "./ensure-daemon.mjs";
 import {
+  prepareTaskWorktree,
+  taskWorktreePlan,
+} from "./git-worktree.mjs";
+import {
   ROUTING_POLICY_END,
   ROUTING_POLICY_START,
   TODO_ROUTING_POLICY,
 } from "./routing-policy.mjs";
+import { TODO_PONYTAIL_FULL_CONTOUR } from "./ponytail-policy.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const pluginRoot = path.resolve(scriptDir, "..");
 const repoRoot = mkdtempSync(path.join(os.tmpdir(), "todo-smoke-"));
 let daemonPid = null;
 
@@ -107,16 +113,27 @@ function runRoutingHook(event, env = {}) {
   return result.stdout.trim() ? JSON.parse(result.stdout) : null;
 }
 
-async function callMcp() {
+function loadMcpLaunchConfig() {
   const mcpConfig = JSON.parse(
     readFileSync(path.join(scriptDir, "..", ".mcp.json"), "utf8"),
   ).mcpServers.todo;
-  const child = spawn(mcpConfig.command, mcpConfig.args, {
-    cwd: repoRoot,
+  const inheritedEnv = { ...process.env };
+  delete inheritedEnv.PLUGIN_ROOT;
+  return {
+    ...mcpConfig,
+    cwd: path.resolve(pluginRoot, mcpConfig.cwd || "."),
     env: {
-      ...process.env,
-      PLUGIN_ROOT: path.resolve(scriptDir, ".."),
+      ...inheritedEnv,
+      ...(mcpConfig.env || {}),
     },
+  };
+}
+
+async function callMcp() {
+  const mcpConfig = loadMcpLaunchConfig();
+  const child = spawn(mcpConfig.command, mcpConfig.args, {
+    cwd: mcpConfig.cwd,
+    env: mcpConfig.env,
     stdio: ["pipe", "pipe", "inherit"],
   });
   let output = "";
@@ -138,19 +155,28 @@ async function callMcp() {
         jsonrpc: "2.0",
         id: 3,
         method: "tools/call",
-        params: { name: "todo_status", arguments: {} },
+        params: {
+          name: "todo_status",
+          arguments: { repoPath: repoRoot },
+        },
       },
       {
         jsonrpc: "2.0",
         id: 4,
         method: "tools/call",
-        params: { name: "worker_list", arguments: {} },
+        params: {
+          name: "worker_list",
+          arguments: { repoPath: repoRoot },
+        },
       },
       {
         jsonrpc: "2.0",
         id: 5,
         method: "tools/call",
-        params: { name: "repo_init", arguments: {} },
+        params: {
+          name: "repo_init",
+          arguments: { repoPath: repoRoot },
+        },
       },
     ]
       .map((message) => JSON.stringify(message))
@@ -168,9 +194,31 @@ async function callMcp() {
   const toolsResponse = responses.find((item) => item.id === 2);
   const statusResponse = responses.find((item) => item.id === 3);
   const workersResponse = responses.find((item) => item.id === 4);
+  const expectedToolNames = [
+    "repo_init",
+    "runner_start",
+    "runner_status",
+    "runner_stop",
+    "task_artifact_add",
+    "task_batch_create",
+    "task_cancel",
+    "task_create",
+    "task_get",
+    "task_list",
+    "task_preflight",
+    "task_reopen",
+    "task_retry",
+    "task_run_finish",
+    "task_run_start",
+    "task_update",
+    "todo_status",
+    "worker_list",
+  ];
   assert(
-    toolsResponse?.result?.tools?.length === 15,
-    "MCP did not list 15 tools",
+    JSON.stringify(
+      toolsResponse?.result?.tools?.map((tool) => tool.name).sort(),
+    ) === JSON.stringify(expectedToolNames),
+    "MCP tool contract changed",
   );
   assert(
     toolsResponse.result.tools.some(
@@ -183,8 +231,21 @@ async function callMcp() {
     "MCP did not list task_update",
   );
   assert(
+    toolsResponse.result.tools.some((tool) => tool.name === "task_preflight") &&
+      toolsResponse.result.tools.some(
+        (tool) => tool.name === "task_batch_create",
+      ),
+    "MCP did not list preflight and atomic batch tools",
+  );
+  assert(
     toolsResponse.result.tools.some((tool) => tool.name === "repo_init"),
     "MCP did not list repo_init",
+  );
+  assert(
+    toolsResponse.result.tools.every((tool) =>
+      tool.inputSchema.required?.includes("repoPath"),
+    ),
+    "repo-bound MCP tools did not require repoPath",
   );
   assert(
     toolsResponse.result.tools.some((tool) => tool.name === "runner_stop"),
@@ -198,27 +259,10 @@ async function callMcp() {
   const createTool = toolsResponse.result.tools.find(
     (tool) => tool.name === "task_create",
   );
-  const finishTool = toolsResponse.result.tools.find(
-    (tool) => tool.name === "task_run_finish",
-  );
   assert(
-    createTool?.inputSchema?.properties?.externalWorkflows &&
-      createTool.inputSchema.properties.runMode &&
-      finishTool?.inputSchema?.properties?.externalSync &&
-      finishTool.inputSchema.properties.externalSyncError,
-    "MCP did not expose external workflow synchronization fields",
-  );
-  const mcpExternalSyncItem =
-    finishTool.inputSchema.properties.externalSync.items;
-  assert(
-    mcpExternalSyncItem.required?.includes("commentUrl") &&
-      mcpExternalSyncItem.properties.commentUrl?.anyOf?.some(
-        (entry) => entry.type === "string",
-      ) &&
-      mcpExternalSyncItem.properties.commentUrl.anyOf.some(
-        (entry) => entry.type === "null",
-      ),
-    "MCP externalSync commentUrl must be required and nullable",
+    createTool?.inputSchema?.properties?.runMode &&
+      createTool.inputSchema.properties.allowWorkerTaskCreation,
+    "MCP did not expose execution and worker delegation fields",
   );
   assert(
     statusResponse?.result?.structuredContent?.runner?.activated === true,
@@ -247,16 +291,11 @@ async function callMcp() {
   );
 }
 
-async function callMcpStop({ force = false, expectError = false } = {}) {
-  const mcpConfig = JSON.parse(
-    readFileSync(path.join(scriptDir, "..", ".mcp.json"), "utf8"),
-  ).mcpServers.todo;
+async function callMcpTool(name, args, env = {}) {
+  const mcpConfig = loadMcpLaunchConfig();
   const child = spawn(mcpConfig.command, mcpConfig.args, {
-    cwd: repoRoot,
-    env: {
-      ...process.env,
-      PLUGIN_ROOT: path.resolve(scriptDir, ".."),
-    },
+    cwd: mcpConfig.cwd,
+    env: { ...mcpConfig.env, ...env },
     stdio: ["pipe", "pipe", "inherit"],
   });
   let output = "";
@@ -276,7 +315,52 @@ async function callMcpStop({ force = false, expectError = false } = {}) {
         jsonrpc: "2.0",
         id: 2,
         method: "tools/call",
-        params: { name: "runner_stop", arguments: { force } },
+        params: { name, arguments: args },
+      },
+    ]
+      .map((message) => JSON.stringify(message))
+      .join("\n") + "\n",
+  );
+  await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", resolve);
+  });
+  return output
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .find((item) => item.id === 2)?.result;
+}
+
+async function callMcpStop({ force = false, expectError = false } = {}) {
+  const mcpConfig = loadMcpLaunchConfig();
+  const child = spawn(mcpConfig.command, mcpConfig.args, {
+    cwd: mcpConfig.cwd,
+    env: mcpConfig.env,
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    output += chunk;
+  });
+  child.stdin.end(
+    [
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18" },
+      },
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "runner_stop",
+          arguments: { repoPath: repoRoot, force },
+        },
       },
     ]
       .map((message) => JSON.stringify(message))
@@ -296,7 +380,7 @@ async function callMcpStop({ force = false, expectError = false } = {}) {
     assert(
       response?.result?.isError === true &&
         response.result.content?.[0]?.text?.includes("active tasks"),
-      "MCP runner_stop did not refuse to interrupt active tasks",
+      `MCP runner_stop did not refuse to interrupt active tasks: ${JSON.stringify(response)}`,
     );
     return;
   }
@@ -311,74 +395,24 @@ try {
     readFileSync(path.join(scriptDir, "result.schema.json"), "utf8"),
   );
   assertStrictObjectSchemas(outputSchema);
-  const externalSyncItemSchema = outputSchema.properties?.externalSync?.items;
-  const commentUrlSchema = externalSyncItemSchema?.properties?.commentUrl;
-  assert(
-    externalSyncItemSchema?.required?.includes("commentUrl") &&
-      commentUrlSchema?.anyOf?.some((entry) => entry.type === "string") &&
-      commentUrlSchema.anyOf.some((entry) => entry.type === "null"),
-    "result schema externalSync commentUrl must be required and nullable",
-  );
-  const aiDisclosureSchema =
-    outputSchema.properties?.externalSync?.items?.properties?.aiDisclosure;
-  assert(
-    aiDisclosureSchema?.type === "boolean" &&
-      aiDisclosureSchema.const === true,
-    "result schema aiDisclosure must declare boolean type for Codex CLI compatibility",
-  );
-  const externalSchemaWorkflows = [
-    { service: "jira", resourceId: "TODO-1" },
+  const expectedResultFields = [
+    "error",
+    "interactiveReason",
+    "requiresInteractive",
+    "status",
+    "summary",
+    "validation",
   ];
-  const externalSchemaReceipt = {
-    service: "jira",
-    resourceId: "TODO-1",
-    startedStatus: "In Progress",
-    finalStatus: "Done",
-    commentId: "10001",
-    commentText: "Performed by Codex (AI). Strict schema regression test.",
-    aiDisclosure: true,
-  };
-  const nullCommentUrlOutcome = normalizeExternalTaskOutcome(
-    externalSchemaWorkflows,
-    {
-      status: "completed",
-      externalSync: [{ ...externalSchemaReceipt, commentUrl: null }],
-    },
-  );
   assert(
-    nullCommentUrlOutcome.externalSync[0].commentUrl === null &&
-      nullCommentUrlOutcome.externalSync[0].aiDisclosure === true,
-    "externalSync commentUrl null or aiDisclosure true was not preserved",
-  );
-  for (const commentUrl of [
-    "http://jira.example.test/browse/TODO-1",
-    "https://jira.example.test/browse/TODO-1?focusedCommentId=10001",
-  ]) {
-    const urlOutcome = normalizeExternalTaskOutcome(externalSchemaWorkflows, {
-      status: "completed",
-      externalSync: [{ ...externalSchemaReceipt, commentUrl }],
-    });
-    assert(
-      urlOutcome.externalSync[0].commentUrl === commentUrl,
-      `valid externalSync commentUrl was not accepted: ${commentUrl}`,
-    );
-  }
-  let invalidCommentUrlRejected = false;
-  try {
-    normalizeExternalTaskOutcome(externalSchemaWorkflows, {
-      status: "completed",
-      externalSync: [
-        { ...externalSchemaReceipt, commentUrl: "not-a-url" },
-      ],
-    });
-  } catch (error) {
-    invalidCommentUrlRejected = error.message.includes(
-      "external sync commentUrl is invalid",
-    );
-  }
-  assert(
-    invalidCommentUrlRejected,
-    "invalid externalSync commentUrl was accepted",
+    outputSchema.type === "object" &&
+      outputSchema.additionalProperties === false &&
+      JSON.stringify(Object.keys(outputSchema.properties).sort()) ===
+        JSON.stringify(expectedResultFields) &&
+      JSON.stringify([...outputSchema.required].sort()) ===
+        JSON.stringify(expectedResultFields) &&
+      JSON.stringify(outputSchema.properties.status.enum) ===
+        JSON.stringify(["completed", "failed"]),
+    "worker result schema contract changed",
   );
 
   const git = spawnSync("git", ["init", "--quiet", repoRoot], {
@@ -394,7 +428,34 @@ try {
   const initialized = initializeRepo(repoRoot);
   assert(
     initialized.created === true &&
-      initialized.config.modelProfiles.length === 2 &&
+      JSON.stringify(initialized.config.modelProfiles) ===
+        JSON.stringify([
+          {
+            name: "fast",
+            model: "gpt-5.6-luna",
+            reasoningEffort: "medium",
+            description: "Mechanical file operations and exact text insertions.",
+          },
+          {
+            name: "medium",
+            model: "gpt-5.6-terra",
+            reasoningEffort: "medium",
+            description: "Small, bounded edits across a few files.",
+          },
+          {
+            name: "expert",
+            model: "gpt-5.6-sol",
+            reasoningEffort: "xhigh",
+            description: "Most coding tasks and complex implementation work.",
+          },
+          {
+            name: "ultra",
+            model: "gpt-5.6-sol",
+            reasoningEffort: "ultra",
+            description: "Large, high-risk, cross-cutting refactors.",
+          },
+        ]) &&
+      initialized.config.defaultModelProfile === "expert" &&
       initialized.config.retries === 0 &&
       initialized.config.configReloadIntervalMs === 5000 &&
       initialized.config.routingMode === "all-mutations" &&
@@ -419,41 +480,46 @@ try {
       repeatedAgents.split(ROUTING_POLICY_START).length === 2,
     "repo initialization routing policy is not idempotent",
   );
-  const sessionContext = runRoutingHook({
-    cwd: repoRoot,
-    hook_event_name: "SessionStart",
-    source: "startup",
-  });
-  assert(
-    sessionContext?.hookSpecificOutput?.additionalContext?.includes(
-      "Route every request",
-    ),
-    "SessionStart hook did not inject ToDo routing policy",
+  const routingHookEvents = [
+    { hook_event_name: "SessionStart", source: "startup" },
+    { hook_event_name: "UserPromptSubmit", prompt: "Fix the selected bug." },
+    { hook_event_name: "SubagentStart", agent_type: "general-purpose" },
+  ];
+  const routingContexts = routingHookEvents.map((event) =>
+    runRoutingHook({ cwd: repoRoot, ...event }),
   );
-  const promptContext = runRoutingHook({
-    cwd: repoRoot,
-    hook_event_name: "UserPromptSubmit",
-    prompt: "Fix the selected bug.",
-  });
-  assert(
-    promptContext?.hookSpecificOutput?.additionalContext?.includes(
-      "$todo:route",
-    ),
-    "UserPromptSubmit hook did not reinforce ToDo routing policy",
-  );
+  for (const context of routingContexts) {
+    const additionalContext =
+      context?.hookSpecificOutput?.additionalContext || "";
+    assert(
+      additionalContext.includes(TODO_ROUTING_POLICY) &&
+        additionalContext.includes(TODO_PONYTAIL_FULL_CONTOUR) &&
+        additionalContext.indexOf(TODO_ROUTING_POLICY) ===
+          additionalContext.lastIndexOf(TODO_ROUTING_POLICY) &&
+        additionalContext.indexOf(TODO_PONYTAIL_FULL_CONTOUR) ===
+          additionalContext.lastIndexOf(TODO_PONYTAIL_FULL_CONTOUR),
+      `${context?.hookSpecificOutput?.hookEventName || "routing"} hook did not inject the complete routing and Ponytail context exactly once`,
+    );
+  }
   const workerContext = runRoutingHook(
     {
       cwd: repoRoot,
       hook_event_name: "SessionStart",
       source: "startup",
     },
-    { TODO_RUNNER_WORKER: "1" },
+    { TODO_RUNNER_WORKER: "1", TODO_RUNNER_REPO_ROOT: repoRoot },
   );
   assert(
     workerContext?.hookSpecificOutput?.additionalContext?.includes(
-      "already claimed ToDo background worker",
-    ),
-    "routing hook did not exempt an already claimed worker",
+      "explicit user authorization",
+    ) &&
+      workerContext.hookSpecificOutput.additionalContext.includes(
+        TODO_ROUTING_POLICY,
+      ) &&
+      workerContext.hookSpecificOutput.additionalContext.includes(
+        TODO_PONYTAIL_FULL_CONTOUR,
+      ),
+    "routing hook did not provide the full context and claimed-worker exception",
   );
 
   const fakeCodex = path.join(repoRoot, "fake-codex.mjs");
@@ -463,14 +529,53 @@ try {
     `#!/usr/bin/env node
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
+if (args[0] === "app-server" && args.includes("--help")) {
+  process.stdout.write(Array.from(
+    { length: 81 },
+    (_, index) => "app-server help line " + (index + 1) + " with repeated   spacing",
+  ).join("\\n") + "\\n");
+  process.exit(0);
+}
+if (args.includes("--version")) {
+  process.stdout.write("fake-codex 1.0\\n");
+  process.exit(0);
+}
 const outputIndex = args.indexOf("--output-last-message");
 let input = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => { input += chunk; });
-process.stdin.on("end", () => {
+process.stdin.on("end", async () => {
   appendFileSync(${JSON.stringify(invocationLog)}, JSON.stringify({ args, input }) + "\\n");
+	  const telemetryConfig = args.find((arg) => arg.startsWith("otel.exporter="));
+	  const telemetryEndpoint = telemetryConfig?.match(/endpoint="([^"]+)"/)?.[1];
+	  if (telemetryEndpoint) {
+	    await fetch(telemetryEndpoint, {
+	      method: "POST",
+	      headers: { "content-type": "application/json" },
+	      body: JSON.stringify({
+	        resourceLogs: [{
+	          resource: { attributes: [{ key: "user.email", value: { stringValue: "RAW_OTLP_SHOULD_NOT_PERSIST" } }] },
+	          scopeLogs: [{ logRecords: [
+	            { attributes: [
+	              { key: "event.name", value: { stringValue: "codex.api_request" } },
+	              { key: "attempt", value: { intValue: "0" } }
+	            ] },
+	            { body: { stringValue: "RAW_OTLP_SHOULD_NOT_PERSIST" }, attributes: [
+	              { key: "event.name", value: { stringValue: "codex.sse_event" } },
+	              { key: "event.kind", value: { stringValue: "response.completed" } },
+	              { key: "input_token_count", value: { intValue: "101" } },
+	              { key: "cached_token_count", value: { intValue: "40" } },
+	              { key: "cache_write_token_count", value: { intValue: "0" } },
+	              { key: "output_token_count", value: { intValue: "17" } },
+	              { key: "reasoning_token_count", value: { intValue: "3" } },
+	              { key: "ttft_ms", value: { intValue: "25" } }
+	            ] }
+	          ] }]
+	        }]
+	      })
+	    });
+	  }
 	  const retryFixture = input.includes("Retry this task after first failure.");
-	  const externalFixture = input.includes('"resourceId":"GBX-123"');
 	  const interactiveRequiredFixture = input.includes(
 	    "This task requires a current-thread browser capability.",
 	  );
@@ -510,35 +615,16 @@ process.stdin.on("end", () => {
 	        : shouldFail
 	          ? "fake first attempt failure"
 	          : "fake completion",
-	      error: interactiveRequiredFixture
-	        ? "browser capability is unavailable in the background worker"
-	        : shouldFail
-	          ? "expected retry fixture failure"
+		      error: interactiveRequiredFixture
+		        ? "browser capability is unavailable in the background worker"
+		        : shouldFail
+		          ? "temporary service unavailable"
 	          : null,
 	      validation: ["fake validation"],
 	      requiresInteractive: interactiveRequiredFixture,
 	      interactiveReason: interactiveRequiredFixture
 	        ? "Browser access is required to finish the task"
-	        : null,
-	      ...(externalFixture
-	        ? {
-	            externalSync: [
-	              {
-	                service: "jira",
-	                resourceId: "GBX-123",
-	                startedStatus: "In Progress",
-	                finalStatus: "Done",
-	                commentId: "background-10001",
-	                commentUrl:
-	                  "https://jira.example.test/browse/GBX-123?focusedCommentId=background-10001",
-	                commentText:
-	                  "Performed by Codex (AI). Completed and validated the background task.",
-	                aiDisclosure: true
-	              }
-	            ],
-	            externalSyncError: null
-	          }
-	        : {})
+	        : null
 	    }));
     process.exit(0);
   }, 1200);
@@ -557,6 +643,7 @@ process.stdin.on("end", () => {
     retries: 1,
     gitExclude: [".todo/", "todo-fixtures/"],
     codexCommand: fakeCodex,
+    executionBackend: "exec",
     models: [
       {
         name: "fast",
@@ -616,6 +703,48 @@ process.stdin.on("end", () => {
       "base64",
     ),
   );
+  for (const [key, value] of [
+    ["user.name", "ToDo Smoke Test"],
+    ["user.email", "todo@example.invalid"],
+  ]) {
+    const configured = spawnSync("git", ["-C", repoRoot, "config", key, value], {
+      encoding: "utf8",
+    });
+    assert(configured.status === 0, configured.stderr || `git config ${key} failed`);
+  }
+  const stagedFixture = spawnSync(
+    "git",
+    ["-C", repoRoot, "add", "AGENTS.md", "src/example.js", "fake-codex.mjs"],
+    { encoding: "utf8" },
+  );
+  assert(stagedFixture.status === 0, stagedFixture.stderr || "git add failed");
+  const fixtureCommit = spawnSync(
+    "git",
+    ["-C", repoRoot, "commit", "--quiet", "-m", "smoke fixture"],
+    { encoding: "utf8" },
+  );
+  assert(fixtureCommit.status === 0, fixtureCommit.stderr || "git commit failed");
+  const tagFixture = spawnSync(
+    "git",
+    ["-C", repoRoot, "tag", "target-tag-only"],
+    { encoding: "utf8" },
+  );
+  assert(tagFixture.status === 0, tagFixture.stderr || "git tag failed");
+  assert(
+    (() => {
+      try {
+        createTask(repoRoot, {
+          title: "Invalid tag target",
+          description: "A tag must not be accepted as a target branch.",
+          gitTargetBranch: "target-tag-only",
+        });
+        return false;
+      } catch (error) {
+        return error.message.includes("existing local branch");
+      }
+    })(),
+    "task creation accepted a tag as targetBranch",
+  );
 
   const first = createTask(repoRoot, {
     title: "First task",
@@ -639,7 +768,7 @@ process.stdin.on("end", () => {
       {
         kind: "url",
         source: "https://example.com/reference?q=todo",
-        label: "External reference",
+        label: "Web reference",
       },
       {
         kind: "text",
@@ -665,7 +794,7 @@ process.stdin.on("end", () => {
   assert(
     withAddedArtifact.execution.model === "gpt-test-fast" &&
       withAddedArtifact.execution.reasoningEffort === "low" &&
-      withAddedArtifact.execution.ephemeral === true,
+      withAddedArtifact.execution.ephemeral === false,
     "task execution profile was not persisted",
   );
   const updatedFirst = updateTask(repoRoot, "001", {
@@ -685,6 +814,23 @@ process.stdin.on("end", () => {
     updatedDetails.body.includes("Use the revised implementation requirements."),
     "task_get details did not return the updated body",
   );
+  const publicationGate = taskBatchLockPath(repoRoot);
+  writeFileSync(
+    publicationGate,
+    `${JSON.stringify({ token: "smoke-batch", pid: process.pid })}\n`,
+    "utf8",
+  );
+  try {
+    let claimBlocked = false;
+    try {
+      claimTask(first.path, "smoke-batch-race");
+    } catch (error) {
+      claimBlocked = error.code === "EEXIST";
+    }
+    assert(claimBlocked, "task claim crossed an active batch publication gate");
+  } finally {
+    unlinkSync(publicationGate);
+  }
   const editClaim = claimTask(first.path, "smoke-edit");
   try {
     let runningUpdateRejected = false;
@@ -717,7 +863,8 @@ process.stdin.on("end", () => {
   const firstTaskText = readFileSync(first.path, "utf8");
   assert(
     firstTaskText.includes("## Artifacts") &&
-      firstTaskText.includes("artifacts/001-first-task/"),
+      firstTaskText.includes("artifacts/001-first-task/") &&
+      !firstTaskText.includes(TODO_PONYTAIL_FULL_CONTOUR),
     "task_update did not preserve copied artifact links",
   );
   assert(
@@ -749,22 +896,13 @@ process.stdin.on("end", () => {
   const updatedCanceled = updateTask(repoRoot, canceled.id, {
     modelProfile: "fast",
     ephemeral: false,
-    externalWorkflows: [
-      {
-        service: "jira",
-        resourceId: "LEGACY-42",
-        url: "https://jira.example.test/browse/LEGACY-42",
-        label: "LEGACY-42",
-      },
-    ],
   });
   assert(
     updatedCanceled.execution.modelProfile === "fast" &&
-      updatedCanceled.execution.ephemeral === false &&
-      updatedCanceled.externalWorkflows?.[0]?.resourceId === "LEGACY-42",
-    "task_update did not replace execution settings and external workflows",
+      updatedCanceled.execution.ephemeral === false,
+    "task_update did not replace execution settings",
   );
-  const canceledReceipt = cancelTask(repoRoot, canceled.id);
+  const canceledReceipt = await cancelTask(repoRoot, canceled.id);
   assert(
     canceledReceipt.status === "canceled" &&
       canceledReceipt.artifacts?.length === 1,
@@ -785,40 +923,46 @@ process.stdin.on("end", () => {
     modelProfile: "expert",
     ephemeral: false,
   });
-  const external = createTask(repoRoot, {
-    title: "External Jira task",
-    description:
-      "Mirror the linked Jira workflow and leave an AI-attributed result comment.",
-    externalWorkflows: [
-      {
-        service: "jira",
-        resourceId: "GBX-123",
-        url: "https://jira.example.test/browse/GBX-123",
-        label: "GBX-123",
-      },
-    ],
+  const backgroundExec = createTask(repoRoot, {
+    title: "Background exec task",
+    description: "Run this task through the background worker.",
   });
   assert(
-    external.execution.mode === "background" &&
-      external.externalWorkflows?.[0]?.resourceId === "GBX-123",
-    "external linkage changed the default background execution mode",
+    backgroundExec.execution.mode === "background",
+    "default task execution mode was not background",
   );
-  const externalInteractive = createTask(repoRoot, {
-    title: "Explicit interactive external Jira task",
+  const disappearingTarget = "todo-pre-model-target";
+  const createDisappearingTarget = spawnSync(
+    "git",
+    ["-C", repoRoot, "branch", disappearingTarget],
+    { encoding: "utf8" },
+  );
+  assert(
+    createDisappearingTarget.status === 0,
+    createDisappearingTarget.stderr || "failed to create disappearing target",
+  );
+  const preModelFailure = createTask(repoRoot, {
+    title: "Pre-model Git failure",
+    description: "Never reach the model after the target branch disappears.",
+    gitTargetBranch: disappearingTarget,
+  });
+  const deleteDisappearingTarget = spawnSync(
+    "git",
+    ["-C", repoRoot, "branch", "-D", disappearingTarget],
+    { encoding: "utf8" },
+  );
+  assert(
+    deleteDisappearingTarget.status === 0,
+    deleteDisappearingTarget.stderr || "failed to delete disappearing target",
+  );
+  const explicitInteractive = createTask(repoRoot, {
+    title: "Explicit interactive task",
     description:
       "Run in the current thread because the user explicitly selected interactive execution.",
     runMode: "interactive",
-    externalWorkflows: [
-      {
-        service: "jira",
-        resourceId: "GBX-124",
-        url: "https://jira.example.test/browse/GBX-124",
-        label: "GBX-124",
-      },
-    ],
   });
   assert(
-    externalInteractive.execution.mode === "interactive",
+    explicitInteractive.execution.mode === "interactive",
     "explicit interactive execution was not preserved",
   );
   const interactiveFallback = createTask(repoRoot, {
@@ -863,6 +1007,7 @@ process.stdin.on("end", () => {
     "init",
     "list",
     "retry",
+    "reopen",
     "start",
     "status",
     "stop",
@@ -880,25 +1025,56 @@ process.stdin.on("end", () => {
     );
   }
   const runSkillDir = path.join(scriptDir, "..", "skills", "run");
+  const runSkillText = readFileSync(path.join(runSkillDir, "SKILL.md"), "utf8");
   assert(existsSync(path.join(runSkillDir, "SKILL.md")), "missing run skill");
   assert(
     readFileSync(path.join(runSkillDir, "agents", "openai.yaml"), "utf8").includes(
       "allow_implicit_invocation: true",
-    ),
+    ) &&
+      runSkillText.includes("Ponytail implementation brief") &&
+      runSkillText.includes("inspect the diff created in this task") &&
+      runSkillText.includes("exact minimal relevant validation") &&
+      runSkillText.includes("concrete root cause"),
     "run skill does not allow plugin-plus-filename invocation",
   );
   const routeSkillDir = path.join(scriptDir, "..", "skills", "route");
+  const routeSkillText = readFileSync(
+    path.join(routeSkillDir, "SKILL.md"),
+    "utf8",
+  );
   assert(
     existsSync(path.join(routeSkillDir, "SKILL.md")) &&
       readFileSync(
         path.join(routeSkillDir, "agents", "openai.yaml"),
         "utf8",
       ).includes("allow_implicit_invocation: true") &&
-      readFileSync(path.join(routeSkillDir, "SKILL.md"), "utf8").includes(
-        "even when the user does not mention ToDo",
-      ),
+      routeSkillText.includes("even when the user does not mention ToDo"),
     "route skill does not allow implicit repository mutation routing",
   );
+  const createSkillText = readFileSync(
+    path.join(scriptDir, "..", "skills", "create", "SKILL.md"),
+    "utf8",
+  );
+  const implementationBriefFields = [
+    "## Ponytail implementation brief",
+    "Owner, flow, and affected callers",
+    "Existing solution or contract to reuse",
+    "Minimal implementation path",
+    "Explicitly excluded options",
+    "Minimal validation",
+  ];
+  for (const [name, skillText] of [
+    ["route", routeSkillText],
+    ["create", createSkillText],
+  ]) {
+    assert(
+      skillText.includes("Original user request") &&
+        skillText.includes("acceptance criteria") &&
+        implementationBriefFields.every((field) => skillText.includes(field)) &&
+        skillText.includes("Do not copy the full injected Ponytail contour"),
+      `${name} skill does not require the complete Ponytail implementation brief`,
+    );
+  }
   const hooksFile = path.join(scriptDir, "..", "hooks", "hooks.json");
   const hookConfig = JSON.parse(readFileSync(hooksFile, "utf8"));
   assert(
@@ -906,6 +1082,22 @@ process.stdin.on("end", () => {
       hookConfig.hooks?.UserPromptSubmit?.length === 1 &&
       hookConfig.hooks?.SubagentStart?.length === 1,
     "routing lifecycle hooks are incomplete",
+  );
+  for (const [index, event] of routingHookEvents.entries()) {
+    const commandHook =
+      hookConfig.hooks[event.hook_event_name][0].hooks[0];
+    const additionalContext =
+      routingContexts[index].hookSpecificOutput.additionalContext;
+    assert(
+      commandHook.additionalContextLimit >=
+        Buffer.byteLength(additionalContext),
+      `${event.hook_event_name} hook context limit truncates routing or Ponytail policy`,
+    );
+  }
+  assert(
+    hookConfig.hooks.SessionStart[0].hooks[0].additionalContextLimit >=
+      Buffer.byteLength(workerContext.hookSpecificOutput.additionalContext),
+    "claimed-worker hook context limit truncates routing or Ponytail policy",
   );
   const daemonStateFile = path.join(repoRoot, ".todo", "daemon.json");
   writeFileSync(
@@ -986,7 +1178,18 @@ process.stdin.on("end", () => {
       getTaskStatus(repoRoot, first.id).execution.model === "gpt-test-fast" &&
       getTaskStatus(repoRoot, parallel.id).execution.model ===
         "gpt-test-expert",
-    "config reload stopped or mutated active task snapshots",
+    `config reload stopped or mutated active task snapshots: ${JSON.stringify({
+      active: reloadedState.active,
+      workerStates: reloadedState.workerStates,
+      workers: drainingWorkers,
+      first: getTaskStatus(repoRoot, first.id),
+      parallel: getTaskStatus(repoRoot, parallel.id),
+    })}`,
+  );
+  await callMcpStop({ expectError: true });
+  assert(
+    processIsAlive(daemonPid),
+    "runner_stop interrupted active tasks without force",
   );
   writeFileSync(configFile, "{ invalid json\n", "utf8");
   const rejectedReloadState = await waitFor(() => {
@@ -1002,7 +1205,10 @@ process.stdin.on("end", () => {
       rejectedReloadState.active.length === 2 &&
       rejectedReloadState.configReload.appliedAt ===
         reloadedState.configReload.appliedAt,
-    "invalid config replaced the last valid snapshot or stopped active tasks",
+    `invalid config replaced the last valid snapshot or stopped active tasks: ${JSON.stringify({
+      before: reloadedState,
+      after: rejectedReloadState,
+    })}`,
   );
   writeFileSync(
     configFile,
@@ -1022,7 +1228,7 @@ process.stdin.on("end", () => {
       hotProfileTask.execution.reasoningEffort === "medium",
     "new task did not cross 999 monotonically or receive the reloaded profile",
   );
-  cancelTask(repoRoot, hotProfileTask.id);
+  await cancelTask(repoRoot, hotProfileTask.id);
   writeFileSync(
     configFile,
     `${JSON.stringify(baseRuntimeConfig)}\n`,
@@ -1031,11 +1237,6 @@ process.stdin.on("end", () => {
   await waitFor(
     () => readDaemonState(repoRoot)?.workers === 2,
     "daemon did not hot-reload the restored worker limit",
-  );
-  await callMcpStop({ expectError: true });
-  assert(
-    processIsAlive(daemonPid),
-    "runner_stop interrupted active tasks without force",
   );
   process.kill(daemonPid, "SIGTERM");
   await new Promise((resolve) => setTimeout(resolve, 150));
@@ -1110,7 +1311,8 @@ process.stdin.on("end", () => {
       dashboardScript.includes('profileButton.dataset.filterField = "profile"') &&
       dashboardScript.includes("link.dataset.blockerTask = target.id") &&
       dashboardScript.includes('setTimeout(() => loadLog(entry, true), 2000)') &&
-      dashboardScript.includes("tableBody.replaceChildren(fragment)") &&
+      dashboardScript.includes("function reconcileTaskRows") &&
+      !dashboardScript.includes("tableBody.replaceChildren(fragment)") &&
       dashboardScript.includes("window.history.replaceState"),
     "dashboard live DOM updater was not served",
   );
@@ -1131,34 +1333,6 @@ process.stdin.on("end", () => {
       .filter(([, passed]) => !passed)
       .map(([name]) => name)
       .join(", ")}`,
-  );
-  for (const query of [
-    "status:completed|rejected",
-    "status:(completed|rejected)",
-  ]) {
-    const response = await fetch(
-      new URL(`/?q=${encodeURIComponent(query)}`, dashboardUrl),
-    );
-    const html = await response.text();
-    assert(
-      response.status === 200 &&
-        html.includes(`value="${query}"`) &&
-        html.includes("Canceled task") &&
-        html.includes("Completed fixture") &&
-        !html.includes("Failed fixture"),
-      `dashboard OR filter did not support ${query}`,
-    );
-  }
-  const rejectedDashboardResponse = await fetch(
-    new URL("/?q=status%3Arejected", dashboardUrl),
-  );
-  const rejectedDashboardHtml = await rejectedDashboardResponse.text();
-  assert(
-    rejectedDashboardResponse.status === 200 &&
-      rejectedDashboardHtml.includes("Canceled task") &&
-      rejectedDashboardHtml.includes(">rejected</button>") &&
-      !rejectedDashboardHtml.includes(">canceled</button>"),
-    "dashboard did not expose canceled tasks as rejected",
   );
   const defaultDashboardResponse = await fetch(dashboardUrl);
   const defaultDashboardHtml = await defaultDashboardResponse.text();
@@ -1246,21 +1420,52 @@ process.stdin.on("end", () => {
   );
   await waitFor(
     () =>
-      [first, blocked, parallel, external].every(
+      [first, blocked, parallel, backgroundExec].every(
         (task) => getTaskStatus(repoRoot, task.id).status === "completed",
       ) &&
-      getTaskStatus(repoRoot, interactiveFallback.id).status === "failed",
+      getTaskStatus(repoRoot, interactiveFallback.id).status === "failed" &&
+      getTaskStatus(repoRoot, preModelFailure.id).status === "failed",
     "tasks did not complete",
   );
-  const externalBackgroundReceipt = getTaskStatus(repoRoot, external.id);
+  const preModelFailureReceipt = getTaskStatus(repoRoot, preModelFailure.id);
   assert(
-    externalBackgroundReceipt.status === "completed" &&
-      externalBackgroundReceipt.execution?.mode === "background" &&
-      externalBackgroundReceipt.externalSync?.[0]?.commentId ===
-        "background-10001" &&
-      typeof externalBackgroundReceipt.externalSync?.[0]?.syncedAt ===
-        "string",
-    "background external task did not complete with a synchronization receipt",
+    preModelFailureReceipt.attemptLedger?.attempts?.length === 0 &&
+      preModelFailureReceipt.metrics === null,
+    "Git preparation failure was counted as a model attempt",
+  );
+  for (const query of [
+    "status:completed|rejected",
+    "status:(completed|rejected)",
+  ]) {
+    const response = await fetch(
+      new URL(`/?q=${encodeURIComponent(query)}`, dashboardUrl),
+    );
+    const html = await response.text();
+    assert(
+      response.status === 200 &&
+        html.includes(`value="${query}"`) &&
+        html.includes("Canceled task") &&
+        html.includes("Completed fixture") &&
+        !html.includes("Failed fixture"),
+      `dashboard OR filter did not support ${query}`,
+    );
+  }
+  const rejectedDashboardResponse = await fetch(
+    new URL("/?q=status%3Arejected", dashboardUrl),
+  );
+  const rejectedDashboardHtml = await rejectedDashboardResponse.text();
+  assert(
+    rejectedDashboardResponse.status === 200 &&
+      rejectedDashboardHtml.includes("Canceled task") &&
+      rejectedDashboardHtml.includes(">rejected</button>") &&
+      !rejectedDashboardHtml.includes(">canceled</button>"),
+    "dashboard did not expose canceled tasks as rejected",
+  );
+  const backgroundReceipt = getTaskStatus(repoRoot, backgroundExec.id);
+  assert(
+    backgroundReceipt.status === "completed" &&
+      backgroundReceipt.execution?.mode === "background",
+    "background task did not complete through the daemon",
   );
   const interactiveFallbackReceipt = getTaskStatus(
     repoRoot,
@@ -1279,30 +1484,28 @@ process.stdin.on("end", () => {
     .split(/\r?\n/)
     .filter(Boolean)
     .map((line) => JSON.parse(line));
-  const fastInvocation = invocations.find((entry) =>
-    entry.input.includes(".todo/001-first-task.md"),
+  const firstInvocations = invocations.filter((entry) =>
+    entry.input.includes(`Task ID: ${first.id}`),
   );
+  const fastInvocation = firstInvocations[0];
   const persistentInvocation = invocations.find((entry) =>
-    entry.input.includes(".todo/004-parallel-task.md"),
+    entry.input.includes("Task ID: 004-parallel-task"),
   );
   assert(
     invocations.some((entry) =>
-      entry.input.includes(`.todo/${path.basename(external.path)}`),
+      entry.input.includes(`Task ID: ${backgroundExec.id}`),
     ) &&
       invocations.some((entry) =>
-        entry.input.includes(
-          `.todo/${path.basename(interactiveFallback.path)}`,
-        ),
+        entry.input.includes(`Task ID: ${interactiveFallback.id}`),
       ) &&
       !invocations.some((entry) =>
-        entry.input.includes(
-          `.todo/${path.basename(externalInteractive.path)}`,
-        ),
+        entry.input.includes(`Task ID: ${explicitInteractive.id}`),
       ),
     "daemon did not respect background, fallback, and explicit interactive modes",
   );
   assert(
-    fastInvocation?.args.includes("--ephemeral") &&
+    fastInvocation &&
+      !fastInvocation.args.includes("--ephemeral") &&
       fastInvocation.args.includes("--json") &&
       fastInvocation.args[fastInvocation.args.indexOf("--model") + 1] ===
         "gpt-test-fast" &&
@@ -1346,6 +1549,10 @@ process.stdin.on("end", () => {
     path.join(firstAttemptRoot, firstAttempt, "prompt.txt"),
     "utf8",
   );
+  const ponytailPromptIndex = firstPrompt.indexOf(
+    TODO_PONYTAIL_FULL_CONTOUR,
+  );
+  const taskBodyPromptIndex = firstPrompt.indexOf(`Task ID: ${first.id}`);
   const logsResponse = await fetch(
     new URL(`/api/logs?task=${encodeURIComponent(first.id)}`, dashboardUrl),
   );
@@ -1373,29 +1580,37 @@ process.stdin.on("end", () => {
     ),
   );
   assert(
+    ponytailPromptIndex >= 0 &&
+      ponytailPromptIndex ===
+        firstPrompt.lastIndexOf(TODO_PONYTAIL_FULL_CONTOUR) &&
+      ponytailPromptIndex < taskBodyPromptIndex &&
+      !firstPrompt.includes('<!-- TODO {"version":'),
+    "worker prompt did not contain the canonical Ponytail contour exactly once before the metadata-free task body",
+  );
+  assert(
+      firstUsage.schemaVersion === 2 &&
       firstUsage.status === "completed" &&
-      firstUsage.attempts === 1 &&
+      firstUsage.attempt === 1 &&
       typeof firstUsage.startedAt === "string" &&
       typeof firstUsage.completedAt === "string" &&
       Date.parse(firstUsage.completedAt) >= Date.parse(firstUsage.startedAt) &&
       firstUsage.durationMs >= 750 &&
-      firstUsage.durationSeconds > 0 &&
-      firstUsage.durationMinutes > 0 &&
-      /^\d{2,}d \d{2}h \d{2}m \d{2}s$/.test(firstUsage.durationHuman) &&
-      firstUsage.runs?.length === 1 &&
-      firstUsage.runs[0].startedAt === firstUsage.startedAt &&
-      firstUsage.runs[0].completedAt === firstUsage.completedAt &&
-      firstUsage.lastRun.startedAt === firstUsage.startedAt &&
-      firstUsage.lastRun.completedAt === firstUsage.completedAt &&
       firstUsage.tokenUsage.available === true &&
+      firstUsage.tokenUsage.coverage === "full" &&
       firstUsage.tokenUsage.inputTokens === 101 &&
       firstUsage.tokenUsage.cachedInputTokens === 40 &&
       firstUsage.tokenUsage.outputTokens === 17 &&
       firstUsage.tokenUsage.reasoningOutputTokens === 3 &&
       firstUsage.tokenUsage.totalTokens === 118 &&
+      firstUsage.requestStats?.available === true &&
+      firstUsage.requestStats.coverage === "full" &&
+      firstUsage.requestStats.requests?.length === 1 &&
+      firstUsage.requestStats.requests[0].ttftMs === 25 &&
+      !JSON.stringify(firstUsage).includes("RAW_OTLP_SHOULD_NOT_PERSIST") &&
       firstUsage.promptFile === "prompt.txt" &&
       firstPrompt.includes("You are a ToDo worker") &&
-      firstPrompt.includes("Task file: .todo/001-first-task.md") &&
+      firstPrompt.includes("Do not create follow-up ToDo tasks") &&
+      taskBodyPromptIndex >= 0 &&
       logsResponse.status === 200 &&
       transcriptEntry?.label === "Readable transcript" &&
       logsPayload.logs.some((entry) => entry.file === "prompt.txt") &&
@@ -1409,10 +1624,9 @@ process.stdin.on("end", () => {
       runnerLog.includes("event=task_start") &&
       runnerLog.includes("event=task_end") &&
       runnerLog.includes("startedAt=") &&
-      runnerLog.includes("completedAt=") &&
-      runnerLog.includes("durationSeconds=") &&
-      runnerLog.includes("durationMinutes=") &&
-      runnerLog.includes("tokenUsage=") &&
+      runnerLog.includes("durationMs=") &&
+      runnerLog.includes("totalTokens=118") &&
+      runnerLog.includes('coverage="full"') &&
       runnerLog.includes("event=config_reloaded") &&
       runnerLog.includes('changed=["workers","modelProfiles","defaultModelProfile"]') &&
       runnerLog.includes("activeTasksPreserved=2") &&
@@ -1422,12 +1636,18 @@ process.stdin.on("end", () => {
   assert(
     firstReceipt.metrics?.startedAt === firstUsage.startedAt &&
       firstReceipt.metrics?.completedAt === firstUsage.completedAt &&
-      firstReceipt.metrics?.durationHuman === firstUsage.durationHuman &&
+      firstReceipt.metrics?.durationMs === firstUsage.durationMs &&
       firstReceipt.metrics?.runs?.length === 1 &&
       firstReceipt.metrics?.lastRun?.startedAt === firstUsage.startedAt &&
       firstReceipt.metrics?.lastRun?.completedAt === firstUsage.completedAt &&
-      firstReceipt.metrics?.tokenUsage?.totalTokens === 118,
-    "completion receipt did not expose task time and token usage",
+      firstReceipt.metrics?.tokenUsage?.totalTokens === 118 &&
+      firstInvocations.length === 1 &&
+      firstReceipt.attemptLedger?.attempts?.length === 1 &&
+      firstReceipt.attemptLedger.attempts[0].trigger === "initial" &&
+      firstReceipt.attemptLedger.attempts[0].status === "completed" &&
+      firstReceipt.retryStats?.modelRetries === 0 &&
+      firstReceipt.retryStats?.deliveryRetries === 0,
+    "successful task did not preserve one-pass completion and usage",
   );
   const completedDashboardResponse = await fetch(dashboardUrl);
   const completedDashboardHtml = await completedDashboardResponse.text();
@@ -1438,14 +1658,23 @@ process.stdin.on("end", () => {
       completedDashboardHtml.includes(">Duration<") &&
       completedDashboardHtml.includes(">Last Run<") &&
       completedDashboardHtml.includes(">Tokens<") &&
+      completedDashboardHtml.includes(">Retries<") &&
       completedDashboardHtml.includes("<th>Logs</th>") &&
       !completedDashboardHtml.includes("00d 00h 00m") &&
       completedDashboardHtml.includes(">118</td>"),
     "dashboard did not expose task time and token usage",
   );
+  const retryImplementationBrief = [
+    "## Ponytail implementation brief",
+    "- Owner, flow, and affected callers: fake retry worker path.",
+    "- Existing solution or contract to reuse: existing daemon retry contract.",
+    "- Minimal implementation path: retry the unchanged body once.",
+    "- Explicitly excluded options: no broad rediscovery.",
+    "- Minimal validation: both prompts retain this exact brief.",
+  ].join("\n");
   const retrying = createTask(repoRoot, {
     title: "Retry metrics task",
-    description: "Retry this task after first failure.",
+    description: `Retry this task after first failure.\n\n${retryImplementationBrief}`,
   });
   await waitFor(
     () => getTaskStatus(repoRoot, retrying.id).status === "completed",
@@ -1455,6 +1684,40 @@ process.stdin.on("end", () => {
   const retriedRunnerLog = readFileSync(
     path.join(repoRoot, ".todo", "runner.log"),
     "utf8",
+  );
+  const retryAttemptDirs = readdirSync(
+    path.join(repoRoot, ".todo", "logs", retrying.id),
+  )
+    .filter((name) => name.startsWith("attempt-"))
+    .sort();
+  const retryUsageFiles = retryAttemptDirs
+    .map((name) =>
+      JSON.parse(
+        readFileSync(
+          path.join(
+            repoRoot,
+            ".todo",
+            "logs",
+            retrying.id,
+            name,
+            "usage.json",
+          ),
+          "utf8",
+        ),
+      ),
+    );
+  const retryPrompts = retryAttemptDirs.map((name) =>
+    readFileSync(
+      path.join(
+        repoRoot,
+        ".todo",
+        "logs",
+        retrying.id,
+        name,
+        "prompt.txt",
+      ),
+      "utf8",
+    ),
   );
   assert(
     retriedReceipt.metrics?.attempts === 2 &&
@@ -1472,132 +1735,61 @@ process.stdin.on("end", () => {
           (total, run) => total + run.durationMs,
           0,
         ) &&
+      retryUsageFiles.length === 2 &&
+      retryUsageFiles.every(
+        (usage, index) =>
+          usage.schemaVersion === 2 &&
+          usage.attempt === index + 1 &&
+          usage.tokenUsage.totalTokens === 118 &&
+          usage.requestStats.coverage === "full" &&
+          usage.runs === undefined &&
+          usage.lastRun === undefined,
+      ) &&
+      retryUsageFiles[0].status === "failed_transient" &&
+      retryUsageFiles[1].status === "completed" &&
+      retryPrompts.length === 2 &&
+      retryPrompts.every(
+        (prompt) =>
+          prompt.includes(retryImplementationBrief) &&
+          prompt.indexOf(TODO_PONYTAIL_FULL_CONTOUR) ===
+            prompt.lastIndexOf(TODO_PONYTAIL_FULL_CONTOUR) &&
+          !prompt.includes('<!-- TODO {"version":'),
+      ) &&
+      retriedReceipt.attemptLedger?.attempts?.length === 2 &&
+      retriedReceipt.attemptLedger.attempts[0].trigger === "initial" &&
+      retriedReceipt.attemptLedger.attempts[1].trigger ===
+        "automatic_retry" &&
+      retriedReceipt.retryStats?.modelRetries === 1 &&
+      retriedReceipt.retryStats?.automaticRetries === 1 &&
+      retriedReceipt.retryStats?.deliveryRetries === 0 &&
       retriedRunnerLog.includes("event=task_auto_retry"),
     "automatic retry did not accumulate time and token usage",
   );
-  const externalClaim = startInteractiveTask(
+  const explicitClaim = await startInteractiveTask(
     repoRoot,
-    externalInteractive.id,
+    explicitInteractive.id,
   );
-  let missingExternalSyncRejected = false;
-  try {
-    finishInteractiveTask(repoRoot, externalInteractive.id, {
-      claimToken: externalClaim.claimToken,
-      status: "completed",
-      summary: "Implementation completed but no external receipt supplied.",
-    });
-  } catch (error) {
-    missingExternalSyncRejected = error.message.includes(
-      "AI-attributed comment receipts",
-    );
-  }
-  assert(
-    missingExternalSyncRejected &&
-      getTaskStatus(repoRoot, externalInteractive.id).status === "running",
-    "external task completed without synchronization evidence",
-  );
-  let missingDisclosureRejected = false;
-  try {
-    finishInteractiveTask(repoRoot, externalInteractive.id, {
-      claimToken: externalClaim.claimToken,
-      status: "completed",
-      summary: "Implementation and Jira synchronization completed.",
-      externalSync: [
-        {
-          service: "jira",
-          resourceId: "GBX-124",
-          startedStatus: "In Progress",
-          finalStatus: "Done",
-          commentId: "10001",
-          commentText: "Implemented and validated the requested change.",
-          aiDisclosure: true,
-        },
-      ],
-    });
-  } catch (error) {
-    missingDisclosureRejected = error.message.includes(
-      "Codex or AI/ИИ",
-    );
-  }
-  assert(
-    missingDisclosureRejected,
-    "external comment without an AI disclosure was accepted",
-  );
-  const externalComment =
-    "Performed by Codex (AI). Completed the requested implementation and smoke validation.";
-  const externalReceipt = finishInteractiveTask(
+  const explicitReceipt = await finishInteractiveTask(
     repoRoot,
-    externalInteractive.id,
+    explicitInteractive.id,
     {
-      claimToken: externalClaim.claimToken,
+      claimToken: explicitClaim.claimToken,
       status: "completed",
-      summary: "Implementation and Jira synchronization completed.",
-      validation: ["external workflow smoke validation"],
-      externalSync: [
-        {
-          service: "jira",
-          resourceId: "GBX-124",
-          startedStatus: "In Progress",
-          finalStatus: "Done",
-          commentId: "10002",
-          commentUrl:
-            "https://jira.example.test/browse/GBX-124?focusedCommentId=10002",
-          commentText: externalComment,
-          aiDisclosure: true,
-        },
-      ],
+      summary: "Completed through explicit current-thread execution.",
+      validation: ["interactive execution smoke validation"],
     },
   );
   assert(
-    externalReceipt.status === "completed" &&
-      externalReceipt.execution?.mode === "interactive" &&
-      externalReceipt.externalWorkflows?.[0]?.resourceId === "GBX-124" &&
-      externalReceipt.externalSync?.[0]?.startedStatus === "In Progress" &&
-      externalReceipt.externalSync?.[0]?.finalStatus === "Done" &&
-      externalReceipt.externalSync?.[0]?.commentId === "10002" &&
-      externalReceipt.externalSync?.[0]?.commentText === externalComment &&
-      externalReceipt.externalSync?.[0]?.aiDisclosure === true &&
-      typeof externalReceipt.externalSync?.[0]?.syncedAt === "string",
-    "external workflow completion receipt was incomplete",
-  );
-  const externalFailure = createTask(repoRoot, {
-    title: "External Asana sync failure",
-    description: "Record a connector failure without false completion.",
-    runMode: "interactive",
-    externalWorkflows: [
-      {
-        service: "asana",
-        resourceId: "1200123456789",
-      },
-    ],
-  });
-  const externalFailureClaim = startInteractiveTask(
-    repoRoot,
-    externalFailure.id,
-  );
-  const externalFailureReceipt = finishInteractiveTask(
-    repoRoot,
-    externalFailure.id,
-    {
-      claimToken: externalFailureClaim.claimToken,
-      status: "failed",
-      summary: "Could not synchronize the Asana workflow.",
-      error: "Asana connector was unavailable.",
-      externalSyncError: "Asana connector was unavailable.",
-    },
-  );
-  assert(
-    externalFailureReceipt.status === "failed" &&
-      externalFailureReceipt.externalSyncError ===
-        "Asana connector was unavailable.",
-    "external synchronization failure was falsely completed or not recorded",
+    explicitReceipt.status === "completed" &&
+      explicitReceipt.execution?.mode === "interactive",
+    "explicit interactive task did not complete",
   );
   const interactive = createTask(repoRoot, {
     title: "Interactive browser task",
     description: "Complete this task in the current Codex thread.",
     runMode: "interactive",
   });
-  const interactiveClaim = startInteractiveTask(repoRoot, interactive.id);
+  const interactiveClaim = await startInteractiveTask(repoRoot, interactive.id);
   assert(
     interactiveClaim.task.status === "running" &&
       interactiveClaim.task.workerId === "interactive",
@@ -1626,7 +1818,7 @@ process.stdin.on("end", () => {
       secondInteractiveTask.metrics.lastRun.completedAt === null,
     "interactive duration was not live or tokens did not default to zero",
   );
-  const interactiveReceipt = finishInteractiveTask(
+  const interactiveReceipt = await finishInteractiveTask(
     repoRoot,
     interactive.id,
     {
@@ -1646,6 +1838,32 @@ process.stdin.on("end", () => {
         interactiveReceipt.metrics.startedAt,
     "current-thread completion was not recorded correctly",
   );
+  const transientInteractive = createTask(repoRoot, {
+    title: "Transient interactive failure",
+    description: "Classify a concrete interactive execution failure.",
+    runMode: "interactive",
+  });
+  const transientInteractiveClaim = await startInteractiveTask(
+    repoRoot,
+    transientInteractive.id,
+  );
+  const transientInteractiveReceipt = await finishInteractiveTask(
+    repoRoot,
+    transientInteractive.id,
+    {
+      claimToken: transientInteractiveClaim.claimToken,
+      status: "failed",
+      summary: "Interactive execution failed.",
+      error: "HTTP 503 service unavailable",
+    },
+  );
+  assert(
+    transientInteractiveReceipt.outcome === "failed_transient" &&
+      transientInteractiveReceipt.attemptLedger?.attempts?.at(-1)?.status ===
+        "failed_transient",
+    "interactive HTTP 503 was not classified as transient",
+  );
+  await cancelTask(repoRoot, transientInteractive.id);
   assert(
     firstReceipt.artifacts?.length === 5,
     "completion receipt did not preserve artifacts",
@@ -1657,13 +1875,316 @@ process.stdin.on("end", () => {
     );
   }
 
+  const unauthorizedParent = createTask(repoRoot, {
+    title: "Unauthorized worker delegation",
+    description: "Verify that implicit delegation is rejected.",
+    modelProfile: "fast",
+    runMode: "interactive",
+  });
+  const unauthorizedClaim = claimTask(unauthorizedParent.path, 77);
+  try {
+    const rejectedCreation = await callMcpTool(
+      "task_create",
+      {
+        repoPath: repoRoot,
+        title: "Forbidden nested task",
+        description: "This task must not be created.",
+        modelProfile: "expert",
+      },
+      {
+        TODO_RUNNER_WORKER: "1",
+        TODO_RUNNER_REPO_ROOT: repoRoot,
+        TODO_RUNNER_TASK_ID: unauthorizedParent.id,
+      },
+    );
+    assert(
+      rejectedCreation?.isError === true &&
+        rejectedCreation.content?.[0]?.text?.includes(
+          "does not record explicit user authorization",
+        ),
+      `claimed worker created a follow-up task without explicit authorization: ${JSON.stringify(rejectedCreation)}`,
+    );
+  } finally {
+    releaseClaim(unauthorizedClaim);
+  }
+  const unverifiedDeliveryUpdate = await callMcpTool("task_update", {
+    repoPath: repoRoot,
+    id: unauthorizedParent.id,
+    delivery: "pr",
+  });
+  assert(
+    unverifiedDeliveryUpdate?.isError === true &&
+      getTaskStatus(repoRoot, unauthorizedParent.id).git?.delivery === "keep",
+    "task_update changed Git delivery without a matching preflight",
+  );
+
+  const tasksBeforePreflight = listTaskStatuses(repoRoot).map((task) => task.id);
+  const failedPreflight = await callMcpTool("task_preflight", {
+    repoPath: repoRoot,
+    gitDeliveries: ["keep"],
+    capabilityReports: [
+      {
+        connector: "firebase",
+        scope: "projects/test/events",
+        access: "read",
+        status: "interactive_required",
+      },
+    ],
+  });
+  const missingPreflightCreate = await callMcpTool("task_create", {
+    repoPath: repoRoot,
+    title: "Must not exist",
+    description: "Creation without a successful preflight must fail.",
+  });
+  const missingRepoPath = await callMcpTool("runner_status", {});
+  assert(
+    failedPreflight?.isError === true &&
+      missingPreflightCreate?.isError === true &&
+      missingRepoPath?.isError === true &&
+      JSON.stringify(listTaskStatuses(repoRoot).map((task) => task.id)) ===
+        JSON.stringify(tasksBeforePreflight),
+    "failed or missing preflight created a task",
+  );
+
+  writeFileSync(
+    configFile,
+    `${JSON.stringify({
+      ...baseRuntimeConfig,
+      executionBackend: "app-server",
+    })}\n`,
+    "utf8",
+  );
+  const appServerPreflight = await callMcpTool("task_preflight", {
+    repoPath: repoRoot,
+    gitDeliveries: ["keep"],
+    capabilityReports: [],
+  });
+  assert(
+    appServerPreflight?.isError !== true &&
+      appServerPreflight?.structuredContent?.preflightId,
+    `app-server preflight failed: ${JSON.stringify(appServerPreflight)}`,
+  );
+  writeFileSync(
+    configFile,
+    `${JSON.stringify(baseRuntimeConfig)}\n`,
+    "utf8",
+  );
+
+  const authorizedPreflight = await callMcpTool("task_preflight", {
+    repoPath: repoRoot,
+    gitDeliveries: ["keep"],
+    capabilityReports: [],
+  });
+  assert(
+    authorizedPreflight?.isError !== true &&
+      authorizedPreflight?.structuredContent?.preflightId,
+    `task preflight failed: ${JSON.stringify(authorizedPreflight)}`,
+  );
+  const tasksBeforeInvalidBatch = listTaskStatuses(repoRoot).map(
+    (task) => task.id,
+  );
+  const invalidBatch = await callMcpTool("task_batch_create", {
+    repoPath: repoRoot,
+    preflightId: authorizedPreflight.structuredContent.preflightId,
+    tasks: [
+      {
+        title: "Batch rollback first",
+        description: "This staged task must be rolled back.",
+        runMode: "interactive",
+      },
+      {
+        title: "Batch rollback invalid",
+        description: "",
+        runMode: "interactive",
+      },
+    ],
+  });
+  assert(
+    invalidBatch?.isError === true &&
+      JSON.stringify(listTaskStatuses(repoRoot).map((task) => task.id)) ===
+        JSON.stringify(tasksBeforeInvalidBatch),
+    "invalid batch left a partial runnable task",
+  );
+  const authorizedParent = createTask(repoRoot, {
+    title: "Fast verification with expert follow-up",
+    description:
+      "Verify the behavior and create an expert implementation task for confirmed findings.",
+    modelProfile: "fast",
+    runMode: "interactive",
+    allowWorkerTaskCreation: true,
+    preflightId: authorizedPreflight.structuredContent.preflightId,
+  });
+  const workerPlan = taskWorktreePlan({
+    repoRoot,
+    taskId: authorizedParent.id,
+    title: authorizedParent.title,
+    targetBranch: authorizedParent.git.targetBranch,
+    delivery: authorizedParent.git.delivery,
+    branch: authorizedParent.git.branch,
+  });
+  await prepareTaskWorktree(workerPlan);
+  const workerEnv = {
+    TODO_RUNNER_WORKER: "1",
+    TODO_RUNNER_REPO_ROOT: repoRoot,
+    TODO_RUNNER_WORKTREE: workerPlan.worktreePath,
+    TODO_RUNNER_TASK_ID: authorizedParent.id,
+  };
+  const worktreeHookContext = runRoutingHook(
+    {
+      cwd: workerPlan.worktreePath,
+      hook_event_name: "SubagentStart",
+      agent_type: "general-purpose",
+    },
+    workerEnv,
+  );
+  assert(
+    worktreeHookContext?.hookSpecificOutput?.additionalContext?.includes(
+      TODO_ROUTING_POLICY,
+    ) &&
+      worktreeHookContext.hookSpecificOutput.additionalContext.includes(
+        TODO_PONYTAIL_FULL_CONTOUR,
+      ) &&
+      worktreeHookContext.hookSpecificOutput.additionalContext.includes(
+        "already claimed ToDo background worker",
+      ),
+    "claimed-worker hook did not resolve activation from a real task worktree",
+  );
+  const authorizedClaim = claimTask(authorizedParent.path, 78);
+  let authorizedCreation;
+  try {
+    const workerPreflight = await callMcpTool(
+      "task_preflight",
+      {
+        repoPath: workerPlan.worktreePath,
+        gitDeliveries: ["keep"],
+        capabilityReports: [
+          {
+            connector: "jira",
+            scope: "issues/read",
+            access: "read",
+            status: "ok",
+          },
+        ],
+      },
+      workerEnv,
+    );
+    const workerPreflightId =
+      workerPreflight?.structuredContent?.preflightId;
+    assert(
+      workerPreflight?.isError !== true && workerPreflightId,
+      `worker worktree preflight was not normalized to the claimed repository: ${JSON.stringify(workerPreflight)}`,
+    );
+
+    const foreignRepo = path.join(repoRoot, ".todo", "foreign-worker-repo");
+    mkdirSync(foreignRepo, { recursive: true });
+    const foreignInit = spawnSync("git", ["-C", foreignRepo, "init", "--quiet"], {
+      encoding: "utf8",
+    });
+    assert(foreignInit.status === 0, foreignInit.stderr || "foreign git init failed");
+    const foreignPreflight = await callMcpTool(
+      "task_preflight",
+      { repoPath: foreignRepo, gitDeliveries: ["keep"] },
+      workerEnv,
+    );
+    assert(
+      foreignPreflight?.isError === true,
+      "worker repoPath escaped to a repository with a different git-common-dir",
+    );
+
+    const tasksBeforeWorkerFailures = listTaskStatuses(repoRoot).map(
+      (task) => task.id,
+    );
+    const restartRequest = path.join(repoRoot, ".todo", ".daemon-restart.json");
+    writeFileSync(restartRequest, '{"status":"pending"}\n', "utf8");
+    let updateBlocked;
+    try {
+      updateBlocked = await callMcpTool(
+        "task_create",
+        {
+          repoPath: workerPlan.worktreePath,
+          preflightId: workerPreflightId,
+          requiredCapabilities: [
+            { connector: "jira", scope: "issues/read", access: "read" },
+          ],
+          title: "Blocked during runtime update",
+          description: "This follow-up must not be published.",
+          runMode: "interactive",
+        },
+        workerEnv,
+      );
+    } finally {
+      unlinkSync(restartRequest);
+    }
+    const uncoveredCapability = await callMcpTool(
+      "task_create",
+      {
+        repoPath: workerPlan.worktreePath,
+        preflightId: workerPreflightId,
+        requiredCapabilities: [
+          {
+            connector: "firebase",
+            scope: "projects/test/events",
+            access: "read",
+          },
+        ],
+        title: "Unverified connector follow-up",
+        description: "This follow-up must not be published.",
+        runMode: "interactive",
+      },
+      workerEnv,
+    );
+    assert(
+      updateBlocked?.isError === true &&
+        uncoveredCapability?.isError === true &&
+        JSON.stringify(listTaskStatuses(repoRoot).map((task) => task.id)) ===
+          JSON.stringify(tasksBeforeWorkerFailures),
+      "worker published during runtime update or dropped a requested capability",
+    );
+
+    authorizedCreation = await callMcpTool(
+      "task_create",
+      {
+        repoPath: workerPlan.worktreePath,
+        preflightId: workerPreflightId,
+        requiredCapabilities: [
+          { connector: "jira", scope: "issues/read", access: "read" },
+        ],
+        title: "Expert implementation follow-up",
+        description: "Implement the findings confirmed by the parent task.",
+        modelProfile: "expert",
+        runMode: "interactive",
+        allowWorkerTaskCreation: true,
+      },
+      workerEnv,
+    );
+  } finally {
+    releaseClaim(authorizedClaim);
+  }
+  const followUp = authorizedCreation?.structuredContent?.task;
+  assert(
+    authorizedCreation?.isError !== true &&
+      followUp?.parentTaskId === authorizedParent.id &&
+      followUp.blockers?.includes(authorizedParent.id) &&
+      followUp.allowWorkerTaskCreation === false &&
+      followUp.preflight?.capabilities?.some(
+        (capability) => capability.connector === "jira",
+      ) &&
+      followUp.execution?.modelProfile === "expert",
+    `explicitly authorized worker follow-up did not preserve parent, dependency, profile, or non-propagation: ${JSON.stringify(authorizedCreation)}`,
+  );
+
   await callMcp();
   await callMcpStop();
 
   writeFileSync(configFile, '{"retries":-1}\n', "utf8");
   assert(
     loadConfig(repoRoot).retries === -1 &&
-      canAutoRetry(loadConfig(repoRoot), { attempts: 999 }),
+      canAutoRetry(loadConfig(repoRoot), {
+        attemptLedger: {
+          attempts: [{ status: "failed_transient" }],
+          deliveryAttempts: [],
+        },
+      }),
     "retries=-1 was not loaded as unlimited",
   );
   writeFileSync(configFile, "{ invalid json\n", "utf8");
@@ -1679,9 +2200,9 @@ process.stdin.on("end", () => {
       status: "passed",
       maxActive,
       dependencyUnlocked: true,
-      completionReceipts: 6,
+      completionReceipts: 5,
       invalidWorkersFallback: fallback.workers,
-      mcpTools: 15,
+      mcpTools: 18,
       repoInit: true,
       modelProfiles: true,
       taskEphemeralOverride: true,
@@ -1714,17 +2235,9 @@ process.stdin.on("end", () => {
       liveDuration: true,
       zeroDefaultTokens: true,
       interactiveCurrentThread: true,
-      externalWorkflowModeIndependent: true,
+      explicitWorkerTaskCreation: true,
       backgroundFailureRequiresInteractive: true,
-      externalWorkflowSyncRequired: true,
-      externalAiDisclosureRecorded: true,
-      externalSyncFailureRecorded: true,
-      codexCliTypedConstSchema: true,
       strictResultSchemaObjects: true,
-      nullableExternalSyncCommentUrl: true,
-      validExternalSyncCommentUrl: true,
-      invalidExternalSyncCommentUrlRejected: true,
-      mcpNullableExternalSyncCommentUrl: true,
       daemonConflictProtection: true,
       unownedSigtermIgnored: true,
       taskUpdate: true,

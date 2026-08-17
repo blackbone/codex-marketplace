@@ -5,6 +5,8 @@ description: Show the local ToDo dashboard URL for an activated repository witho
 
 # ToDo Dashboard
 
+Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
+
 1. Call `runner_status`.
 2. Return `dashboardUrl` when the daemon is running.
 3. If no URL is available, report the runner state and tell the user to invoke `$todo:start`; do not start it automatically.

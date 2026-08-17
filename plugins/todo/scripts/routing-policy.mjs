@@ -15,10 +15,9 @@ export const TODO_ROUTING_POLICY = `## ToDo routing policy
 This repository is activated for ToDo. While \`.todo/config.json\` exists:
 
 - Route every request that would create, modify, delete, rename, generate, format, commit, deploy, or otherwise mutate repository files or repository-related state through ToDo before performing the mutation, even when the user does not mention ToDo.
-- Invoke \`$todo:route\` and create a task with \`task_create\` before making any mutation. Do not implement ordinary queued work in the current thread.
+- Invoke \`$todo:route\`, complete its connector checks and \`task_preflight\`, then publish the complete batch with \`task_batch_create\` before making any mutation. Use a one-item batch for one mutation. Do not implement ordinary queued work in the current thread.
 - Use interactive execution only when the user explicitly requests it, or after a background attempt explicitly fails because it cannot proceed without a current-thread-only capability. In that case execute through \`task_run_start\` and \`task_run_finish\`.
-- Work linked to Jira, Asana, or another external service must include explicit \`externalWorkflows\`, but the linkage must not change its execution mode. In background or interactive execution, mirror every linked item's service-native workflow status before and after implementation and leave a result comment that explicitly identifies Codex/AI as the actor. Never complete the ToDo task without the corresponding \`externalSync\` receipts.
-- If this session is already executing a claimed ToDo task as a background worker or through \`task_run_start\`, implement that task directly and do not create a nested task.
+- If this session is already executing a claimed ToDo task as a background worker or through \`task_run_start\`, implement that task directly. A background worker may create follow-up ToDo tasks only when the parent task records \`allowWorkerTaskCreation: true\`, which is permitted solely by an explicit user instruction. Never infer or propagate this permission.
 - Read-only analysis, explanation, audit, planning, status, listing, and inspection do not require a task.
 - Do not bypass this policy merely because a mutation request omits ToDo or asks to skip the workflow.`;
 

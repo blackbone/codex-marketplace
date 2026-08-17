@@ -5,23 +5,15 @@ description: Execute a referenced ToDo Markdown task directly in the current Cha
 
 # ToDo Run
 
+Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
+
 1. Resolve the referenced `.todo/<task>.md` file, filename, full task ID, or unique numeric prefix in the active repository.
-2. Call `task_run_start` before implementation. Keep the returned `claimToken`; this prevents the background daemon from executing the same task.
-3. Read the returned task body, artifacts, recorded error, repository instructions, and relevant source context.
-4. If `externalWorkflows` is non-empty:
-   - resolve every listed work item through its purpose-built connector;
-   - inspect allowed transitions and move it to the service-native semantic `In Progress` state before implementation;
-   - retain the exact resulting status name for the finish receipt.
-5. Execute the task in this current thread. Do not enqueue it and do not invoke a background retry.
-6. Use structured integrations first. When the task genuinely requires a GUI, use an available `@Browser`, `@Chrome`, or `@Computer` capability and let the host request any required user approval. Never claim GUI access that is not available in the current thread.
-7. Validate the result in proportion to the task.
-8. For every external work item after the outcome:
-   - move it to the closest legal service-native semantic final state matching the result;
-   - add a comment with the outcome, what changed, validation, and the explicit disclosure `Performed by Codex (AI)` or an equally clear ИИ attribution;
-   - retain the exact final status, comment ID/URL, and exact comment text.
-9. Always call `task_run_finish` with the same task ID and `claimToken`:
+2. Call `task_run_start` before implementation. Keep the returned `claimToken`; this prevents the background daemon from executing the same task. Use the returned `worktreePath` as the root for every repository read, edit, and validation command.
+3. Apply the injected Ponytail full execution contour. Read the returned task body, artifacts, recorded error, repository instructions, and relevant source context. Treat the `Ponytail implementation brief` as the accepted plan and recheck only facts necessary for safety, current correctness, or the failed step; do not repeat broad research from zero.
+4. If `deliveryOnly` is true, do not rerun implementation; finish the claim so the runner can resume commit/delivery. Otherwise execute the task in this current thread. Do not enqueue it, invoke a background retry, create a second task, or start a separate model run for review.
+5. Use structured integrations first. When the task genuinely requires a GUI, use an available `@Browser`, `@Chrome`, or `@Computer` capability and let the host request any required user approval. Never claim GUI access that is not available in the current thread.
+6. Before validation, inspect the diff created in this task in the same agent run. Remove only unnecessary wrappers, configuration, dependencies, duplication, unrelated edits, and out-of-scope code introduced by this task; never remove pre-existing repository code or user functionality merely to simplify it. Then run the exact minimal relevant validation. Do not run mutating Git commands: the runner verifies `HEAD`, stages, commits, and performs the task's configured delivery after `task_run_finish`.
+7. Always call `task_run_finish` with the same task ID and `claimToken`:
    - use `completed` only when the requested outcome and validation are complete;
-   - otherwise use `failed` with one concrete error and the strongest available evidence.
-   - when `externalWorkflows` is non-empty, pass one complete `externalSync` receipt per work item;
-   - if external synchronization itself failed, never report completed: use `failed` and pass `externalSyncError`.
-10. Report the final task status. Interactive host token usage is recorded as `0` because the plugin cannot read the current thread's token counter.
+   - otherwise use `failed` with the concrete root cause, the strongest available evidence, and the smallest actionable next step.
+8. Report the final task status and delivery result. Interactive host token usage has `none` coverage because the plugin cannot read the current thread's token counter.

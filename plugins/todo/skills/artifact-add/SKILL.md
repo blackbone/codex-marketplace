@@ -5,6 +5,8 @@ description: Attach chat images, files, code references, URLs, or text context t
 
 # ToDo Artifact Add
 
+Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
+
 1. Require a full task ID or unique numeric prefix.
 2. Map each attachment to the appropriate artifact kind: `image`, `file`, `code`, `url`, or `text`.
 3. Add a concise label and explain what the worker must inspect.

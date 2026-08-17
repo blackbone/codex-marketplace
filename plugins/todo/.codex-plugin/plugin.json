@@ -1,15 +1,15 @@
 {
   "name": "todo",
-  "version": "0.1.0+codex.20260804115237",
-  "description": "Durable repository and external-workflow routing through mode-independent ToDo tasks.",
+  "version": "0.1.0+codex.20260814110310",
+  "description": "Durable repository task routing with persistent per-task Codex threads, isolated Git delivery, and telemetry.",
   "author": {
     "name": "blackbone"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "ToDo",
-    "shortDescription": "Durable task routing and execution",
-    "longDescription": "Routes repository mutations through monotonically numbered local .todo tasks even without an explicit ToDo mention, hot-reloads worker/profile configuration without interrupting active tasks, runs work in background Codex workers by default, exposes live execution prompts, transcripts, raw logs, results, and usage in the local dashboard, and keeps external Jira/Asana-style work items synchronized with AI-attributed audit comments independently of background or interactive execution.",
+    "shortDescription": "Persistent-thread durable task execution",
+    "longDescription": "Routes repository mutations through durable local tasks, runs one Codex app-server per repository with a persistent thread per task, archives each thread between worker attempts and restores it for retries or reopen, validates connectors and Git state before atomic publication, executes in runner-owned worktrees, and records attempt telemetry.",
     "developerName": "blackbone",
     "category": "Productivity",
     "capabilities": [

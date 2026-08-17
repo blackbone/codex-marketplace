@@ -14,9 +14,24 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { ensureRepoRoutingPolicy } from "./routing-policy.mjs";
+import {
+  appendDeliveryAttempt,
+  appendModelAttempt,
+  classifyFailure,
+  createAttemptLedger,
+} from "./attempt-ledger.mjs";
+import {
+  cleanupTaskWorktree,
+  commitTaskWorktree,
+  deliverTaskWorktree,
+  prepareTaskWorktree,
+  taskBranchName,
+  taskWorktreePlan,
+  verifyTaskWorktreeHead,
+} from "./git-worktree.mjs";
 
 export const DEFAULT_WORKERS = 4;
 export const DEFAULT_POLL_INTERVAL_MS = 2000;
@@ -28,38 +43,72 @@ export const DAEMON_PROTOCOL_VERSION = 2;
 export const DEFAULT_MODEL_PROFILES = [
   {
     name: "fast",
+    model: "gpt-5.6-luna",
+    reasoningEffort: "medium",
+    description: "Mechanical file operations and exact text insertions.",
+  },
+  {
+    name: "medium",
     model: "gpt-5.6-terra",
     reasoningEffort: "medium",
-    description: "Focused, low-risk implementation work.",
+    description: "Small, bounded edits across a few files.",
   },
   {
     name: "expert",
     model: "gpt-5.6-sol",
-    reasoningEffort: "high",
-    description: "Complex or cross-cutting implementation work.",
+    reasoningEffort: "xhigh",
+    description: "Most coding tasks and complex implementation work.",
+  },
+  {
+    name: "ultra",
+    model: "gpt-5.6-sol",
+    reasoningEffort: "ultra",
+    description: "Large, high-risk, cross-cutting refactors.",
   },
 ];
 export const DEFAULT_MODEL_PROFILE = "expert";
 export const DEFAULT_ROUTING_MODE = "all-mutations";
+export const DEFAULT_EXECUTION_BACKEND = "app-server";
+export const DEFAULT_GIT_DELIVERY = "keep";
+export const DEFAULT_GIT_REMOTE = "origin";
 export const DEFAULT_CONFIG = {
   workers: DEFAULT_WORKERS,
   pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
   configReloadIntervalMs: DEFAULT_CONFIG_RELOAD_INTERVAL_MS,
   dashboardPort: DEFAULT_DASHBOARD_PORT,
   retries: DEFAULT_RETRIES,
+  executionBackend: DEFAULT_EXECUTION_BACKEND,
   gitExclude: [".todo/"],
   models: DEFAULT_MODEL_PROFILES,
   defaultModelProfile: DEFAULT_MODEL_PROFILE,
   routingMode: DEFAULT_ROUTING_MODE,
+  git: {
+    delivery: DEFAULT_GIT_DELIVERY,
+    targetBranch: null,
+    remote: DEFAULT_GIT_REMOTE,
+  },
 };
 export const TASK_NAME_PATTERN =
   /^[0-9]+-[a-z0-9]+(?:-[a-z0-9]+)*\.md$/;
 const HEADER_PATTERN = /^<!-- TODO (\{.*\}) -->$/;
 const MODEL_PROFILE_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const EXTERNAL_SERVICE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const EXTERNAL_AI_DISCLOSURE_PATTERN =
-  /(?:\bai\b|codex|ии|искусственн(?:ый|ым|ого)\s+интеллект)/iu;
 const TASK_RUN_MODES = new Set(["background", "interactive"]);
+const TASK_GIT_DELIVERIES = new Set(["keep", "merge", "pr"]);
+const CONFIG_GIT_DELIVERIES = new Set(["keep", "merge"]);
+const TASK_GIT_PHASES = new Set([
+  "queued",
+  "working",
+  "model-completed",
+  "committing",
+  "committed",
+  "delivered",
+]);
+const TASK_GIT_FINALIZER_PHASES = new Set([
+  "model-completed",
+  "committing",
+  "committed",
+  "delivered",
+]);
 const REASONING_EFFORTS = new Set([
   "none",
   "minimal",
@@ -73,7 +122,6 @@ const REASONING_EFFORTS = new Set([
 const ARTIFACTS_START = "<!-- TODO ARTIFACTS START -->";
 const ARTIFACTS_END = "<!-- TODO ARTIFACTS END -->";
 const MAX_ARTIFACTS_PER_TASK = 64;
-const MAX_EXTERNAL_WORKFLOWS = 16;
 const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024;
 const MIME_EXTENSIONS = new Map([
   ["image/gif", ".gif"],
@@ -101,8 +149,105 @@ export function findGitRoot(startPath = process.cwd()) {
   return root ? path.resolve(root) : null;
 }
 
+export function currentGitBranch(repoRoot) {
+  const result = spawnSync(
+    "git",
+    ["-C", path.resolve(repoRoot), "symbolic-ref", "--quiet", "--short", "HEAD"],
+    { encoding: "utf8" },
+  );
+  const branch = result.status === 0 ? result.stdout.trim() : "";
+  return branch || null;
+}
+
+function assertExistingLocalBranch(repoRoot, branch) {
+  const valid = spawnSync(
+    "git",
+    ["-C", path.resolve(repoRoot), "check-ref-format", "--branch", branch],
+    { encoding: "utf8" },
+  );
+  const exists =
+    valid.status === 0
+      ? spawnSync(
+          "git",
+          [
+            "-C",
+            path.resolve(repoRoot),
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            `refs/heads/${branch}^{commit}`,
+          ],
+          { encoding: "utf8" },
+        )
+      : null;
+  if (valid.status !== 0 || exists?.status !== 0) {
+    throw new Error(`Git target branch is not an existing local branch: ${branch}`);
+  }
+}
+
 export function todoDir(repoRoot) {
   return path.join(repoRoot, ".todo");
+}
+
+export function taskBatchLockPath(repoRoot) {
+  return path.join(todoDir(repoRoot), ".task-batch.lock");
+}
+
+export function taskBatchPublicationActive(repoRoot) {
+  const lockPath = taskBatchLockPath(repoRoot);
+  if (!existsSync(lockPath)) return false;
+  try {
+    const lock = readJson(lockPath);
+    if (Number.isInteger(lock.pid) && !processIsAlive(lock.pid)) {
+      unlinkSync(lockPath);
+      return false;
+    }
+  } catch {
+    // An unrecognized lock is preserved instead of risking partial publication.
+  }
+  return true;
+}
+
+export function acquireTaskBatchGate(repoRoot, details) {
+  const lockPath = taskBatchLockPath(repoRoot);
+  if (taskBatchPublicationActive(repoRoot)) {
+    const error = new Error("task batch publication is active");
+    error.code = "EEXIST";
+    throw error;
+  }
+  const token = randomUUID();
+  let fd;
+  let created = false;
+  try {
+    fd = openSync(lockPath, "wx");
+    created = true;
+    writeFileSync(
+      fd,
+      `${JSON.stringify({
+        token,
+        pid: process.pid,
+        createdAt: new Date().toISOString(),
+        ...details,
+      })}\n`,
+      "utf8",
+    );
+    closeSync(fd);
+    fd = undefined;
+    return { lockPath, token };
+  } catch (error) {
+    if (fd !== undefined) closeSync(fd);
+    if (created && existsSync(lockPath)) unlinkSync(lockPath);
+    throw error;
+  }
+}
+
+export function releaseTaskBatchGate(gate) {
+  if (!gate || !existsSync(gate.lockPath)) return;
+  try {
+    if (readJson(gate.lockPath).token === gate.token) unlinkSync(gate.lockPath);
+  } catch {
+    // Never remove a gate whose ownership cannot be verified.
+  }
 }
 
 export function configPath(repoRoot) {
@@ -198,12 +343,14 @@ export function loadConfig(repoRoot) {
       configReloadIntervalMs: DEFAULT_CONFIG_RELOAD_INTERVAL_MS,
       dashboardPort: DEFAULT_DASHBOARD_PORT,
       retries: DEFAULT_RETRIES,
+      executionBackend: DEFAULT_EXECUTION_BACKEND,
       gitExclude: [],
       codexCommand: "codex",
       codexSandbox: "workspace-write",
       modelProfiles: DEFAULT_MODEL_PROFILES,
       defaultModelProfile: DEFAULT_MODEL_PROFILE,
       routingMode: DEFAULT_ROUTING_MODE,
+      git: { ...DEFAULT_CONFIG.git },
       warning: null,
       readError: null,
     };
@@ -237,6 +384,19 @@ export function loadConfig(repoRoot) {
     "workspace-write",
     "danger-full-access",
   ]);
+  const executionBackend = ["app-server", "exec"].includes(
+    raw.executionBackend,
+  )
+    ? raw.executionBackend
+    : DEFAULT_EXECUTION_BACKEND;
+  if (
+    raw.executionBackend !== undefined &&
+    raw.executionBackend !== executionBackend
+  ) {
+    warning = warning
+      ? `${warning}; executionBackend must be app-server or exec`
+      : "executionBackend must be app-server or exec";
+  }
   const normalizedProfiles = normalizeModelProfiles(raw.models);
   if (normalizedProfiles.warning) {
     warning = warning
@@ -275,6 +435,39 @@ export function loadConfig(repoRoot) {
       ? `${warning}; routingMode must be ${DEFAULT_ROUTING_MODE}`
       : `routingMode must be ${DEFAULT_ROUTING_MODE}`;
   }
+  const rawGit =
+    raw.git && typeof raw.git === "object" && !Array.isArray(raw.git)
+      ? raw.git
+      : {};
+  const gitDelivery = CONFIG_GIT_DELIVERIES.has(rawGit.delivery)
+    ? rawGit.delivery
+    : DEFAULT_GIT_DELIVERY;
+  if (rawGit.delivery !== undefined && rawGit.delivery !== gitDelivery) {
+    warning = warning
+      ? `${warning}; git.delivery must be keep or merge`
+      : "git.delivery must be keep or merge";
+  }
+  const targetBranch =
+    typeof rawGit.targetBranch === "string" &&
+    rawGit.targetBranch.trim() &&
+    !/[\r\n]/.test(rawGit.targetBranch)
+      ? rawGit.targetBranch.trim()
+      : null;
+  if (rawGit.targetBranch !== undefined && !targetBranch) {
+    warning = warning
+      ? `${warning}; git.targetBranch must be a non-empty branch name`
+      : "git.targetBranch must be a non-empty branch name";
+  }
+  const remote =
+    typeof rawGit.remote === "string" &&
+    /^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/.test(rawGit.remote.trim())
+      ? rawGit.remote.trim()
+      : DEFAULT_GIT_REMOTE;
+  if (rawGit.remote !== undefined && rawGit.remote !== remote) {
+    warning = warning
+      ? `${warning}; git.remote is invalid`
+      : "git.remote is invalid";
+  }
 
   return {
     activated: true,
@@ -298,6 +491,7 @@ export function loadConfig(repoRoot) {
       DEFAULT_DASHBOARD_PORT,
     ),
     retries,
+    executionBackend,
     gitExclude,
     codexCommand:
       typeof raw.codexCommand === "string" && raw.codexCommand.trim()
@@ -309,6 +503,7 @@ export function loadConfig(repoRoot) {
     modelProfiles: normalizedProfiles.profiles,
     defaultModelProfile,
     routingMode,
+    git: { delivery: gitDelivery, targetBranch, remote },
     warning,
     readError,
   };
@@ -317,12 +512,50 @@ export function loadConfig(repoRoot) {
 export function emptyTokenUsage() {
   return {
     available: false,
+    coverage: "none",
     turns: 0,
     inputTokens: 0,
     cachedInputTokens: 0,
+    uncachedInputTokens: 0,
+    cacheWriteInputTokens: 0,
     outputTokens: 0,
     reasoningOutputTokens: 0,
+    visibleOutputTokens: 0,
     totalTokens: 0,
+  };
+}
+
+function normalizedTokenUsage(value) {
+  if (!value || typeof value !== "object" || value.available !== true) {
+    return emptyTokenUsage();
+  }
+  const inputTokens = Math.max(0, Number(value.inputTokens) || 0);
+  const cachedInputTokens = Math.max(
+    0,
+    Number(value.cachedInputTokens) || 0,
+  );
+  const outputTokens = Math.max(0, Number(value.outputTokens) || 0);
+  const reasoningOutputTokens = Math.max(
+    0,
+    Number(value.reasoningOutputTokens) || 0,
+  );
+  return {
+    available: true,
+    coverage: ["full", "partial", "unknown"].includes(value.coverage)
+      ? value.coverage
+      : "unknown",
+    turns: Math.max(0, Number(value.turns) || 0),
+    inputTokens,
+    cachedInputTokens,
+    uncachedInputTokens: Math.max(0, inputTokens - cachedInputTokens),
+    cacheWriteInputTokens: Math.max(
+      0,
+      Number(value.cacheWriteInputTokens) || 0,
+    ),
+    outputTokens,
+    reasoningOutputTokens,
+    visibleOutputTokens: Math.max(0, outputTokens - reasoningOutputTokens),
+    totalTokens: inputTokens + outputTokens,
   };
 }
 
@@ -347,7 +580,7 @@ export function taskMetrics(startedAt, completedAt, tokenUsage) {
     startedAt: new Date(startedAt).toISOString(),
     completedAt: new Date(completedAt).toISOString(),
     ...durationFields(Math.max(0, completedAt - startedAt)),
-    tokenUsage,
+    tokenUsage: normalizedTokenUsage(tokenUsage),
   };
 }
 
@@ -368,7 +601,9 @@ function normalizedMetricRun(run) {
     startedAt: new Date(resolvedStartedMs).toISOString(),
     completedAt: new Date(completedMs).toISOString(),
     ...durationFields(durationMs),
-    tokenUsage: run.tokenUsage || emptyTokenUsage(),
+    tokenUsage: normalizedTokenUsage(run.tokenUsage),
+    ...(typeof run.attemptId === "string" ? { attemptId: run.attemptId } : {}),
+    ...(typeof run.usagePath === "string" ? { usagePath: run.usagePath } : {}),
     ...(run.legacyAggregate === true ? { legacyAggregate: true } : {}),
   };
 }
@@ -386,7 +621,7 @@ export function metricRuns(metrics) {
       startedAt: new Date(completedMs - durationMs).toISOString(),
       completedAt: new Date(completedMs).toISOString(),
       ...durationFields(durationMs),
-      tokenUsage: metrics.tokenUsage || emptyTokenUsage(),
+      tokenUsage: normalizedTokenUsage(metrics.tokenUsage),
       legacyAggregate: true,
     },
   ];
@@ -396,28 +631,52 @@ export function cumulativeTaskMetrics(previous, attempt) {
   const normalizedAttempt = normalizedMetricRun(attempt);
   if (!normalizedAttempt) throw new Error("invalid task run metrics");
   const previousRuns = metricRuns(previous);
-  const previousUsage = previous?.tokenUsage || emptyTokenUsage();
+  const previousUsage = normalizedTokenUsage(previous?.tokenUsage);
+  const attemptUsage = normalizedAttempt.tokenUsage;
+  const measuredRuns =
+    previousRuns.filter((run) => run.tokenUsage.available).length +
+    (attemptUsage.available ? 1 : 0);
+  const totalRuns = previousRuns.length + 1;
   const tokenUsage = {
-    available:
-      previousUsage.available === true ||
-      normalizedAttempt.tokenUsage.available === true,
+    available: measuredRuns > 0,
+    coverage:
+      measuredRuns === 0
+        ? "none"
+        : measuredRuns === totalRuns &&
+            previousRuns.every((run) => run.tokenUsage.coverage === "full") &&
+            attemptUsage.coverage === "full"
+          ? "full"
+          : "partial",
     turns:
       (Number(previousUsage.turns) || 0) +
-      (Number(normalizedAttempt.tokenUsage.turns) || 0),
+      (Number(attemptUsage.turns) || 0),
     inputTokens:
       (Number(previousUsage.inputTokens) || 0) +
-      (Number(normalizedAttempt.tokenUsage.inputTokens) || 0),
+      (Number(attemptUsage.inputTokens) || 0),
     cachedInputTokens:
       (Number(previousUsage.cachedInputTokens) || 0) +
-      (Number(normalizedAttempt.tokenUsage.cachedInputTokens) || 0),
+      (Number(attemptUsage.cachedInputTokens) || 0),
+    uncachedInputTokens: 0,
+    cacheWriteInputTokens:
+      (Number(previousUsage.cacheWriteInputTokens) || 0) +
+      (Number(attemptUsage.cacheWriteInputTokens) || 0),
     outputTokens:
       (Number(previousUsage.outputTokens) || 0) +
-      (Number(normalizedAttempt.tokenUsage.outputTokens) || 0),
+      (Number(attemptUsage.outputTokens) || 0),
     reasoningOutputTokens:
       (Number(previousUsage.reasoningOutputTokens) || 0) +
-      (Number(normalizedAttempt.tokenUsage.reasoningOutputTokens) || 0),
+      (Number(attemptUsage.reasoningOutputTokens) || 0),
+    visibleOutputTokens: 0,
     totalTokens: 0,
   };
+  tokenUsage.uncachedInputTokens = Math.max(
+    0,
+    tokenUsage.inputTokens - tokenUsage.cachedInputTokens,
+  );
+  tokenUsage.visibleOutputTokens = Math.max(
+    0,
+    tokenUsage.outputTokens - tokenUsage.reasoningOutputTokens,
+  );
   tokenUsage.totalTokens = tokenUsage.inputTokens + tokenUsage.outputTokens;
   const runs = [...previousRuns, normalizedAttempt];
   const durationMs = runs.reduce(
@@ -438,17 +697,95 @@ export function cumulativeTaskMetrics(previous, attempt) {
   };
 }
 
-export function canAutoRetry(config, metrics) {
-  const attempts = Number(metrics?.attempts) || 0;
+export function canAutoRetry(config, taskStatus) {
+  const ledger = taskStatus?.attemptLedger;
+  const finalizerOnly = TASK_GIT_FINALIZER_PHASES.has(taskStatus?.git?.phase);
+  const attempts = finalizerOnly
+    ? ledger?.deliveryAttempts || []
+    : ledger?.attempts || [];
+  const last = attempts.at?.(-1);
+  const retries = Math.max(0, attempts.length - 1);
   return (
-    attempts > 0 &&
-    (config.retries === -1 || attempts <= config.retries)
+    last?.status === "failed_transient" &&
+    (config.retries === -1 || retries < config.retries)
   );
+}
+
+function storedAttemptLedger(task) {
+  const ledger = task?.metadata?.attemptLedger;
+  if (
+    ledger &&
+    Array.isArray(ledger.attempts) &&
+    Array.isArray(ledger.deliveryAttempts)
+  ) {
+    return ledger;
+  }
+  const runs = metricRuns(task?.metadata?.metrics);
+  if (runs.length === 0) return createAttemptLedger();
+  let migrated = createAttemptLedger();
+  for (const [index, run] of runs.entries()) {
+    const last = index === runs.length - 1;
+    const failure =
+      last && task.metadata.nextAttemptTrigger !== "automatic_retry"
+        ? task.metadata.error
+          ? classifyFailure({
+              errorKind: task.metadata.error.kind,
+              code: task.metadata.error.exit_code,
+              message: task.metadata.error.message,
+            })
+          : { status: "failed_permanent", errorKind: "legacy_retry" }
+        : { status: "failed_transient", errorKind: "legacy_retry" };
+    const digest = createHash("sha256")
+      .update(`${task.id}:legacy-attempt:${index + 1}`)
+      .digest("hex");
+    const attemptId = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+    migrated = appendModelAttempt(migrated, {
+      attemptId,
+      trigger: index === 0 ? "initial" : "manual_retry",
+      status: failure.status,
+      errorKind: failure.errorKind,
+      timing: {
+        startedAt: run.startedAt,
+        completedAt: run.completedAt,
+        durationMs: run.durationMs,
+      },
+      tokenUsage: run.tokenUsage,
+      usagePath: run.usagePath || null,
+    });
+  }
+  return migrated;
+}
+
+function nextAttemptTrigger(task) {
+  const attempts = storedAttemptLedger(task).attempts;
+  if (attempts.length === 0) return "initial";
+  return task.metadata.nextAttemptTrigger === "automatic_retry"
+    ? "automatic_retry"
+    : "manual_retry";
+}
+
+function appendClaimedAttempt(task, claim, status, errorKind, metrics, usagePath) {
+  if (!claim?.attemptId) return storedAttemptLedger(task);
+  const run = metrics?.lastRun;
+  if (!run) throw new Error("attempt metrics are missing");
+  return appendModelAttempt(storedAttemptLedger(task), {
+    attemptId: claim.attemptId,
+    trigger: claim.trigger,
+    status,
+    errorKind: status === "completed" ? null : errorKind,
+    timing: {
+      startedAt: run.startedAt,
+      completedAt: run.completedAt,
+      durationMs: run.durationMs,
+    },
+    tokenUsage: run.tokenUsage,
+    usagePath: usagePath || null,
+  });
 }
 
 export function resolveTaskExecution(
   config,
-  { modelProfile, ephemeral, runMode } = {},
+  { backend, modelProfile, ephemeral, runMode } = {},
 ) {
   const requestedProfile =
     typeof modelProfile === "string" && modelProfile.trim()
@@ -470,11 +807,15 @@ export function resolveTaskExecution(
   if (runMode !== undefined && !TASK_RUN_MODES.has(runMode)) {
     throw new Error("runMode must be background or interactive");
   }
+  if (backend !== undefined && !["app-server", "exec"].includes(backend)) {
+    throw new Error("backend must be app-server or exec");
+  }
   return {
+    backend: backend || config.executionBackend || DEFAULT_EXECUTION_BACKEND,
     modelProfile: profile.name,
     model: profile.model,
     reasoningEffort: profile.reasoningEffort,
-    ephemeral: ephemeral !== false,
+    ephemeral: ephemeral === true,
     mode: runMode || "background",
   };
 }
@@ -654,6 +995,10 @@ export function readClaim(lockPath) {
     workerId,
     taskId: task ? taskIdFromFilename(task) : null,
     claimedAt: raw.claimedAt ?? raw.started_at ?? null,
+    attemptId: typeof raw.attemptId === "string" ? raw.attemptId : null,
+    attempt: Number.isInteger(raw.attempt) ? raw.attempt : null,
+    trigger: typeof raw.trigger === "string" ? raw.trigger : null,
+    retryOf: typeof raw.retryOf === "string" ? raw.retryOf : null,
   };
 }
 
@@ -759,265 +1104,6 @@ function validMetricRun(run, { requireStartedAt = true } = {}) {
   );
 }
 
-function externalText(value, name, maxLength) {
-  if (typeof value !== "string" || !value.trim()) {
-    throw new Error(`${name} must be a non-empty string`);
-  }
-  const normalized = value.trim();
-  if (normalized.length > maxLength) {
-    throw new Error(`${name} must not exceed ${maxLength} characters`);
-  }
-  return normalized;
-}
-
-function externalUrl(value, name) {
-  if (value === undefined || value === null) return null;
-  const normalized = externalText(value, name, 8000);
-  let url;
-  try {
-    url = new URL(normalized);
-  } catch {
-    throw new Error(`${name} is invalid`);
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error(`${name} must use http or https`);
-  }
-  return url.toString();
-}
-
-function externalReferenceKey(value) {
-  return `${value.service}:${value.resourceId}`;
-}
-
-function normalizeExternalWorkflows(value = []) {
-  if (!Array.isArray(value)) {
-    throw new Error("externalWorkflows must be an array");
-  }
-  if (value.length > MAX_EXTERNAL_WORKFLOWS) {
-    throw new Error(
-      `externalWorkflows must not contain more than ${MAX_EXTERNAL_WORKFLOWS} items`,
-    );
-  }
-  const seen = new Set();
-  return value.map((item) => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) {
-      throw new Error("externalWorkflows items must be objects");
-    }
-    const allowed = new Set(["service", "resourceId", "url", "label"]);
-    if (Object.keys(item).some((key) => !allowed.has(key))) {
-      throw new Error("externalWorkflows item contains unsupported fields");
-    }
-    const service = externalText(
-      item.service,
-      "external workflow service",
-      100,
-    ).toLowerCase();
-    if (!EXTERNAL_SERVICE_PATTERN.test(service)) {
-      throw new Error(
-        "external workflow service must be lowercase kebab-case",
-      );
-    }
-    const resourceId = externalText(
-      item.resourceId,
-      "external workflow resourceId",
-      512,
-    );
-    const normalized = {
-      service,
-      resourceId,
-      ...(item.url === undefined
-        ? {}
-        : { url: externalUrl(item.url, "external workflow url") }),
-      ...(item.label === undefined
-        ? {}
-        : {
-            label: externalText(
-              item.label,
-              "external workflow label",
-              200,
-            ),
-          }),
-    };
-    const key = externalReferenceKey(normalized);
-    if (seen.has(key)) {
-      throw new Error(`duplicate external workflow reference: ${key}`);
-    }
-    seen.add(key);
-    return normalized;
-  });
-}
-
-function normalizeExternalSync(value, expectedWorkflows) {
-  if (!Array.isArray(value)) {
-    throw new Error("externalSync must be an array");
-  }
-  const expected = normalizeExternalWorkflows(expectedWorkflows);
-  if (value.length !== expected.length) {
-    throw new Error(
-      "externalSync must contain one status/comment receipt for every external workflow",
-    );
-  }
-  const expectedKeys = new Set(expected.map(externalReferenceKey));
-  const seen = new Set();
-  const normalized = value.map((item) => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) {
-      throw new Error("externalSync items must be objects");
-    }
-    const allowed = new Set([
-      "service",
-      "resourceId",
-      "startedStatus",
-      "finalStatus",
-      "commentId",
-      "commentUrl",
-      "commentText",
-      "aiDisclosure",
-      "syncedAt",
-    ]);
-    if (Object.keys(item).some((key) => !allowed.has(key))) {
-      throw new Error("externalSync item contains unsupported fields");
-    }
-    const service = externalText(
-      item.service,
-      "external sync service",
-      100,
-    ).toLowerCase();
-    if (!EXTERNAL_SERVICE_PATTERN.test(service)) {
-      throw new Error("external sync service must be lowercase kebab-case");
-    }
-    const resourceId = externalText(
-      item.resourceId,
-      "external sync resourceId",
-      512,
-    );
-    const key = externalReferenceKey({ service, resourceId });
-    if (!expectedKeys.has(key)) {
-      throw new Error(`unexpected external sync reference: ${key}`);
-    }
-    if (seen.has(key)) {
-      throw new Error(`duplicate external sync reference: ${key}`);
-    }
-    seen.add(key);
-    const commentText = externalText(
-      item.commentText,
-      "external sync commentText",
-      8000,
-    );
-    if (item.aiDisclosure !== true) {
-      throw new Error("external sync aiDisclosure must be true");
-    }
-    if (!EXTERNAL_AI_DISCLOSURE_PATTERN.test(commentText)) {
-      throw new Error(
-        "external sync commentText must explicitly identify Codex or AI/ИИ",
-      );
-    }
-    const syncedAt =
-      item.syncedAt === undefined
-        ? null
-        : externalText(item.syncedAt, "external sync syncedAt", 100);
-    if (syncedAt !== null && !validMetricTimestamp(syncedAt)) {
-      throw new Error("external sync syncedAt must be an ISO timestamp");
-    }
-    return {
-      service,
-      resourceId,
-      startedStatus: externalText(
-        item.startedStatus,
-        "external sync startedStatus",
-        200,
-      ),
-      finalStatus: externalText(
-        item.finalStatus,
-        "external sync finalStatus",
-        200,
-      ),
-      commentId: externalText(
-        item.commentId,
-        "external sync commentId",
-        512,
-      ),
-      commentUrl:
-        item.commentUrl === undefined || item.commentUrl === null
-          ? null
-          : externalUrl(item.commentUrl, "external sync commentUrl"),
-      commentText,
-      aiDisclosure: true,
-      ...(syncedAt === null ? {} : { syncedAt }),
-    };
-  });
-  if (seen.size !== expectedKeys.size) {
-    throw new Error("externalSync does not cover every external workflow");
-  }
-  return normalized;
-}
-
-export function normalizeExternalTaskOutcome(
-  expectedWorkflows,
-  {
-    status,
-    externalSync = [],
-    externalSyncError = null,
-  } = {},
-) {
-  if (status !== "completed" && status !== "failed") {
-    throw new Error("status must be completed or failed");
-  }
-  if (!Array.isArray(externalSync)) {
-    throw new Error("externalSync must be an array");
-  }
-
-  const workflows = normalizeExternalWorkflows(expectedWorkflows);
-  let normalizedExternalSync = [];
-  let normalizedExternalSyncError = null;
-  if (workflows.length > 0) {
-    if (externalSync.length > 0) {
-      const syncedAt = new Date().toISOString();
-      normalizedExternalSync = normalizeExternalSync(
-        externalSync,
-        workflows,
-      ).map((item) => ({ ...item, syncedAt }));
-    }
-    if (externalSyncError !== null && externalSyncError !== undefined) {
-      normalizedExternalSyncError = externalText(
-        externalSyncError,
-        "externalSyncError",
-        4000,
-      );
-    }
-    if (status === "completed" && normalizedExternalSync.length === 0) {
-      throw new Error(
-        "external workflow task cannot complete without status and AI-attributed comment receipts",
-      );
-    }
-    if (
-      status === "failed" &&
-      normalizedExternalSync.length === 0 &&
-      normalizedExternalSyncError === null
-    ) {
-      throw new Error(
-        "failed external workflow task requires externalSync receipts or externalSyncError",
-      );
-    }
-    if (status === "completed" && normalizedExternalSyncError !== null) {
-      throw new Error(
-        "completed external workflow task cannot include externalSyncError",
-      );
-    }
-  } else if (
-    externalSync.length > 0 ||
-    (externalSyncError !== null && externalSyncError !== undefined)
-  ) {
-    throw new Error(
-      "externalSync is only valid for tasks with externalWorkflows",
-    );
-  }
-
-  return {
-    externalSync: normalizedExternalSync,
-    externalSyncError: normalizedExternalSyncError,
-  };
-}
-
 function storedTaskExecution(repoRoot, task) {
   const execution =
     task.metadata.execution ||
@@ -1038,27 +1124,101 @@ export function readTask(taskPath) {
   if (!match) throw new Error("first line is not a TODO metadata header");
 
   const metadata = JSON.parse(match[1]);
-  const keys = Object.keys(metadata).sort();
-  const allowedKeys = new Set([
-    "version",
-    "blockers",
-    "error",
-    "execution",
-    "externalSync",
-    "externalSyncError",
-    "externalWorkflows",
-    "metrics",
-  ]);
   if (
-    !["version", "blockers", "error"].every((key) => keys.includes(key)) ||
-    keys.some((key) => !allowedKeys.has(key))
+    !["version", "blockers", "error"].every((key) =>
+      Object.hasOwn(metadata, key),
+    )
   ) {
-    throw new Error(
-      "task metadata contains unsupported fields",
-    );
+    throw new Error("task metadata is incomplete");
   }
   if (metadata.version !== 1 || !Array.isArray(metadata.blockers)) {
     throw new Error("unsupported metadata");
+  }
+  if (
+    metadata.allowWorkerTaskCreation !== undefined &&
+    typeof metadata.allowWorkerTaskCreation !== "boolean"
+  ) {
+    throw new Error("invalid allowWorkerTaskCreation metadata");
+  }
+  if (
+    metadata.parentTaskId !== undefined &&
+    (typeof metadata.parentTaskId !== "string" ||
+      !TASK_NAME_PATTERN.test(`${metadata.parentTaskId}.md`))
+  ) {
+    throw new Error("invalid parentTaskId metadata");
+  }
+  if (
+    metadata.batchReady !== undefined &&
+    typeof metadata.batchReady !== "boolean"
+  ) {
+    throw new Error("invalid batchReady metadata");
+  }
+  if (
+    metadata.nextAttemptTrigger !== undefined &&
+    !["automatic_retry", "manual_retry"].includes(
+      metadata.nextAttemptTrigger,
+    )
+  ) {
+    throw new Error("invalid nextAttemptTrigger metadata");
+  }
+  if (metadata.preflight !== undefined) {
+    const preflight = metadata.preflight;
+    if (
+      !preflight ||
+      typeof preflight !== "object" ||
+      Array.isArray(preflight) ||
+      typeof preflight.id !== "string" ||
+      !Array.isArray(preflight.capabilities)
+    ) {
+      throw new Error("invalid preflight metadata");
+    }
+  }
+  if (metadata.git !== undefined) {
+    const git = metadata.git;
+    if (
+      !git ||
+      typeof git !== "object" ||
+      Array.isArray(git) ||
+      typeof git.branch !== "string" ||
+      !git.branch.startsWith("codex/todo-") ||
+      typeof git.targetBranch !== "string" ||
+      !git.targetBranch ||
+      !TASK_GIT_DELIVERIES.has(git.delivery) ||
+      !TASK_GIT_PHASES.has(git.phase) ||
+      (git.worktreePath !== undefined &&
+        typeof git.worktreePath !== "string") ||
+      (git.baseCommit !== undefined &&
+        !/^[0-9a-f]{40,64}$/i.test(git.baseCommit)) ||
+      (git.headCommit !== undefined &&
+        !/^[0-9a-f]{40,64}$/i.test(git.headCommit)) ||
+      (git.deliveryAttemptId !== undefined &&
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          git.deliveryAttemptId,
+        ))
+    ) {
+      throw new Error("invalid git metadata");
+    }
+  }
+  if (metadata.attemptLedger !== undefined) {
+    const ledger = metadata.attemptLedger;
+    if (
+      !ledger ||
+      !Array.isArray(ledger.attempts) ||
+      !Array.isArray(ledger.deliveryAttempts) ||
+      !ledger.retryStats ||
+      [
+        "modelRetries",
+        "automaticRetries",
+        "manualRetries",
+        "deliveryRetries",
+      ].some(
+        (key) =>
+          !Number.isInteger(ledger.retryStats[key]) ||
+          ledger.retryStats[key] < 0,
+      )
+    ) {
+      throw new Error("invalid attempt ledger metadata");
+    }
   }
   const seen = new Set();
   for (const blocker of metadata.blockers) {
@@ -1086,6 +1246,7 @@ export function readTask(taskPath) {
         ? Object.keys(execution).sort()
         : [];
     const allowedExecutionKeys = new Set([
+      "backend",
       "ephemeral",
       "mode",
       "model",
@@ -1101,6 +1262,8 @@ export function readTask(taskPath) {
       !execution.modelProfile ||
       typeof execution.model !== "string" ||
       !execution.model ||
+      (execution.backend !== undefined &&
+        !["app-server", "exec"].includes(execution.backend)) ||
       !REASONING_EFFORTS.has(execution.reasoningEffort) ||
       typeof execution.ephemeral !== "boolean" ||
       (execution.mode !== undefined && !TASK_RUN_MODES.has(execution.mode))
@@ -1108,21 +1271,25 @@ export function readTask(taskPath) {
       throw new Error("invalid execution metadata");
     }
   }
-  const externalWorkflows = normalizeExternalWorkflows(
-    metadata.externalWorkflows || [],
-  );
-  if (metadata.externalSync !== undefined) {
-    metadata.externalSync = normalizeExternalSync(
-      metadata.externalSync,
-      externalWorkflows,
-    );
-  }
-  if (metadata.externalSyncError !== undefined) {
-    metadata.externalSyncError = externalText(
-      metadata.externalSyncError,
-      "externalSyncError",
-      4000,
-    );
+  if (metadata.codexThread !== undefined) {
+    const thread = metadata.codexThread;
+    if (
+      !thread ||
+      typeof thread !== "object" ||
+      Array.isArray(thread) ||
+      typeof thread.id !== "string" ||
+      !thread.id ||
+      !["active", "archive-pending", "archived", "unarchive-pending"].includes(
+        thread.state,
+      ) ||
+      !validMetricTimestamp(thread.createdAt) ||
+      (thread.lastTurnId !== undefined &&
+        (typeof thread.lastTurnId !== "string" || !thread.lastTurnId)) ||
+      (thread.archivedAt !== undefined &&
+        !validMetricTimestamp(thread.archivedAt))
+    ) {
+      throw new Error("invalid codexThread metadata");
+    }
   }
   if (metadata.metrics !== undefined) {
     const metrics = metadata.metrics;
@@ -1759,7 +1926,15 @@ export function createTask(
     modelProfile,
     ephemeral,
     runMode,
-    externalWorkflows = [],
+    delivery,
+    gitTargetBranch,
+    gitSnapshot,
+    preflightId,
+    requiredCapabilities = [],
+    batchId,
+    batchReady = true,
+    allowWorkerTaskCreation = false,
+    parentTaskId,
   },
 ) {
   if (!isActivated(repoRoot)) {
@@ -1773,24 +1948,86 @@ export function createTask(
   if (typeof description !== "string" || !description.trim()) {
     throw new Error("description must be a non-empty string");
   }
+  if (typeof allowWorkerTaskCreation !== "boolean") {
+    throw new Error("allowWorkerTaskCreation must be a boolean");
+  }
+  if (!TASK_GIT_DELIVERIES.has(delivery || DEFAULT_GIT_DELIVERY)) {
+    throw new Error("delivery must be keep, merge, or pr");
+  }
+  if (
+    !Array.isArray(requiredCapabilities) ||
+    requiredCapabilities.some(
+      (item) =>
+        !item ||
+        typeof item !== "object" ||
+        typeof item.connector !== "string" ||
+        typeof item.scope !== "string" ||
+        !["read", "write"].includes(item.access),
+    )
+  ) {
+    throw new Error("requiredCapabilities is invalid");
+  }
+  if (preflightId !== undefined && typeof preflightId !== "string") {
+    throw new Error("preflightId must be a string");
+  }
+  if (
+    gitTargetBranch !== undefined &&
+    (typeof gitTargetBranch !== "string" || !gitTargetBranch.trim())
+  ) {
+    throw new Error("gitTargetBranch must be a non-empty string");
+  }
+  if (
+    gitSnapshot !== undefined &&
+    (!gitSnapshot ||
+      typeof gitSnapshot !== "object" ||
+      !TASK_GIT_DELIVERIES.has(gitSnapshot.delivery) ||
+      typeof gitSnapshot.targetBranch !== "string" ||
+      !gitSnapshot.targetBranch.trim() ||
+      typeof gitSnapshot.remote !== "string" ||
+      !/^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/.test(gitSnapshot.remote))
+  ) {
+    throw new Error("gitSnapshot is invalid");
+  }
+  if (batchId !== undefined && typeof batchId !== "string") {
+    throw new Error("batchId must be a string");
+  }
+  if (typeof batchReady !== "boolean") {
+    throw new Error("batchReady must be a boolean");
+  }
   if (
     !Array.isArray(blockers) ||
     !Array.isArray(acceptanceCriteria) ||
-    !Array.isArray(artifacts) ||
-    !Array.isArray(externalWorkflows)
+    !Array.isArray(artifacts)
   ) {
     throw new Error(
-      "blockers, acceptanceCriteria, artifacts, and externalWorkflows must be arrays",
+      "blockers, acceptanceCriteria, and artifacts must be arrays",
     );
   }
 
   ensureLayout(repoRoot);
-  const normalizedExternalWorkflows =
-    normalizeExternalWorkflows(externalWorkflows);
   const blockerFiles = [
     ...new Set(blockers.map((item) => resolveBlocker(repoRoot, item))),
   ];
-  const execution = resolveTaskExecution(loadConfig(repoRoot), {
+  const normalizedParentTaskId =
+    parentTaskId === undefined
+      ? null
+      : taskIdFromFilename(existingTaskFilename(repoRoot, parentTaskId));
+  const config = loadConfig(repoRoot);
+  const targetBranch =
+    gitSnapshot?.targetBranch ||
+    gitTargetBranch ||
+    config.git.targetBranch ||
+    currentGitBranch(repoRoot);
+  if (!targetBranch) {
+    throw new Error(
+      "Git target branch is unavailable; configure git.targetBranch",
+    );
+  }
+  assertExistingLocalBranch(repoRoot, targetBranch);
+  const resolvedDelivery =
+    delivery || gitSnapshot?.delivery || config.git.delivery;
+  const remote = gitSnapshot?.remote || config.git.remote;
+  const execution = resolveTaskExecution(config, {
     modelProfile,
     ephemeral,
     runMode,
@@ -1800,9 +2037,20 @@ export function createTask(
     blockers: blockerFiles,
     error: null,
     execution,
-    ...(normalizedExternalWorkflows.length === 0
-      ? {}
-      : { externalWorkflows: normalizedExternalWorkflows }),
+    batchReady,
+    ...(batchId ? { batchId } : {}),
+    ...(preflightId
+      ? {
+          preflight: {
+            id: preflightId,
+            capabilities: requiredCapabilities,
+          },
+        }
+      : {}),
+    ...(allowWorkerTaskCreation ? { allowWorkerTaskCreation: true } : {}),
+    ...(normalizedParentTaskId
+      ? { parentTaskId: normalizedParentTaskId }
+      : {}),
   };
   const creatingMetadata = {
     ...metadata,
@@ -1861,7 +2109,17 @@ export function createTask(
         taskId,
         stored.manifest.artifacts,
       );
-      task.metadata = metadata;
+      task.metadata = {
+        ...metadata,
+        git: {
+          branch: taskBranchName(taskId, title),
+          targetBranch,
+          delivery: resolvedDelivery,
+          remote,
+          phase: "queued",
+        },
+        attemptLedger: createAttemptLedger(),
+      };
       writeTask(task);
       return getTaskStatus(repoRoot, taskId);
     } catch (error) {
@@ -1872,6 +2130,62 @@ export function createTask(
       }
       throw error;
     }
+  }
+}
+
+export function createTaskBatch(
+  repoRoot,
+  tasks,
+  {
+    preflightId,
+    requiredCapabilities = [],
+    targetBranch,
+    gitSnapshot,
+  } = {},
+) {
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    throw new Error("tasks must be a non-empty array");
+  }
+  const batchId = randomUUID();
+  let batchGate;
+  const created = [];
+  try {
+    batchGate = acquireTaskBatchGate(repoRoot, {
+      purpose: "batch-publication",
+      batchId,
+    });
+    if (existsSync(path.join(todoDir(repoRoot), ".daemon-restart.json"))) {
+      throw new Error("ToDo runtime update is pending");
+    }
+    for (const input of tasks) {
+      const task = createTask(repoRoot, {
+        ...input,
+        preflightId,
+        requiredCapabilities,
+        gitTargetBranch: targetBranch,
+        gitSnapshot,
+        batchId,
+        batchReady: false,
+      });
+      created.push(task);
+    }
+    for (const status of created) {
+      const task = readTask(status.path);
+      task.metadata.batchReady = true;
+      writeTask(task);
+    }
+    return created.map((task) => getTaskStatus(repoRoot, task.id));
+  } catch (error) {
+    for (const status of created) {
+      if (status.path && existsSync(status.path)) unlinkSync(status.path);
+      const artifactRoot = taskArtifactDir(repoRoot, status.id);
+      if (existsSync(artifactRoot)) {
+        rmSync(artifactRoot, { recursive: true, force: true });
+      }
+    }
+    throw error;
+  } finally {
+    releaseTaskBatchGate(batchGate);
   }
 }
 
@@ -1911,7 +2225,16 @@ export function addTaskArtifacts(repoRoot, id, artifacts) {
 export function updateTask(
   repoRoot,
   id,
-  { body, blockers, modelProfile, ephemeral, externalWorkflows } = {},
+  {
+    body,
+    blockers,
+    modelProfile,
+    ephemeral,
+    delivery,
+    preflightId,
+    requiredCapabilities,
+    allowWorkerTaskCreation,
+  } = {},
 ) {
   const filename = existingTaskFilename(repoRoot, id);
   const taskPath = path.join(todoDir(repoRoot), filename);
@@ -1921,10 +2244,12 @@ export function updateTask(
     blockers === undefined &&
     modelProfile === undefined &&
     ephemeral === undefined &&
-    externalWorkflows === undefined
+    delivery === undefined &&
+    preflightId === undefined &&
+    allowWorkerTaskCreation === undefined
   ) {
     throw new Error(
-      "task update requires body, blockers, modelProfile, ephemeral, or externalWorkflows",
+      "task update requires body, blockers, modelProfile, ephemeral, delivery, preflightId, or allowWorkerTaskCreation",
     );
   }
   if (
@@ -1936,8 +2261,31 @@ export function updateTask(
   if (blockers !== undefined && !Array.isArray(blockers)) {
     throw new Error("blockers must be an array");
   }
-  if (externalWorkflows !== undefined && !Array.isArray(externalWorkflows)) {
-    throw new Error("externalWorkflows must be an array");
+  if (
+    allowWorkerTaskCreation !== undefined &&
+    typeof allowWorkerTaskCreation !== "boolean"
+  ) {
+    throw new Error("allowWorkerTaskCreation must be a boolean");
+  }
+  if (delivery !== undefined && !TASK_GIT_DELIVERIES.has(delivery)) {
+    throw new Error("delivery must be keep, merge, or pr");
+  }
+  if (preflightId !== undefined && typeof preflightId !== "string") {
+    throw new Error("preflightId must be a string");
+  }
+  if (
+    requiredCapabilities !== undefined &&
+    (!Array.isArray(requiredCapabilities) ||
+      requiredCapabilities.some(
+        (item) =>
+          !item ||
+          typeof item !== "object" ||
+          typeof item.connector !== "string" ||
+          typeof item.scope !== "string" ||
+          !["read", "write"].includes(item.access),
+      ))
+  ) {
+    throw new Error("requiredCapabilities is invalid");
   }
 
   let claim;
@@ -1967,18 +2315,22 @@ export function updateTask(
         artifacts,
       );
     }
-    if (externalWorkflows !== undefined) {
-      task.metadata.externalWorkflows = normalizeExternalWorkflows(
-        externalWorkflows,
-      );
-      delete task.metadata.externalSync;
-      delete task.metadata.externalSyncError;
+    if (allowWorkerTaskCreation !== undefined) {
+      if (allowWorkerTaskCreation) {
+        task.metadata.allowWorkerTaskCreation = true;
+      } else {
+        delete task.metadata.allowWorkerTaskCreation;
+      }
     }
     if (modelProfile !== undefined || ephemeral !== undefined) {
       const currentExecution =
         task.metadata.execution ||
         resolveTaskExecution(loadConfig(repoRoot), {});
       task.metadata.execution = resolveTaskExecution(loadConfig(repoRoot), {
+        backend:
+          currentExecution.backend ||
+          loadConfig(repoRoot).executionBackend ||
+          DEFAULT_EXECUTION_BACKEND,
         modelProfile:
           modelProfile === undefined
             ? currentExecution.modelProfile
@@ -1987,6 +2339,16 @@ export function updateTask(
           ephemeral === undefined ? currentExecution.ephemeral : ephemeral,
         runMode: currentExecution.mode || "background",
       });
+    }
+    if (delivery !== undefined) {
+      const git = ensureTaskGitMetadata(repoRoot, task);
+      task.metadata.git = { ...git, delivery };
+    }
+    if (preflightId !== undefined) {
+      task.metadata.preflight = {
+        id: preflightId,
+        capabilities: requiredCapabilities || [],
+      };
     }
     writeTask(task);
   } finally {
@@ -2004,6 +2366,24 @@ function historyPath(repoRoot, id) {
   );
 }
 
+function existingHistoryPath(repoRoot, id) {
+  const direct = historyPath(repoRoot, id);
+  if (existsSync(direct)) return direct;
+  const shorthand = path.basename(String(id)).replace(/\.md$|\.json$/g, "");
+  if (!/^[0-9]+$/.test(shorthand)) return direct;
+  const requested = BigInt(shorthand);
+  const historyDir = path.join(todoDir(repoRoot), "history");
+  const matches = existsSync(historyDir)
+    ? readdirSync(historyDir).filter((name) => {
+        const match = /^([0-9]+)-.+\.json$/.exec(name);
+        return match && BigInt(match[1]) === requested;
+      })
+    : [];
+  if (matches.length === 1) return path.join(historyDir, matches[0]);
+  if (matches.length > 1) throw new Error(`Task ID is ambiguous: ${id}`);
+  return direct;
+}
+
 export function writeHistory(repoRoot, id, value) {
   atomicWriteJson(historyPath(repoRoot, id), {
     id: taskIdFromFilename(id),
@@ -2016,12 +2396,18 @@ export function getTaskStatus(repoRoot, id) {
   try {
     filename = existingTaskFilename(repoRoot, id);
   } catch {
-    return { id: String(id), status: "unknown" };
+    const closedPath = existingHistoryPath(repoRoot, id);
+    return existsSync(closedPath)
+      ? readJson(closedPath)
+      : { id: String(id), status: "unknown" };
   }
 
   const taskPath = path.join(todoDir(repoRoot), filename);
   if (!existsSync(taskPath)) {
-    const closedPath = historyPath(repoRoot, taskIdFromFilename(filename));
+    const closedPath = existingHistoryPath(
+      repoRoot,
+      taskIdFromFilename(filename),
+    );
     return existsSync(closedPath)
       ? readJson(closedPath)
       : { id: taskIdFromFilename(filename), status: "unknown" };
@@ -2045,6 +2431,7 @@ export function getTaskStatus(repoRoot, id) {
   );
   let status = "queued";
   if (existsSync(lockPath)) status = "running";
+  else if (task.metadata.batchReady === false) status = "staging";
   else if (task.metadata.error !== null) status = "failed";
   else if (existingBlockers.length > 0) status = "blocked";
 
@@ -2056,6 +2443,7 @@ export function getTaskStatus(repoRoot, id) {
     artifactError = error.message;
   }
 
+  const attemptLedger = storedAttemptLedger(task);
   return {
     id: task.id,
     title: titleFromBody(task.body, task.id),
@@ -2067,10 +2455,16 @@ export function getTaskStatus(repoRoot, id) {
     claim,
     error: task.metadata.error,
     metrics: task.metadata.metrics || null,
+    outcome: task.metadata.outcome || null,
+    git: task.metadata.git || null,
+    attemptLedger,
+    retryStats: attemptLedger.retryStats,
+    preflight: task.metadata.preflight || null,
     execution: storedTaskExecution(repoRoot, task),
-    externalWorkflows: task.metadata.externalWorkflows || [],
-    externalSync: task.metadata.externalSync || [],
-    externalSyncError: task.metadata.externalSyncError || null,
+    codexThread: task.metadata.codexThread || null,
+    allowWorkerTaskCreation:
+      task.metadata.allowWorkerTaskCreation === true,
+    parentTaskId: task.metadata.parentTaskId || null,
     artifacts,
     artifactError,
     updatedAt: statSync(taskPath).mtime.toISOString(),
@@ -2208,18 +2602,353 @@ export function listWorkerStatuses(repoRoot) {
   };
 }
 
-export function retryTask(repoRoot, id) {
+function ensureTaskGitMetadata(repoRoot, task) {
+  if (task.metadata.git) return task.metadata.git;
+  const config = loadConfig(repoRoot);
+  const targetBranch = config.git.targetBranch || currentGitBranch(repoRoot);
+  if (!targetBranch) {
+    throw new Error(
+      "Git target branch is unavailable; configure git.targetBranch",
+    );
+  }
+  task.metadata.git = {
+    branch: taskBranchName(task.id, titleFromBody(task.body, task.id)),
+    targetBranch,
+    delivery: config.git.delivery,
+    remote: config.git.remote,
+    phase: "queued",
+  };
+  task.metadata.attemptLedger = storedAttemptLedger(task);
+  writeTask(task);
+  return task.metadata.git;
+}
+
+function worktreePlan(repoRoot, task) {
+  const git = ensureTaskGitMetadata(repoRoot, task);
+  return taskWorktreePlan({
+    repoRoot,
+    taskId: task.id,
+    title: titleFromBody(task.body, task.id),
+    targetBranch: git.targetBranch,
+    delivery: git.delivery,
+    branch: git.branch,
+  });
+}
+
+export async function prepareTaskGit(repoRoot, taskPath) {
+  const task = readTask(taskPath);
+  const plan = worktreePlan(repoRoot, task);
+  const prepared = await prepareTaskWorktree(plan, {
+    expectedBase: task.metadata.git?.baseCommit || null,
+  });
+  const current = readTask(taskPath);
+  const git = ensureTaskGitMetadata(repoRoot, current);
+  if (git.baseCommit && git.baseCommit !== prepared.head) {
+    throw new Error(
+      `Task branch HEAD changed from ${git.baseCommit} to ${prepared.head}`,
+    );
+  }
+  current.metadata.git = {
+    ...git,
+    phase: "working",
+    worktreePath: plan.worktreePath,
+    baseCommit: git.baseCommit || prepared.head,
+  };
+  writeTask(current);
+  return {
+    plan,
+    worktreePath: plan.worktreePath,
+    expectedHead: current.metadata.git.baseCommit,
+    reused: prepared.reused,
+  };
+}
+
+export function markTaskModelCompleted(
+  taskPath,
+  claim,
+  result,
+  metrics,
+  usagePath,
+) {
+  const task = readTask(taskPath);
+  task.metadata.metrics = metrics;
+  task.metadata.attemptLedger = appendClaimedAttempt(
+    task,
+    claim,
+    "completed",
+    null,
+    metrics,
+    usagePath,
+  );
+  task.metadata.outcome = "completed";
+  delete task.metadata.nextAttemptTrigger;
+  task.metadata.git = {
+    ...ensureTaskGitMetadata(path.dirname(path.dirname(taskPath)), task),
+    phase: "model-completed",
+    pendingResult: {
+      status: "completed",
+      summary: result.summary,
+      validation: result.validation,
+    },
+  };
+  writeTask(task);
+  return task.metadata.attemptLedger;
+}
+
+function deliveryTiming(startedAt, completedAt) {
+  return {
+    startedAt: new Date(startedAt).toISOString(),
+    completedAt: new Date(completedAt).toISOString(),
+    durationMs: Math.max(0, completedAt - startedAt),
+  };
+}
+
+export function beginTaskDelivery(taskPath) {
+  const task = readTask(taskPath);
+  if (task.metadata.git.phase === "delivered") {
+    return storedAttemptLedger(task).deliveryAttempts.at(-1)?.attemptId || null;
+  }
+  if (!TASK_GIT_FINALIZER_PHASES.has(task.metadata.git.phase)) {
+    throw new Error(
+      `Task delivery cannot start from phase ${task.metadata.git.phase}`,
+    );
+  }
+  if (task.metadata.git.deliveryAttemptId) {
+    return task.metadata.git.deliveryAttemptId;
+  }
+  const attemptId = randomUUID();
+  task.metadata.git = { ...task.metadata.git, deliveryAttemptId: attemptId };
+  writeTask(task);
+  return attemptId;
+}
+
+export async function finalizeTaskGit(repoRoot, taskPath, usagePath = null) {
+  const startedAt = Date.now();
+  let deliveryAttemptId = null;
+  try {
+    let task = readTask(taskPath);
+    const plan = worktreePlan(repoRoot, task);
+    if (task.metadata.git.phase === "delivered") {
+      return {
+        result: task.metadata.git.pendingResult,
+        delivery: task.metadata.git.deliveryResult,
+        deliveryAttemptId:
+          storedAttemptLedger(task).deliveryAttempts.at(-1)?.attemptId || null,
+      };
+    }
+    deliveryAttemptId = beginTaskDelivery(taskPath);
+    task = readTask(taskPath);
+    if (task.metadata.git.phase === "model-completed") {
+      await verifyTaskWorktreeHead(plan, task.metadata.git.baseCommit);
+      task.metadata.git = { ...task.metadata.git, phase: "committing" };
+      writeTask(task);
+    }
+    if (task.metadata.git.phase === "committing") {
+      const committed = await commitTaskWorktree(plan, {
+        expectedHead: task.metadata.git.baseCommit,
+        recoverCommittedHead: true,
+      });
+      task = readTask(taskPath);
+      task.metadata.git = {
+        ...task.metadata.git,
+        phase: "committed",
+        headCommit: committed.headCommit,
+        noChanges: committed.changed === false,
+      };
+      writeTask(task);
+    }
+    task = readTask(taskPath);
+    if (task.metadata.git.phase !== "committed") {
+      throw new Error(
+        `Task Git finalizer cannot run from phase ${task.metadata.git.phase}`,
+      );
+    }
+    const pendingResult = task.metadata.git.pendingResult;
+    const delivery = await deliverTaskWorktree(plan, {
+      headCommit: task.metadata.git.headCommit,
+      noChanges: task.metadata.git.noChanges === true,
+      baseCommit: task.metadata.git.baseCommit,
+      title: titleFromBody(task.body, task.id),
+      body: pendingResult?.summary || "",
+      remote: task.metadata.git.remote || DEFAULT_GIT_REMOTE,
+    });
+    const completedAt = Date.now();
+    task = readTask(taskPath);
+    task.metadata.attemptLedger = appendDeliveryAttempt(
+      storedAttemptLedger(task),
+      {
+        status: "completed",
+        attemptId: deliveryAttemptId,
+        timing: deliveryTiming(startedAt, completedAt),
+        usagePath,
+      },
+    );
+    const { deliveryAttemptId: _completedAttempt, ...completedGit } =
+      task.metadata.git;
+    task.metadata.git = {
+      ...completedGit,
+      phase: "delivered",
+      deliveryResult: delivery,
+    };
+    task.metadata.outcome = "completed";
+    writeTask(task);
+    return { result: pendingResult, delivery, deliveryAttemptId };
+  } catch (error) {
+    const completedAt = Date.now();
+    if (existsSync(taskPath)) {
+      const task = readTask(taskPath);
+      const failure = classifyFailure({
+        errorKind: error.kind || "git_delivery",
+        code: error.code,
+        message: error.message,
+      });
+      task.metadata.attemptLedger = appendDeliveryAttempt(
+        storedAttemptLedger(task),
+        {
+          status: failure.status,
+          attemptId: deliveryAttemptId || undefined,
+          errorKind: failure.errorKind,
+          timing: deliveryTiming(startedAt, completedAt),
+          usagePath,
+        },
+      );
+      task.metadata.outcome = failure.status;
+      const { deliveryAttemptId: _failedAttempt, ...failedGit } =
+        task.metadata.git;
+      task.metadata.git = {
+        ...failedGit,
+        deliveryError: String(error.message).slice(0, 4000),
+      };
+      writeTask(task);
+      error.taskFailure = failure;
+    }
+    throw error;
+  }
+}
+
+export function retryTask(
+  repoRoot,
+  id,
+  { trigger = "manual_retry" } = {},
+) {
+  if (!["automatic_retry", "manual_retry"].includes(trigger)) {
+    throw new Error("retry trigger must be automatic_retry or manual_retry");
+  }
   const filename = existingTaskFilename(repoRoot, id);
   const taskPath = path.join(todoDir(repoRoot), filename);
   if (!existsSync(taskPath)) throw new Error(`Task does not exist: ${id}`);
   if (existsSync(`${taskPath}.lock`)) throw new Error(`Task is running: ${id}`);
   const task = readTask(taskPath);
   task.metadata.error = null;
+  if (!TASK_GIT_FINALIZER_PHASES.has(task.metadata.git?.phase)) {
+    task.metadata.nextAttemptTrigger = trigger;
+  }
   writeTask(task);
   return getTaskStatus(repoRoot, id);
 }
 
-export function startInteractiveTask(repoRoot, id) {
+export function updateTaskCodexThread(taskPath, value) {
+  const task = readTask(taskPath);
+  task.metadata.codexThread = {
+    ...(task.metadata.codexThread || {}),
+    ...value,
+  };
+  writeTask(task);
+  return task.metadata.codexThread;
+}
+
+export function listPendingThreadArchives(repoRoot) {
+  const historyDir = path.join(todoDir(repoRoot), "history");
+  if (!existsSync(historyDir)) return [];
+  return readdirSync(historyDir)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => path.join(historyDir, name))
+    .filter((file) => {
+      try {
+        return readJson(file).codexThread?.state === "archive-pending";
+      } catch {
+        return false;
+      }
+    });
+}
+
+export function markClosedTaskThreadArchived(receiptPath) {
+  const receipt = readJson(receiptPath);
+  receipt.codexThread = {
+    ...receipt.codexThread,
+    state: "archived",
+    archivedAt: new Date().toISOString(),
+  };
+  atomicWriteJson(receiptPath, receipt);
+  return receipt;
+}
+
+export function reopenTask(repoRoot, id) {
+  try {
+    const activeFilename = existingTaskFilename(repoRoot, id);
+    const activePath = path.join(todoDir(repoRoot), activeFilename);
+    if (existsSync(activePath)) throw new Error(`Task is already open: ${id}`);
+  } catch (error) {
+    if (error.message === `Task is already open: ${id}`) throw error;
+  }
+  const closedPath = existingHistoryPath(repoRoot, id);
+  if (!existsSync(closedPath)) throw new Error(`Closed task does not exist: ${id}`);
+  const receipt = readJson(closedPath);
+  if (typeof receipt.taskBody !== "string" || !receipt.taskBody.trim()) {
+    throw new Error(`Task cannot be reopened because its body was not retained: ${id}`);
+  }
+  if (!receipt.codexThread?.id) {
+    throw new Error(`Task cannot be reopened because it has no Codex thread: ${id}`);
+  }
+  const reopenCount = (receipt.reopenCount || 0) + 1;
+  const previousBranch = receipt.git?.branch;
+  const continueKeptBranch =
+    receipt.git?.delivery === "keep" &&
+    typeof previousBranch === "string" &&
+    spawnSync(
+      "git",
+      ["-C", repoRoot, "show-ref", "--verify", "--quiet", `refs/heads/${previousBranch}`],
+    ).status === 0;
+  const targetBranch = continueKeptBranch
+    ? previousBranch
+    : receipt.git?.targetBranch || loadConfig(repoRoot).git.targetBranch;
+  if (!targetBranch) throw new Error("Reopened task target branch is unavailable");
+  const branch = `${previousBranch || `todo/${receipt.id}`}-reopen-${reopenCount}`;
+  const task = {
+    id: receipt.id,
+    path: path.join(todoDir(repoRoot), `${receipt.id}.md`),
+    body: receipt.taskBody,
+    metadata: {
+      version: 1,
+      blockers: [],
+      error: null,
+      execution: receipt.execution,
+      batchReady: true,
+      codexThread: {
+        ...receipt.codexThread,
+        state:
+          receipt.codexThread.state === "archived"
+            ? "unarchive-pending"
+            : "active",
+      },
+      attemptLedger: createAttemptLedger(),
+      reopenCount,
+      priorClosures: [...(receipt.priorClosures || []), receipt.closedAt],
+      git: {
+        branch,
+        targetBranch,
+        delivery: receipt.git?.delivery || loadConfig(repoRoot).git.delivery,
+        remote: receipt.git?.remote || loadConfig(repoRoot).git.remote,
+        phase: "queued",
+      },
+    },
+  };
+  writeTask(task);
+  unlinkSync(closedPath);
+  return getTaskStatus(repoRoot, receipt.id);
+}
+
+export async function startInteractiveTask(repoRoot, id) {
   const filename = existingTaskFilename(repoRoot, id);
   const taskPath = path.join(todoDir(repoRoot), filename);
   if (!existsSync(taskPath)) throw new Error(`Task does not exist: ${id}`);
@@ -2232,19 +2961,68 @@ export function startInteractiveTask(repoRoot, id) {
   }
 
   let claim;
+  const deliveryOnly = TASK_GIT_FINALIZER_PHASES.has(status.git?.phase);
   try {
-    claim = claimTask(taskPath, "interactive");
+    claim = claimTask(taskPath, "interactive", {
+      modelAttempt: !deliveryOnly,
+    });
   } catch (error) {
     if (error.code === "EEXIST") throw new Error(`Task is running: ${id}`);
     throw error;
   }
-  return {
-    claimToken: claim.token,
-    task: getTaskDetails(repoRoot, id),
-  };
+  try {
+    const prepared = deliveryOnly
+      ? {
+          worktreePath: status.git.worktreePath,
+          expectedHead: status.git.baseCommit,
+        }
+      : await prepareTaskGit(repoRoot, taskPath);
+    return {
+      claimToken: claim.token,
+      worktreePath: prepared.worktreePath,
+      expectedHead: prepared.expectedHead,
+      deliveryOnly,
+      task: getTaskDetails(repoRoot, id),
+    };
+  } catch (error) {
+    releaseClaim(claim);
+    const completedAt = Date.now();
+    const claimedAt = Date.parse(claim?.claimedAt);
+    const failure = classifyFailure({
+      errorKind: error.kind || "git_prepare",
+      code: error.code,
+      message: error.message,
+    });
+    const metrics = claim?.attemptId
+      ? cumulativeTaskMetrics(
+          status.metrics || null,
+          taskMetrics(
+            Number.isFinite(claimedAt) ? claimedAt : completedAt,
+            completedAt,
+            emptyTokenUsage(),
+          ),
+        )
+      : status.metrics || null;
+    setTaskError(
+      taskPath,
+      error.kind || "git_prepare",
+      null,
+      error.message,
+      metrics,
+      claim?.attemptId
+        ? {
+            claim,
+            status: failure.status,
+            errorKind: failure.errorKind,
+            usagePath: null,
+          }
+        : null,
+    );
+    throw error;
+  }
 }
 
-export function finishInteractiveTask(
+export async function finishInteractiveTask(
   repoRoot,
   id,
   {
@@ -2253,8 +3031,6 @@ export function finishInteractiveTask(
     summary,
     validation = [],
     error = null,
-    externalSync = [],
-    externalSyncError = null,
   },
 ) {
   const filename = existingTaskFilename(repoRoot, id);
@@ -2286,43 +3062,78 @@ export function finishInteractiveTask(
     throw new Error("validation must be an array of strings");
   }
   const task = readTask(taskPath);
-  const externalWorkflows = task.metadata.externalWorkflows || [];
-  const normalizedExternalOutcome = normalizeExternalTaskOutcome(
-    externalWorkflows,
-    { status, externalSync, externalSyncError },
-  );
+  const deliveryOnly = TASK_GIT_FINALIZER_PHASES.has(task.metadata.git?.phase);
   const completedAt = Date.now();
   const claimedAt = Date.parse(currentClaim.claimedAt);
   const startedAt = Number.isFinite(claimedAt) ? claimedAt : completedAt;
-  const metrics = cumulativeTaskMetrics(
-    task.metadata.metrics || null,
-    taskMetrics(startedAt, completedAt, emptyTokenUsage()),
-  );
-  const claim = { lockPath, token: claimToken };
+  const metrics = deliveryOnly
+    ? task.metadata.metrics || null
+    : cumulativeTaskMetrics(
+        task.metadata.metrics || null,
+        taskMetrics(startedAt, completedAt, emptyTokenUsage()),
+      );
+  const claim = {
+    lockPath,
+    token: claimToken,
+    attemptId: currentClaim.attemptId,
+    attempt: currentClaim.attempt,
+    trigger: currentClaim.trigger,
+    retryOf: currentClaim.retryOf,
+  };
   try {
     if (status === "completed") {
+      if (!deliveryOnly) {
+        markTaskModelCompleted(
+          taskPath,
+          claim,
+          {
+            status,
+            summary: summary.trim(),
+            validation: validation.map((item) => item.trim()).filter(Boolean),
+          },
+          metrics,
+          null,
+        );
+      }
+      let finalized;
+      try {
+        finalized = await finalizeTaskGit(repoRoot, taskPath);
+      } catch (finalizeError) {
+        setTaskError(
+          taskPath,
+          finalizeError.kind || "git_delivery",
+          null,
+          finalizeError.message,
+          metrics,
+        );
+        throw finalizeError;
+      }
       completeTask(
         repoRoot,
         taskPath,
-        {
-          status,
-          summary: summary.trim(),
-          validation: validation.map((item) => item.trim()).filter(Boolean),
-          externalSync: normalizedExternalOutcome.externalSync,
-        },
+        finalized.result,
         metrics,
       );
     } else {
+      const failureMessage =
+        typeof error === "string" && error.trim() ? error : summary;
+      const failure = classifyFailure({
+        message: failureMessage,
+      });
       setTaskError(
         taskPath,
-        "interactive",
+        failure.errorKind,
         null,
-        typeof error === "string" && error.trim() ? error : summary,
+        failureMessage,
         metrics,
-        {
-          externalSync: normalizedExternalOutcome.externalSync,
-          externalSyncError: normalizedExternalOutcome.externalSyncError,
-        },
+        deliveryOnly
+          ? null
+          : {
+              claim,
+              status: failure.status,
+              errorKind: failure.errorKind,
+              usagePath: null,
+            },
       );
     }
   } finally {
@@ -2331,32 +3142,97 @@ export function finishInteractiveTask(
   return getTaskStatus(repoRoot, id);
 }
 
-export function cancelTask(repoRoot, id) {
+export async function cancelTask(repoRoot, id) {
   const filename = existingTaskFilename(repoRoot, id);
   const taskPath = path.join(todoDir(repoRoot), filename);
   if (!existsSync(taskPath)) throw new Error(`Task does not exist: ${id}`);
-  if (existsSync(`${taskPath}.lock`)) throw new Error(`Task is running: ${id}`);
-  const task = readTask(taskPath);
-  writeHistory(repoRoot, task.id, {
-    title: titleFromBody(task.body, task.id),
-    status: "canceled",
-    closedAt: new Date().toISOString(),
-    execution: storedTaskExecution(repoRoot, task),
-    externalWorkflows: task.metadata.externalWorkflows || [],
-    externalSync: task.metadata.externalSync || [],
-    externalSyncError: task.metadata.externalSyncError || null,
-    artifacts: readTaskArtifacts(repoRoot, task.id),
-  });
-  unlinkSync(taskPath);
-  return readJson(historyPath(repoRoot, task.id));
+  let claim;
+  try {
+    claim = claimTask(taskPath, "task-cancel");
+  } catch (error) {
+    if (error.code === "EEXIST") throw new Error(`Task is running: ${id}`);
+    throw error;
+  }
+  try {
+    const task = readTask(taskPath);
+    if (task.metadata.git) {
+      const warnings = await cleanupTaskWorktree(worktreePlan(repoRoot, task), {
+        deleteBranch: !TASK_GIT_FINALIZER_PHASES.has(task.metadata.git.phase),
+      });
+      if (warnings.length > 0) {
+        throw new Error(`Task Git state was preserved: ${warnings.join("; ")}`);
+      }
+    }
+    const attemptLedger = storedAttemptLedger(task);
+    const codexThread = task.metadata.codexThread
+      ? {
+          ...task.metadata.codexThread,
+          state:
+            task.metadata.codexThread.state === "archived"
+              ? "archived"
+              : "archive-pending",
+        }
+      : null;
+    writeHistory(repoRoot, task.id, {
+      title: titleFromBody(task.body, task.id),
+      status: "canceled",
+      closedAt: new Date().toISOString(),
+      execution: storedTaskExecution(repoRoot, task),
+      codexThread,
+      taskBody: task.body,
+      metrics: task.metadata.metrics || null,
+      outcome: "cancelled",
+      git: task.metadata.git || null,
+      attemptLedger,
+      retryStats: attemptLedger.retryStats,
+      preflight: task.metadata.preflight || null,
+      allowWorkerTaskCreation:
+        task.metadata.allowWorkerTaskCreation === true,
+      parentTaskId: task.metadata.parentTaskId || null,
+      artifacts: readTaskArtifacts(repoRoot, task.id),
+      reopenCount: task.metadata.reopenCount || 0,
+      priorClosures: task.metadata.priorClosures || [],
+    });
+    unlinkSync(taskPath);
+    return readJson(historyPath(repoRoot, task.id));
+  } finally {
+    releaseClaim(claim);
+  }
 }
 
-export function claimTask(taskPath, workerId) {
+export function claimTask(
+  taskPath,
+  workerId,
+  { modelAttempt = false } = {},
+) {
+  const repoRoot = path.dirname(path.dirname(path.resolve(taskPath)));
+  const batchGate = acquireTaskBatchGate(repoRoot, {
+    purpose: "task-claim",
+    task: path.basename(taskPath),
+  });
   const lockPath = `${taskPath}.lock`;
   const token = randomUUID();
   const claimedAt = new Date().toISOString();
-  const fd = openSync(lockPath, "wx");
+  let attemptFields = {};
+  let fd;
   try {
+    if (existsSync(path.join(todoDir(repoRoot), ".daemon-restart.json"))) {
+      const error = new Error("ToDo runtime update is pending");
+      error.code = "EEXIST";
+      throw error;
+    }
+    if (modelAttempt) {
+      const task = readTask(taskPath);
+      const ledger = storedAttemptLedger(task);
+      const previous = ledger.attempts.at(-1) || null;
+      attemptFields = {
+        attemptId: randomUUID(),
+        attempt: ledger.attempts.length + 1,
+        trigger: nextAttemptTrigger(task),
+        retryOf: previous?.attemptId || null,
+      };
+    }
+    fd = openSync(lockPath, "wx");
     writeFileSync(
       fd,
       `${JSON.stringify({
@@ -2365,13 +3241,46 @@ export function claimTask(taskPath, workerId) {
         workerId,
         task: path.basename(taskPath),
         claimedAt,
+        ...attemptFields,
       })}\n`,
       "utf8",
     );
+    return { lockPath, token, claimedAt, ...attemptFields };
   } finally {
-    closeSync(fd);
+    if (fd !== undefined) closeSync(fd);
+    releaseTaskBatchGate(batchGate);
   }
-  return { lockPath, token, claimedAt };
+}
+
+export function beginModelAttempt(taskPath, claim) {
+  if (!claim?.lockPath || !claim.token) {
+    throw new Error("A live task claim is required");
+  }
+  const currentClaim = readJson(claim.lockPath);
+  if (!currentClaim || currentClaim.token !== claim.token) {
+    throw new Error("Task claim is no longer owned by this worker");
+  }
+  if (currentClaim.attemptId) {
+    Object.assign(claim, {
+      attemptId: currentClaim.attemptId,
+      attempt: currentClaim.attempt,
+      trigger: currentClaim.trigger,
+      retryOf: currentClaim.retryOf,
+    });
+    return claim;
+  }
+  const task = readTask(taskPath);
+  const ledger = storedAttemptLedger(task);
+  const previous = ledger.attempts.at(-1) || null;
+  const attemptFields = {
+    attemptId: randomUUID(),
+    attempt: ledger.attempts.length + 1,
+    trigger: nextAttemptTrigger(task),
+    retryOf: previous?.attemptId || null,
+  };
+  atomicWriteJson(claim.lockPath, { ...currentClaim, ...attemptFields });
+  Object.assign(claim, attemptFields);
+  return claim;
 }
 
 export function releaseClaim(claim) {
@@ -2393,6 +3302,41 @@ export function cleanupStaleClaims(repoRoot) {
     try {
       const claim = readClaim(lockPath);
       if (claim?.pid && !processIsAlive(claim.pid)) {
+        if (claim.attemptId) {
+          const task = readTask(taskPath);
+          const recorded = storedAttemptLedger(task).attempts.some(
+            (attempt) => attempt.attemptId === claim.attemptId,
+          );
+          if (!recorded) {
+            const completedAt = Date.now();
+            const claimedAt = Date.parse(claim.claimedAt);
+            const metrics = cumulativeTaskMetrics(
+              task.metadata.metrics || null,
+              taskMetrics(
+                Number.isFinite(claimedAt) ? claimedAt : completedAt,
+                completedAt,
+                emptyTokenUsage(),
+              ),
+            );
+            setTaskError(
+              taskPath,
+              "interrupted",
+              null,
+              "Task worker exited before recording its result",
+              metrics,
+              {
+                claim,
+                status: "failed_transient",
+                errorKind: "interrupted",
+                usagePath: null,
+              },
+            );
+          }
+        }
+        const task = readTask(taskPath);
+        if (task.metadata.codexThread?.id) {
+          updateTaskCodexThread(taskPath, { state: "archive-pending" });
+        }
         unlinkSync(lockPath);
         removed.push(path.basename(lockPath));
       }
@@ -2409,7 +3353,7 @@ export function setTaskError(
   exitCode,
   message,
   metrics = null,
-  externalEvidence = null,
+  attemptContext = null,
 ) {
   if (!existsSync(taskPath)) return;
   const task = readTask(taskPath);
@@ -2420,14 +3364,23 @@ export function setTaskError(
     message: String(message || "Task execution failed").trim().slice(0, 4000),
   };
   if (metrics) task.metadata.metrics = metrics;
-  if (externalEvidence) {
-    if (externalEvidence.externalSync?.length > 0) {
-      task.metadata.externalSync = externalEvidence.externalSync;
-    }
-    if (externalEvidence.externalSyncError) {
-      task.metadata.externalSyncError =
-        externalEvidence.externalSyncError;
-    }
+  const failure = attemptContext?.status
+    ? {
+        status: attemptContext.status,
+        errorKind: attemptContext.errorKind || kind,
+      }
+    : classifyFailure({ errorKind: kind, code: exitCode, message });
+  task.metadata.outcome = failure.status;
+  if (attemptContext?.claim?.attemptId) {
+    task.metadata.attemptLedger = appendClaimedAttempt(
+      task,
+      attemptContext.claim,
+      failure.status,
+      failure.errorKind,
+      metrics,
+      attemptContext.usagePath,
+    );
+    delete task.metadata.nextAttemptTrigger;
   }
   writeTask(task);
 }
@@ -2439,12 +3392,24 @@ export function completeTask(repoRoot, taskPath, result, metrics = null) {
     status: "completed",
     closedAt: metrics?.completedAt || new Date().toISOString(),
     execution: storedTaskExecution(repoRoot, task),
+    codexThread: task.metadata.codexThread || null,
+    taskBody: task.body,
     metrics,
+    outcome: task.metadata.outcome || "completed",
+    git: task.metadata.git || null,
+    attemptLedger: task.metadata.attemptLedger || createAttemptLedger(),
+    retryStats:
+      task.metadata.attemptLedger?.retryStats ||
+      createAttemptLedger().retryStats,
+    preflight: task.metadata.preflight || null,
     summary: result.summary,
     validation: result.validation,
-    externalWorkflows: task.metadata.externalWorkflows || [],
-    externalSync: result.externalSync || task.metadata.externalSync || [],
+    allowWorkerTaskCreation:
+      task.metadata.allowWorkerTaskCreation === true,
+    parentTaskId: task.metadata.parentTaskId || null,
     artifacts: readTaskArtifacts(repoRoot, task.id),
+    reopenCount: task.metadata.reopenCount || 0,
+    priorClosures: task.metadata.priorClosures || [],
   });
   unlinkSync(taskPath);
   return readJson(historyPath(repoRoot, task.id));

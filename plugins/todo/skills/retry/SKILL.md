@@ -5,9 +5,12 @@ description: Manually retry a failed ToDo task after its configured automatic re
 
 # ToDo Retry
 
+Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
+
 1. Call `task_get` for the requested task.
-2. Retry only a failed task and only after the recorded error has been addressed or the user explicitly accepts another attempt beyond the configured automatic retry limit.
-3. Call `task_retry`.
-4. Preserve the task's configured execution mode. External workflow linkage alone must not move a background task into the current thread.
-5. If the task was changed to `interactive` after a background failure with `error.kind: "interactive_required"`, continue with `$todo:run` in the current thread. Otherwise leave a background retry to the daemon.
-6. Report the returned task status.
+2. Inspect `attemptLedger`, `retryStats`, the latest classified status, and the Git phase. Automatic retry is fail-closed and applies only to `failed_transient`; unknown, authentication, permission, cancellation, preflight, and interactive failures never qualify automatically.
+3. Retry only after the recorded cause has been addressed or the user explicitly accepts a new manual attempt. Resolve authentication, connector probes, or required interaction in the current thread first.
+4. Call `task_retry`. A failed Git delivery resumes the runner-owned delivery phase without spending another model attempt; other failures create a linked `manual_retry` model attempt.
+5. Preserve the task's configured execution mode.
+6. If the task was changed to `interactive` after a background failure with `error.kind: "interactive_required"`, continue with `$todo:run` in the current thread. Otherwise leave the retry to the daemon.
+7. Report the returned task status and model/delivery retry counts.

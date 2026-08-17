@@ -5,6 +5,8 @@ description: Stop the detached ToDo daemon without interrupting active tasks by 
 
 # ToDo Stop
 
+Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
+
 1. Call `runner_stop` for the target repository.
 2. Keep `force` false unless the user explicitly asks to interrupt running tasks.
 3. If active tasks prevent shutdown, report their IDs and leave the daemon running.

@@ -1,10 +1,20 @@
 import path from "node:path";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  unlinkSync,
+} from "node:fs";
+import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   addTaskArtifacts,
   atomicWriteJson,
   cancelTask,
-  createTask,
+  createTaskBatch,
+  currentGitBranch,
   DAEMON_IMPLEMENTATION,
   DAEMON_PROTOCOL_VERSION,
   daemonStopRequestPath,
@@ -20,12 +30,26 @@ import {
   loadConfig,
   processIsAlive,
   readDaemonState,
+  readJson,
   retryTask,
+  reopenTask,
   finishInteractiveTask,
   startInteractiveTask,
   updateTask,
+  todoDir,
 } from "./lib.mjs";
-import { ensureDaemon } from "./ensure-daemon.mjs";
+import { ensureDaemon, verifyDaemonProcess } from "./ensure-daemon.mjs";
+import {
+  commandCheck,
+  createPreflightReceipt,
+  runLocalPreflightChecks,
+  validatePreflightReceipt,
+} from "./preflight.mjs";
+import {
+  daemonRestartRequestPath,
+  readDaemonRestartRequest,
+  runtimeDescriptor,
+} from "./runtime-update.mjs";
 
 const pluginManifest = JSON.parse(
   readFileSync(
@@ -34,6 +58,9 @@ const pluginManifest = JSON.parse(
   ),
 );
 const pluginVersion = pluginManifest.version;
+const pluginRuntime = runtimeDescriptor(
+  fileURLToPath(new URL("..", import.meta.url)),
+);
 
 const artifactInputSchema = {
   type: "object",
@@ -101,176 +128,165 @@ const artifactInputSchema = {
   additionalProperties: false,
 };
 
-const externalWorkflowSchema = {
+const capabilityInputSchema = {
   type: "object",
   properties: {
-    service: {
-      type: "string",
-      minLength: 1,
-      maxLength: 100,
-      pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$",
-      description: "External system identifier, for example jira or asana.",
-    },
-    resourceId: {
-      type: "string",
-      minLength: 1,
-      maxLength: 512,
-      description: "Stable external issue, task, or work-item identifier.",
-    },
-    url: {
-      type: "string",
-      minLength: 1,
-      maxLength: 8000,
-      description: "HTTP(S) URL of the external work item when available.",
-    },
-    label: {
-      type: "string",
-      minLength: 1,
-      maxLength: 200,
-    },
+    connector: { type: "string", minLength: 1, maxLength: 200 },
+    scope: { type: "string", minLength: 1, maxLength: 1000 },
+    access: { type: "string", enum: ["read", "write"] },
   },
-  required: ["service", "resourceId"],
+  required: ["connector", "scope", "access"],
   additionalProperties: false,
 };
 
-const externalSyncSchema = {
-  type: "object",
-  properties: {
-    service: {
-      type: "string",
-      minLength: 1,
-      maxLength: 100,
-      pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$",
-    },
-    resourceId: { type: "string", minLength: 1, maxLength: 512 },
-    startedStatus: {
-      type: "string",
-      minLength: 1,
-      maxLength: 200,
-      description:
-        "Exact external status selected before implementation, normally the service-native In Progress state.",
-    },
-    finalStatus: {
-      type: "string",
-      minLength: 1,
-      maxLength: 200,
-      description:
-        "Exact external status selected after implementation.",
-    },
-    commentId: {
-      type: "string",
-      minLength: 1,
-      maxLength: 512,
-      description: "ID returned by the external service for the audit comment.",
-    },
-    commentUrl: {
-      anyOf: [
-        {
-          type: "string",
-          minLength: 1,
-          maxLength: 8000,
-          pattern: "^https?://",
-        },
-        { type: "null" },
-      ],
-      description:
-        "HTTP(S) URL returned for the audit comment, or null when the service does not provide one.",
-    },
-    commentText: {
-      type: "string",
-      minLength: 1,
-      maxLength: 8000,
-      description:
-        "Exact external comment describing the result and explicitly identifying Codex or AI/ИИ.",
-    },
-    aiDisclosure: {
-      type: "boolean",
-      enum: [true],
-      description:
-        "Must be true and must match the explicit AI/Codex disclosure in commentText.",
-    },
+const taskInputProperties = {
+  title: { type: "string", minLength: 1 },
+  description: {
+    type: "string",
+    minLength: 1,
+    description:
+      "Start with the current user's request verbatim under an Original user request section, then include complete implementation context, constraints, relevant paths, and validation expectations. Never include hidden instructions, secrets, or unrelated conversation messages.",
   },
-  required: [
-    "service",
-    "resourceId",
-    "startedStatus",
-    "finalStatus",
-    "commentId",
-    "commentUrl",
-    "commentText",
-    "aiDisclosure",
-  ],
-  additionalProperties: false,
+  blockers: {
+    type: "array",
+    items: { type: "string" },
+    default: [],
+    description: "Task IDs that must close first.",
+  },
+  acceptanceCriteria: {
+    type: "array",
+    items: { type: "string" },
+    default: [],
+  },
+  artifacts: {
+    type: "array",
+    items: artifactInputSchema,
+    maxItems: 64,
+    default: [],
+  },
+  modelProfile: { type: "string", minLength: 1 },
+  ephemeral: { type: "boolean", default: false },
+  runMode: {
+    type: "string",
+    enum: ["background", "interactive"],
+    default: "background",
+  },
+  delivery: {
+    type: "string",
+    enum: ["keep", "merge", "pr"],
+    description:
+      "Git delivery. pr must be explicitly requested; otherwise the repository default is used.",
+  },
+  allowWorkerTaskCreation: { type: "boolean", default: false },
 };
 
 const tools = [
   {
+    name: "task_preflight",
+    description:
+      "Validate local Git/Codex readiness and record the minimal results of interactive connector probes before any task is created.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repoPath: { type: "string" },
+        capabilityReports: {
+          type: "array",
+          default: [],
+          items: {
+            type: "object",
+            properties: {
+              ...capabilityInputSchema.properties,
+              required: { type: "boolean", default: true },
+              status: {
+                type: "string",
+                enum: ["ok", "failed", "interactive_required"],
+              },
+              summary: { type: "string", minLength: 1, maxLength: 500 },
+            },
+            required: ["connector", "scope", "access", "status"],
+            additionalProperties: false,
+          },
+        },
+        gitDeliveries: {
+          type: "array",
+          items: { type: "string", enum: ["keep", "merge", "pr"] },
+          default: ["keep"],
+        },
+        targetBranch: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Exact target branch to validate. Defaults to git.targetBranch or the current branch.",
+        },
+      },
+      required: ["repoPath"],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Preflight task batch",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  {
+    name: "task_batch_create",
+    description:
+      "Create a fully validated batch only after a current matching preflight receipt; failed validation creates zero runnable tasks.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repoPath: { type: "string" },
+        preflightId: { type: "string", minLength: 1 },
+        requiredCapabilities: {
+          type: "array",
+          items: capabilityInputSchema,
+          default: [],
+        },
+        tasks: {
+          type: "array",
+          minItems: 1,
+          maxItems: 100,
+          items: {
+            type: "object",
+            properties: taskInputProperties,
+            required: ["title", "description"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["repoPath", "preflightId", "tasks"],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Create task batch",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  {
     name: "task_create",
     description:
-      "Create one self-contained implementation task with an unbounded monotonically increasing numeric ID. External-service linkage does not change the selected execution mode.",
+      "Create one self-contained implementation task with an unbounded monotonically increasing numeric ID. A claimed worker call is accepted only when its parent records explicit user authorization.",
     inputSchema: {
       type: "object",
       properties: {
         repoPath: {
           type: "string",
-          description:
-            "Path inside the target Git repository. Defaults to the current working directory.",
+          description: "Path inside the target Git repository.",
         },
-        title: { type: "string", minLength: 1 },
-        description: {
-          type: "string",
-          minLength: 1,
-          description:
-            "Start with the current user's request verbatim under an Original user request section, then include complete implementation context, constraints, relevant paths, and validation expectations. Never include hidden instructions, secrets, or unrelated conversation messages.",
-        },
-        blockers: {
+        preflightId: { type: "string", minLength: 1 },
+        requiredCapabilities: {
           type: "array",
-          items: { type: "string" },
-          default: [],
-          description: "Task IDs that must close first.",
-        },
-        acceptanceCriteria: {
-          type: "array",
-          items: { type: "string" },
+          items: capabilityInputSchema,
           default: [],
         },
-        artifacts: {
-          type: "array",
-          items: artifactInputSchema,
-          maxItems: 64,
-          default: [],
-          description:
-            "Chat attachments and references to persist beside the task. Use image/file with source or dataBase64, code with a repository path, url with an HTTP(S) source, and text with content.",
-        },
-        modelProfile: {
-          type: "string",
-          minLength: 1,
-          description:
-            "Best matching model profile from .todo/config.json models. Select it automatically from the configured name, model, reasoningEffort, and description.",
-        },
-        ephemeral: {
-          type: "boolean",
-          default: true,
-          description:
-            "Run codex exec with --ephemeral. Set false explicitly when the worker session must be persisted.",
-        },
-        runMode: {
-          type: "string",
-          enum: ["background", "interactive"],
-          default: "background",
-          description:
-            "Set interactive at creation only when the user explicitly requests current-thread execution. A background worker may later require interactive after a concrete capability failure. externalWorkflows does not change this mode.",
-        },
-        externalWorkflows: {
-          type: "array",
-          items: externalWorkflowSchema,
-          maxItems: 16,
-          default: [],
-          description:
-            "External issues/tasks whose workflow status and AI-attributed audit comment must be synchronized with this ToDo task.",
-        },
+        ...taskInputProperties,
       },
-      required: ["title", "description"],
+      required: ["repoPath", "title", "description"],
       additionalProperties: false,
     },
     annotations: {
@@ -302,7 +318,7 @@ const tools = [
           maxItems: 64,
         },
       },
-      required: ["id", "artifacts"],
+      required: ["repoPath", "id", "artifacts"],
       additionalProperties: false,
     },
     annotations: {
@@ -316,7 +332,7 @@ const tools = [
   {
     name: "task_update",
     description:
-      "Replace the Markdown body, blockers, execution settings, and/or external workflow links of an existing queued, blocked, or failed task without manually editing .todo files. Existing artifacts and error state are preserved.",
+      "Replace the Markdown body, blockers, execution settings, and/or worker task-creation permission of an existing queued, blocked, or failed task without manually editing .todo files. Existing artifacts and error state are preserved.",
     inputSchema: {
       type: "object",
       properties: {
@@ -350,21 +366,32 @@ const tools = [
           description:
             "Replace the task ephemeral setting. false omits --ephemeral.",
         },
-        externalWorkflows: {
-          type: "array",
-          items: externalWorkflowSchema,
-          maxItems: 16,
+        delivery: {
+          type: "string",
+          enum: ["keep", "merge", "pr"],
           description:
-            "Complete replacement external workflow list. Use this to migrate legacy unclaimed tasks that contain authoritative external work links but no structured workflow metadata.",
+            "Replace Git delivery; a matching fresh preflightId is required.",
+        },
+        preflightId: { type: "string", minLength: 1 },
+        requiredCapabilities: {
+          type: "array",
+          items: capabilityInputSchema,
+          default: [],
+        },
+        allowWorkerTaskCreation: {
+          type: "boolean",
+          description:
+            "Replace the worker task-creation permission. Set true only from an explicit current-user instruction; omit to preserve it.",
         },
       },
-      required: ["id"],
+      required: ["repoPath", "id"],
       anyOf: [
         { required: ["body"] },
         { required: ["blockers"] },
         { required: ["modelProfile"] },
         { required: ["ephemeral"] },
-        { required: ["externalWorkflows"] },
+        { required: ["delivery"] },
+        { required: ["allowWorkerTaskCreation"] },
       ],
       additionalProperties: false,
     },
@@ -385,10 +412,10 @@ const tools = [
       properties: {
         repoPath: {
           type: "string",
-          description:
-            "Path inside the target Git repository. Defaults to the current working directory.",
+          description: "Path inside the target Git repository.",
         },
       },
+      required: ["repoPath"],
       additionalProperties: false,
     },
     annotations: {
@@ -414,7 +441,7 @@ const tools = [
             "Full task ID or its unique numeric prefix, for example 018.",
         },
       },
-      required: ["id"],
+      required: ["repoPath", "id"],
       additionalProperties: false,
     },
     annotations: {
@@ -438,6 +465,7 @@ const tools = [
           default: 100,
         },
       },
+      required: ["repoPath"],
       additionalProperties: false,
     },
     annotations: {
@@ -455,6 +483,7 @@ const tools = [
       properties: {
         repoPath: { type: "string" },
       },
+      required: ["repoPath"],
       additionalProperties: false,
     },
     annotations: {
@@ -479,6 +508,7 @@ const tools = [
           default: 100,
         },
       },
+      required: ["repoPath"],
       additionalProperties: false,
     },
     annotations: {
@@ -497,7 +527,7 @@ const tools = [
         repoPath: { type: "string" },
         id: { type: "string", minLength: 1 },
       },
-      required: ["id"],
+      required: ["repoPath", "id"],
       additionalProperties: false,
     },
     annotations: {
@@ -505,6 +535,27 @@ const tools = [
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "task_reopen",
+    description:
+      "Reopen a completed or canceled task and continue its persistent Codex thread.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repoPath: { type: "string" },
+        id: { type: "string", minLength: 1 },
+      },
+      required: ["repoPath", "id"],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Reopen closed task",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
       openWorldHint: false,
     },
   },
@@ -523,7 +574,7 @@ const tools = [
             "Full task ID, filename, or unique numeric prefix, for example 018.",
         },
       },
-      required: ["id"],
+      required: ["repoPath", "id"],
       additionalProperties: false,
     },
     annotations: {
@@ -537,7 +588,7 @@ const tools = [
   {
     name: "task_run_finish",
     description:
-      "Finish a task claimed by task_run_start. A task linked to external services cannot complete without one status and AI-attributed comment receipt per external work item.",
+      "Finish a task claimed by task_run_start.",
     inputSchema: {
       type: "object",
       properties: {
@@ -558,23 +609,8 @@ const tools = [
           type: "string",
           description: "Concrete failure reason when status is failed.",
         },
-        externalSync: {
-          type: "array",
-          items: externalSyncSchema,
-          maxItems: 16,
-          default: [],
-          description:
-            "Exact external start/final statuses and comment receipts. Required for completion of every task with externalWorkflows.",
-        },
-        externalSyncError: {
-          type: "string",
-          minLength: 1,
-          maxLength: 4000,
-          description:
-            "Why external workflow or comment synchronization could not be completed. Valid only when finishing an external task as failed.",
-        },
       },
-      required: ["id", "claimToken", "status", "summary"],
+      required: ["repoPath", "id", "claimToken", "status", "summary"],
       additionalProperties: false,
     },
     annotations: {
@@ -594,7 +630,7 @@ const tools = [
         repoPath: { type: "string" },
         id: { type: "string", minLength: 1 },
       },
-      required: ["id"],
+      required: ["repoPath", "id"],
       additionalProperties: false,
     },
     annotations: {
@@ -614,6 +650,7 @@ const tools = [
       properties: {
         repoPath: { type: "string" },
       },
+      required: ["repoPath"],
       additionalProperties: false,
     },
     annotations: {
@@ -631,6 +668,7 @@ const tools = [
       properties: {
         repoPath: { type: "string" },
       },
+      required: ["repoPath"],
       additionalProperties: false,
     },
     annotations: {
@@ -656,6 +694,7 @@ const tools = [
             "Interrupt active tasks and stop the daemon. Use only when the user explicitly requests interruption.",
         },
       },
+      required: ["repoPath"],
       additionalProperties: false,
     },
     annotations: {
@@ -668,13 +707,45 @@ const tools = [
   },
 ];
 
+function gitCommonDir(repoRoot) {
+  const result = spawnSync(
+    "git",
+    ["-C", repoRoot, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+    { encoding: "utf8", timeout: 10000 },
+  );
+  if (result.status !== 0 || !result.stdout.trim()) return null;
+  const commonDir = path.resolve(repoRoot, result.stdout.trim());
+  return existsSync(commonDir) ? realpathSync(commonDir) : null;
+}
+
 function resolveRepo(args = {}) {
-  const startPath = args.repoPath
-    ? path.resolve(args.repoPath)
-    : process.cwd();
+  const worker = process.env.TODO_RUNNER_WORKER === "1";
+  const claimedPath = worker && process.env.TODO_RUNNER_REPO_ROOT;
+  if (!args.repoPath && !claimedPath) {
+    throw new Error("repoPath is required");
+  }
+  const startPath = path.resolve(args.repoPath || claimedPath);
   const repoRoot = findGitRoot(startPath);
   if (!repoRoot) throw new Error(`Not inside a Git repository: ${startPath}`);
-  return repoRoot;
+  if (!worker) return repoRoot;
+
+  const claimedRepoRoot = claimedPath
+    ? findGitRoot(path.resolve(claimedPath))
+    : null;
+  const requestedCommonDir = gitCommonDir(repoRoot);
+  const claimedCommonDir = claimedRepoRoot
+    ? gitCommonDir(claimedRepoRoot)
+    : null;
+  if (
+    !claimedRepoRoot ||
+    !requestedCommonDir ||
+    requestedCommonDir !== claimedCommonDir
+  ) {
+    throw new Error(
+      "A claimed ToDo worker may access only its claimed Git repository",
+    );
+  }
+  return claimedRepoRoot;
 }
 
 function activatedRepo(args) {
@@ -687,12 +758,107 @@ function activatedRepo(args) {
   return repoRoot;
 }
 
+function workerTaskCreationArgs(repoRoot, args) {
+  if (process.env.TODO_RUNNER_WORKER !== "1") return args;
+
+  const workerRepoRoot = process.env.TODO_RUNNER_REPO_ROOT;
+  const claimedRepoRoot = workerRepoRoot
+    ? findGitRoot(path.resolve(workerRepoRoot))
+    : null;
+  if (!claimedRepoRoot || claimedRepoRoot !== repoRoot) {
+    throw new Error(
+      "A claimed ToDo worker may create follow-up tasks only in its claimed repository",
+    );
+  }
+
+  const parentTaskId = process.env.TODO_RUNNER_TASK_ID;
+  if (!parentTaskId) {
+    throw new Error(
+      "Claimed worker task creation is missing TODO_RUNNER_TASK_ID",
+    );
+  }
+  const parent = getTaskDetails(repoRoot, parentTaskId);
+  if (
+    parent.status !== "running" ||
+    parent.workerId === null ||
+    parent.workerId === "interactive"
+  ) {
+    throw new Error(
+      `Claimed parent task is not running in a background worker: ${parentTaskId}`,
+    );
+  }
+  if (parent.allowWorkerTaskCreation !== true) {
+    throw new Error(
+      `Task ${parent.id} does not record explicit user authorization to create follow-up tasks`,
+    );
+  }
+
+  if (!args.preflightId) {
+    throw new Error(
+      "Claimed workers must run task_preflight and provide its fresh preflightId",
+    );
+  }
+  const capabilities = [
+    ...(parent.preflight?.capabilities || []),
+    ...(args.requiredCapabilities || []),
+  ];
+  const requiredCapabilities = [
+    ...new Map(
+      capabilities.map((item) => [
+        JSON.stringify([item.connector, item.scope, item.access]),
+        item,
+      ]),
+    ).values(),
+  ];
+
+  return {
+    ...args,
+    preflightId: args.preflightId,
+    requiredCapabilities,
+    blockers: [...(args.blockers || []), parent.id],
+    allowWorkerTaskCreation: false,
+    parentTaskId: parent.id,
+  };
+}
+
+function ensureWorkerTaskCreationRuntime(repoRoot) {
+  const daemon = readDaemonState(repoRoot);
+  const identity = daemon
+    ? verifyDaemonProcess(repoRoot, daemon)
+    : { ok: false };
+  const restartPath = daemonRestartRequestPath(repoRoot);
+  const restart = readDaemonRestartRequest(repoRoot);
+  if (
+    !daemon ||
+    !processIsAlive(daemon.pid) ||
+    !isCurrentDaemonState(daemon) ||
+    !identity.ok ||
+    !pluginRuntime.available ||
+    daemon.pluginVersion !== pluginVersion ||
+    (daemon.runtime?.fingerprint || daemon.runtimeFingerprint) !==
+      pluginRuntime.fingerprint ||
+    daemon.status !== "running" ||
+    (daemon.runtimeUpdate?.status && daemon.runtimeUpdate.status !== "current") ||
+    existsSync(restartPath) ||
+    restart
+  ) {
+    throw new Error(
+      "ToDo worker cannot publish tasks while the daemon runtime is unavailable or updating",
+    );
+  }
+  return { status: "worker-parent" };
+}
+
 async function stopRunner(repoRoot, force = false) {
   const daemon = readDaemonState(repoRoot);
   if (!daemon || !processIsAlive(daemon.pid)) {
     const staleStopRequest = daemonStopRequestPath(repoRoot);
     if (existsSync(staleStopRequest)) unlinkSync(staleStopRequest);
     return { repoRoot, status: "stopped", pid: daemon?.pid || null };
+  }
+  const identity = verifyDaemonProcess(repoRoot, daemon);
+  if (!identity.ok) {
+    throw new Error(`Refusing to stop an unverified daemon PID: ${identity.reason}`);
   }
   const active = Array.isArray(daemon.active) ? daemon.active : [];
   if (active.length > 0 && force !== true) {
@@ -743,11 +909,14 @@ function runnerStatus(repoRoot) {
   const daemonRunning = daemonCurrent && daemon.status === "running";
   const daemonStarting = daemonCurrent && daemon.status === "starting";
   const daemonStopping = daemonCurrent && daemon.status === "stopping";
+  const daemonRestartPending =
+    daemonCurrent && daemon.status === "restart-pending";
   const appliedConfig = daemonCurrent ? daemon.appliedConfig || null : null;
   const conflictingDaemon =
     daemonAlive && !isCurrentDaemonState(daemon) ? daemon : null;
   const legacy = activated && !daemonAlive ? findLegacyRunner(repoRoot) : null;
-  const running = daemonRunning || daemonStarting || legacy !== null;
+  const running =
+    daemonRunning || daemonStarting || daemonRestartPending || legacy !== null;
   const tasks = activated ? listTaskStatuses(repoRoot) : [];
   const workerStatuses = activated ? listWorkerStatuses(repoRoot) : null;
   const counts = {};
@@ -764,7 +933,10 @@ function runnerStatus(repoRoot) {
       appliedConfig?.configReloadIntervalMs ?? config.configReloadIntervalMs,
     retries: appliedConfig?.retries ?? config.retries,
     dashboardPort: appliedConfig?.dashboardPort ?? config.dashboardPort,
-    dashboardUrl: daemonRunning ? daemon.dashboard?.url || null : null,
+    dashboardUrl:
+      daemonRunning || daemonRestartPending
+        ? daemon.dashboard?.url || null
+        : null,
     modelProfiles: appliedConfig?.modelProfiles ?? config.modelProfiles,
     defaultModelProfile:
       appliedConfig?.defaultModelProfile ?? config.defaultModelProfile,
@@ -772,9 +944,13 @@ function runnerStatus(repoRoot) {
       ? daemon.configReload?.warning || null
       : config.warning,
     configReload: daemonCurrent ? daemon.configReload || null : null,
+    git: appliedConfig?.git ?? config.git,
+    runtime: daemonCurrent ? daemon.runtime || null : null,
+    runtimeUpdate: daemonCurrent ? daemon.runtimeUpdate || null : null,
     daemon: daemonCurrent ? daemon : null,
     daemonStarting,
     daemonStopping,
+    daemonRestartPending,
     conflictingDaemon,
     legacyRunner: legacy,
     tasks: counts,
@@ -829,30 +1005,361 @@ function todoStatus(repoRoot, args = {}) {
       defaultModelProfile: runner.defaultModelProfile,
       configWarning: runner.configWarning,
       configReload: runner.configReload,
+      git: runner.git,
+      runtime: runner.runtime,
+      runtimeUpdate: runner.runtimeUpdate,
     },
     tasks: { counts, items: tasks },
     workers: runner.workerStates,
   };
 }
 
+function preflightBindingConfig(config, targetBranch) {
+  return {
+    ...config,
+    git: { ...config.git, resolvedTargetBranch: targetBranch },
+  };
+}
+
+function branchWorktrees(repoRoot, branch) {
+  const result = spawnSync(
+    "git",
+    ["-C", repoRoot, "worktree", "list", "--porcelain"],
+    { encoding: "utf8", timeout: 10000 },
+  );
+  if (result.status !== 0) return [];
+  return result.stdout
+    .trim()
+    .split(/\n\s*\n/)
+    .filter(Boolean)
+    .map((block) => {
+      const lines = block.split(/\r?\n/);
+      return {
+        path: lines.find((line) => line.startsWith("worktree "))?.slice(9),
+        branch: lines.find((line) => line.startsWith("branch "))?.slice(7),
+      };
+    })
+    .filter(
+      (item) => item.path && item.branch === `refs/heads/${branch}`,
+    )
+    .map((item) => item.path);
+}
+
+function preflightPath(repoRoot, id) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(id))) {
+    throw new Error("Invalid preflightId");
+  }
+  return path.join(todoDir(repoRoot), "preflight", `${id}.json`);
+}
+
+function requiredLocalChecks(deliveries) {
+  const checks = [
+    "config",
+    "runtime",
+    "git-root",
+    "git-target",
+    "git-identity",
+    "codex-command",
+    "git-worktree",
+  ];
+  if (deliveries.includes("merge")) checks.push("git-merge-target");
+  if (deliveries.includes("pr")) checks.push("github-pr");
+  return checks;
+}
+
+async function taskPreflight(repoRoot, args) {
+  const config = loadConfig(repoRoot);
+  const deliveries = [
+    ...new Set(
+      (Array.isArray(args.gitDeliveries) && args.gitDeliveries.length > 0
+        ? args.gitDeliveries
+        : [config.git.delivery]),
+    ),
+  ];
+  const targetBranch =
+    args.targetBranch || config.git.targetBranch || currentGitBranch(repoRoot);
+  let runtime;
+  try {
+    runtime =
+      process.env.TODO_RUNNER_WORKER === "1"
+        ? ensureWorkerTaskCreationRuntime(repoRoot)
+        : ensureDaemon(repoRoot);
+  } catch (error) {
+    runtime = { status: "failed", reason: error.message };
+  }
+  const runtimeReady = ["running", "already-running", "worker-parent"].includes(
+    runtime.status,
+  );
+  const probePath = path.join(
+    todoDir(repoRoot),
+    `preflight-worktree-${randomUUID()}`,
+  );
+  const checks = await runLocalPreflightChecks(
+    [
+      {
+        name: "config",
+        run: () => ({
+          status: config.readError ? "failed" : "ok",
+          summary: config.readError || "configuration loaded",
+        }),
+      },
+      {
+        name: "runtime",
+        run: () => ({
+          status: runtimeReady ? "ok" : "failed",
+          summary: runtimeReady
+            ? `runtime ${runtime.status}`
+            : `runtime ${runtime.status}: ${runtime.reason || runtime.runtimeUpdate?.reason || "not ready"}`,
+        }),
+      },
+      {
+        name: "git-root",
+        run: () => commandCheck("git", ["rev-parse", "--show-toplevel"], repoRoot),
+      },
+      {
+        name: "git-target",
+        run: () => {
+          if (!targetBranch) {
+            return { status: "failed", summary: "target branch is unavailable" };
+          }
+          const valid = commandCheck(
+            "git",
+            ["check-ref-format", "--branch", targetBranch],
+            repoRoot,
+          );
+          return valid.status === "ok"
+            ? commandCheck(
+                "git",
+                [
+                  "rev-parse",
+                  "--verify",
+                  "--end-of-options",
+                  `refs/heads/${targetBranch}^{commit}`,
+                ],
+                repoRoot,
+              )
+            : valid;
+        },
+      },
+      {
+        name: "git-identity",
+        run: () => {
+          const name = commandCheck("git", ["config", "user.name"], repoRoot);
+          const email = commandCheck("git", ["config", "user.email"], repoRoot);
+          return name.status === "ok" && email.status === "ok"
+            ? { status: "ok", summary: "Git identity configured" }
+            : { status: "failed", summary: "Git user.name/user.email missing" };
+        },
+      },
+      {
+        name: "codex-command",
+        run: () =>
+          commandCheck(
+            config.codexCommand,
+            config.executionBackend === "app-server"
+              ? ["app-server", "--help"]
+              : ["--version"],
+            repoRoot,
+          ),
+      },
+      {
+        name: "git-worktree",
+        run: () => {
+          if (!targetBranch) {
+            return { status: "failed", summary: "target branch is unavailable" };
+          }
+          const valid = commandCheck(
+            "git",
+            ["check-ref-format", "--branch", targetBranch],
+            repoRoot,
+          );
+          if (valid.status !== "ok") return valid;
+          const added = commandCheck(
+            "git",
+            [
+              "worktree",
+              "add",
+              "--detach",
+              probePath,
+              `refs/heads/${targetBranch}`,
+            ],
+            repoRoot,
+          );
+          if (added.status !== "ok") return added;
+          const removed = commandCheck(
+            "git",
+            ["worktree", "remove", "--force", probePath],
+            repoRoot,
+          );
+          return existsSync(probePath)
+            ? {
+                status: "failed",
+                summary: `probe worktree cleanup failed; preserved ${probePath}`,
+              }
+            : removed;
+        },
+      },
+      {
+        name: "git-merge-target",
+        required: deliveries.includes("merge"),
+        run: () => {
+          const checkouts = branchWorktrees(repoRoot, targetBranch);
+          if (checkouts.length === 0) {
+            return { status: "ok", summary: "target is not checked out" };
+          }
+          if (checkouts.length > 1) {
+            return { status: "failed", summary: "target has multiple checkouts" };
+          }
+          const dirty = spawnSync(
+            "git",
+            [
+              "status",
+              "--porcelain",
+              "--untracked-files=all",
+              "--",
+              ".",
+              ":(exclude).todo/**",
+            ],
+            { cwd: checkouts[0], encoding: "utf8" },
+          );
+          return dirty.status === 0 && !dirty.stdout.trim()
+            ? { status: "ok", summary: "merge target is clean" }
+            : { status: "failed", summary: "merge target is dirty" };
+        },
+      },
+      {
+        name: "github-pr",
+        required: deliveries.includes("pr"),
+        run: () => {
+          const remote = commandCheck(
+            "git",
+            ["remote", "get-url", config.git.remote],
+            repoRoot,
+          );
+          if (remote.status !== "ok") return remote;
+          return commandCheck("gh", ["auth", "status"], repoRoot);
+        },
+      },
+    ],
+    { repoRoot },
+  );
+  if (process.env.TODO_RUNNER_WORKER === "1") {
+    ensureWorkerTaskCreationRuntime(repoRoot);
+  }
+  const receipt = createPreflightReceipt({
+    repoRoot,
+    config: preflightBindingConfig(config, targetBranch),
+    capabilityReports: args.capabilityReports || [],
+    localPreflight: checks,
+  });
+  const receiptFile = preflightPath(repoRoot, receipt.id);
+  mkdirSync(path.dirname(receiptFile), { recursive: true });
+  atomicWriteJson(receiptFile, receipt);
+  return {
+    preflightId: receipt.id,
+    expiresAt: new Date(receipt.expiresAt).toISOString(),
+    capabilities: receipt.capabilities,
+    localChecks: receipt.localChecks,
+    deliveries,
+    targetBranch,
+  };
+}
+
+function validatedPreflight(
+  repoRoot,
+  args,
+  tasks,
+  { targetBranch: requestedTargetBranch } = {},
+) {
+  const config = loadConfig(repoRoot);
+  const receiptFile = preflightPath(repoRoot, args.preflightId);
+  if (!existsSync(receiptFile)) throw new Error("Preflight receipt not found");
+  const deliveries = [
+    ...new Set(tasks.map((task) => task.delivery || config.git.delivery)),
+  ];
+  const targetBranch =
+    requestedTargetBranch || config.git.targetBranch || currentGitBranch(repoRoot);
+  const receipt = validatePreflightReceipt(readJson(receiptFile), {
+    repoRoot,
+    config: preflightBindingConfig(config, targetBranch),
+    requiredCapabilities: args.requiredCapabilities || [],
+    requiredLocalChecks: requiredLocalChecks(deliveries),
+  });
+  return {
+    receipt,
+    gitSnapshot: {
+      delivery: config.git.delivery,
+      targetBranch,
+      remote: config.git.remote,
+    },
+  };
+}
+
+function ensureTaskCreationRuntime(repoRoot) {
+  const daemon = ensureDaemon(repoRoot);
+  if (!["running", "already-running"].includes(daemon.status)) {
+    throw new Error(
+      `ToDo runtime is not current (${daemon.status}): ${daemon.reason || daemon.runtimeUpdate?.reason || "retry after the safe restart"}`,
+    );
+  }
+  return daemon;
+}
+
 async function callTool(name, args = {}) {
   switch (name) {
+    case "task_preflight":
+      return taskPreflight(activatedRepo(args), args);
+    case "task_batch_create": {
+      if (process.env.TODO_RUNNER_WORKER === "1") {
+        throw new Error("Background workers cannot create task batches");
+      }
+      const repoRoot = activatedRepo(args);
+      const preflight = validatedPreflight(repoRoot, args, args.tasks);
+      const daemon = ensureTaskCreationRuntime(repoRoot);
+      const tasks = createTaskBatch(repoRoot, args.tasks, {
+        preflightId: args.preflightId,
+        requiredCapabilities: args.requiredCapabilities || [],
+        gitSnapshot: preflight.gitSnapshot,
+      });
+      return { tasks, daemon: daemon.status };
+    }
     case "task_create": {
       const repoRoot = activatedRepo(args);
-      const task = createTask(repoRoot, args);
+      const input = workerTaskCreationArgs(repoRoot, args);
+      const preflight = validatedPreflight(repoRoot, input, [input]);
+      const daemon =
+        process.env.TODO_RUNNER_WORKER === "1"
+          ? ensureWorkerTaskCreationRuntime(repoRoot)
+          : ensureTaskCreationRuntime(repoRoot);
+      const [task] = createTaskBatch(repoRoot, [input], {
+        preflightId: input.preflightId,
+        requiredCapabilities: input.requiredCapabilities || [],
+        gitSnapshot: preflight.gitSnapshot,
+      });
       if (task.execution?.mode === "interactive") {
         return {
           task: getTaskStatus(repoRoot, task.id),
           daemon: "deferred-interactive",
         };
       }
-      const daemon = ensureDaemon(repoRoot);
       return { task: getTaskStatus(repoRoot, task.id), daemon: daemon.status };
     }
     case "task_artifact_add":
       return addTaskArtifacts(activatedRepo(args), args.id, args.artifacts);
-    case "task_update":
-      return updateTask(activatedRepo(args), args.id, args);
+    case "task_update": {
+      const repoRoot = activatedRepo(args);
+      if (args.delivery !== undefined) {
+        const task = getTaskStatus(repoRoot, args.id);
+        const targetBranch =
+          task.git?.targetBranch ||
+          loadConfig(repoRoot).git.targetBranch ||
+          currentGitBranch(repoRoot);
+        validatedPreflight(repoRoot, args, [{ delivery: args.delivery }], {
+          targetBranch,
+        });
+      }
+      return updateTask(repoRoot, args.id, args);
+    }
     case "repo_init":
       return initializeRepo(resolveRepo(args));
     case "task_get": {
@@ -884,6 +1391,12 @@ async function callTool(name, args = {}) {
       if (task.execution?.mode !== "interactive") ensureDaemon(repoRoot);
       return task;
     }
+    case "task_reopen": {
+      const repoRoot = activatedRepo(args);
+      const task = reopenTask(repoRoot, args.id);
+      if (task.execution?.mode !== "interactive") ensureDaemon(repoRoot);
+      return task;
+    }
     case "task_run_start":
       return startInteractiveTask(activatedRepo(args), args.id);
     case "task_run_finish":
@@ -892,8 +1405,14 @@ async function callTool(name, args = {}) {
         args.id,
         args,
       );
-    case "task_cancel":
-      return cancelTask(activatedRepo(args), args.id);
+    case "task_cancel": {
+      const repoRoot = activatedRepo(args);
+      const receipt = await cancelTask(repoRoot, args.id);
+      if (receipt.codexThread?.state === "archive-pending") {
+        ensureDaemon(repoRoot);
+      }
+      return receipt;
+    }
     case "runner_status":
       return runnerStatus(resolveRepo(args));
     case "runner_start": {
@@ -926,7 +1445,7 @@ async function handle(message) {
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: "todo", version: pluginVersion },
       instructions:
-        "In repositories containing .todo/config.json, route every mutation through $todo:route even when the user does not mention ToDo: create it with task_create before changing repository state and leave it queued by default. Interactive execution is allowed only when the user explicitly requests it, or after a background attempt reports that it cannot proceed without a current-thread-only capability. Task IDs use an unbounded monotonic numeric sequence and continue past 999. Tasks linked to Jira, Asana, or any external service must include externalWorkflows, but that linkage never changes execution mode. In either mode, mirror the service-native workflow status before and after implementation and leave a result comment that explicitly says Codex/AI performed the work; pass its receipt through externalSync before completion. Already claimed ToDo workers must implement directly without nesting tasks. Read-only work stays inline. Use repo_init to activate durable routing. Never edit .todo task files directly.",
+        "In repositories containing .todo/config.json, route every mutation through $todo:route even when the user does not mention ToDo: create it with task_create before changing repository state and leave it queued for codex exec by default. Interactive execution is allowed only when the user explicitly requests it, or after a background attempt reports that it cannot proceed without a current-thread-only capability. Task IDs use an unbounded monotonic numeric sequence and continue past 999. A claimed background worker must implement directly and cannot create follow-up tasks unless its parent task records allowWorkerTaskCreation from an explicit user instruction. Authorized follow-up tasks automatically depend on the parent and cannot propagate that permission. Read-only work stays inline. Use repo_init to activate durable routing. Never edit .todo task files directly.",
     });
   }
   if (message.method === "ping") return success(message.id, {});

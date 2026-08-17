@@ -4,8 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "npm run test:contract && npm run test:smoke",
+    "test": "npm run test:contract && npm run test:preflight && npm run test:app-server && npm run test:runtime && npm run test:git && npm run test:smoke",
     "test:contract": "node --test tests/*.test.mjs",
+    "test:preflight": "node plugins/todo/scripts/preflight-test.mjs",
+    "test:app-server": "node plugins/todo/scripts/app-server-client-test.mjs && node plugins/todo/scripts/app-server-daemon-test.mjs",
+    "test:runtime": "node plugins/todo/scripts/runtime-update-test.mjs",
+    "test:git": "node plugins/todo/scripts/git-worktree.mjs --self-check",
     "test:smoke": "node plugins/todo/scripts/smoke-test.mjs"
   }
 }

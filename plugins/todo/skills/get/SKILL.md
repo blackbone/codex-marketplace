@@ -5,6 +5,8 @@ description: Inspect one ToDo task including its body, status, blockers, error, 
 
 # ToDo Get
 
+Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
+
 1. Require a full task ID or unique numeric prefix.
 2. Call `task_get`.
 3. Report the returned state without changing the task.

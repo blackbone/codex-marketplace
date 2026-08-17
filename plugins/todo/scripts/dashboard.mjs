@@ -19,7 +19,7 @@ import {
 
 const DASHBOARD_HOST = "127.0.0.1";
 const TASK_LOG_ID_PATTERN = /^[0-9]+-[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const ATTEMPT_LOG_PATTERN = /^[0-9TZ-]+$/;
+const ATTEMPT_LOG_PATTERN = /^(?:[0-9TZ-]+|attempt-[0-9]+-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}|delivery-[0-9]{4}(?:-[0-9]{2}){2}T(?:[0-9]{2}-){3}[0-9]{3}Z)$/i;
 const LOG_FILE_PATTERN = /^[a-z0-9][a-z0-9._-]*\.(?:log|txt|json|jsonl)$/i;
 const TASK_LOG_FILES = new Map([
   ["prompt.txt", "Execution prompt"],
@@ -27,6 +27,7 @@ const TASK_LOG_FILES = new Map([
   ["stderr.log", "Standard error"],
   ["result.json", "Structured result"],
   ["usage.json", "Usage metrics"],
+  ["delivery.json", "Git delivery"],
 ]);
 const SORT_FIELDS = new Set([
   "id",
@@ -42,6 +43,7 @@ const SORT_FIELDS = new Set([
   "duration",
   "lastRun",
   "tokens",
+  "retries",
 ]);
 const STATUS_ORDER = new Map([
   ["running", 0],
@@ -170,19 +172,21 @@ function taskLogInventory(repoRoot, selectedTask = null) {
       const metadata = available.map((file) =>
         logFileMetadata(path.join(attemptRoot, file)),
       );
-      entries.push({
-        scope: "task",
-        taskId,
-        attempt,
-        file: "transcript.txt",
-        label: "Readable transcript",
-        virtual: true,
-        size: metadata.reduce((total, item) => total + item.size, 0),
-        modifiedAt: metadata
-          .map((item) => item.modifiedAt)
-          .sort()
-          .at(-1),
-      });
+      if (!attempt.startsWith("delivery-")) {
+        entries.push({
+          scope: "task",
+          taskId,
+          attempt,
+          file: "transcript.txt",
+          label: "Readable transcript",
+          virtual: true,
+          size: metadata.reduce((total, item) => total + item.size, 0),
+          modifiedAt: metadata
+            .map((item) => item.modifiedAt)
+            .sort()
+            .at(-1),
+        });
+      }
       for (const file of available) {
         entries.push({
           scope: "task",
@@ -199,21 +203,24 @@ function taskLogInventory(repoRoot, selectedTask = null) {
 }
 
 function executionEventText(event, index) {
-  const item = event?.item;
+  const item = event?.item || event?.params?.item;
   const itemType = item?.type || null;
-  const heading = `[${String(index + 1).padStart(4, "0")}] ${event?.type || "event"}${itemType ? ` · ${itemType}` : ""}`;
+  const eventType = event?.type || event?.method || "event";
+  const heading = `[${String(index + 1).padStart(4, "0")}] ${eventType}${itemType ? ` · ${itemType}` : ""}`;
   if (!item) {
     const payload = { ...event };
     delete payload.type;
+    delete payload.method;
     return `${heading}\n${Object.keys(payload).length > 0 ? JSON.stringify(payload, null, 2) : ""}`.trimEnd();
   }
-  if (itemType === "agent_message" || itemType === "reasoning") {
+  if (["agent_message", "agentMessage", "reasoning"].includes(itemType)) {
     return `${heading}\n${item.text || ""}`.trimEnd();
   }
-  if (itemType === "command_execution") {
+  if (["command_execution", "commandExecution"].includes(itemType)) {
     const parts = [heading, item.command || ""];
-    if (item.aggregated_output) parts.push("", item.aggregated_output);
-    parts.push("", `status=${item.status || "unknown"} exit_code=${item.exit_code ?? ""}`);
+    const output = item.aggregated_output || item.aggregatedOutput;
+    if (output) parts.push("", output);
+    parts.push("", `status=${item.status || "unknown"} exit_code=${item.exit_code ?? item.exitCode ?? ""}`);
     return parts.join("\n").trimEnd();
   }
   return `${heading}\n${JSON.stringify(item, null, 2)}`;
@@ -352,6 +359,60 @@ function compactDuration(durationMs) {
   return visible.length > 0 ? visible.join(" ") : "0s";
 }
 
+function tokenUsageView(task) {
+  const usage = task.metrics?.tokenUsage || {};
+  const coverage = usage.available === true
+    ? usage.coverage === "full" ? "full" : "partial"
+    : "none";
+  if (coverage === "none") {
+    return { text: "—", title: "Coverage: none\nNo measured token usage" };
+  }
+  const number = (value) => Math.max(0, Number(value) || 0);
+  const total = number(usage.totalTokens);
+  return {
+    text: `${total}${coverage === "partial" ? "*" : ""}`,
+    title: [
+      `Coverage: ${coverage}${coverage === "partial" ? " (*)" : ""}`,
+      `Total: ${total}`,
+      `Input: ${number(usage.inputTokens)}`,
+      `Cached input: ${number(usage.cachedInputTokens)}`,
+      `Uncached input: ${number(usage.uncachedInputTokens)}`,
+      `Cache write input: ${number(usage.cacheWriteInputTokens)}`,
+      `Output: ${number(usage.outputTokens)}`,
+      `Reasoning output: ${number(usage.reasoningOutputTokens)}`,
+      `Visible output: ${number(usage.visibleOutputTokens)}`,
+      `Turns: ${number(usage.turns)}`,
+    ].join("\n"),
+  };
+}
+
+function retryStatsView(task) {
+  const stats = task.retryStats || task.attemptLedger?.retryStats || {};
+  const number = (value) => Math.max(0, Number(value) || 0);
+  const model = number(stats.modelRetries);
+  const automatic = number(stats.automaticRetries);
+  const manual = number(stats.manualRetries);
+  const delivery = number(stats.deliveryRetries);
+  return {
+    text: `M${model} D${delivery}`,
+    title: `Model retries: ${model}\nAutomatic: ${automatic}\nManual: ${manual}\nDelivery retries: ${delivery}`,
+    total: model + delivery,
+  };
+}
+
+function daemonRuntimeState(daemon) {
+  if (!daemon) return "offline";
+  const update = daemon.runtimeUpdate;
+  if (update?.status === "pending" || daemon.status === "restart-pending") {
+    const active = Number.isInteger(update?.activeTasks)
+      ? ` (${update.activeTasks} active)`
+      : "";
+    return `restart pending${active}`;
+  }
+  if (daemon.status && daemon.status !== "running") return daemon.status;
+  return update?.status || (daemon.runtime ? "current" : "legacy");
+}
+
 const FILTER_FIELDS = new Set([
   "id",
   "task",
@@ -367,8 +428,8 @@ const FILTER_FIELDS = new Set([
   "duration",
   "lastrun",
   "tokens",
+  "retries",
   "error",
-  "external",
 ]);
 
 function filterTokens(query) {
@@ -397,10 +458,6 @@ function filterTokens(query) {
 }
 
 function taskFilterValue(task, field) {
-  const external = (task.externalWorkflows || [])
-    .flatMap((item) => [item.service, item.resourceId, item.label, item.url])
-    .filter(Boolean)
-    .join(" ");
   switch (field) {
     case "id":
       return taskNumber(task.id);
@@ -428,10 +485,10 @@ function taskFilterValue(task, field) {
       return `${task.metrics?.lastRun?.durationMs ?? 0} ${compactDuration(task.metrics?.lastRun?.durationMs)}`;
     case "tokens":
       return task.metrics?.tokenUsage?.totalTokens ?? 0;
+    case "retries":
+      return retryStatsView(task).total;
     case "error":
       return task.error?.message || "";
-    case "external":
-      return external;
     default:
       return "";
   }
@@ -448,7 +505,6 @@ function taskSearchText(task) {
     ...(task.existingBlockers || task.blockers || []),
     ...taskBlockerNumbers(task),
     task.error?.message,
-    taskFilterValue(task, "external"),
   ]
     .filter((value) => value !== null && value !== undefined)
     .join(" ")
@@ -511,6 +567,7 @@ const DASHBOARD_SCRIPT = `(() => {
   let pollTimer = null;
   let visibleLogs = [];
   let selectedLog = null;
+  let loadedLogContent = null;
   let logPollTimer = null;
   const timestampFormatter = new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium",
@@ -519,7 +576,7 @@ const DASHBOARD_SCRIPT = `(() => {
   const filterFields = new Set([
     "id", "task", "title", "status", "worker", "profile",
     "blocker", "blockers", "updated", "start", "end",
-    "duration", "lastrun", "tokens", "error", "external",
+    "duration", "lastrun", "tokens", "error",
   ]);
 
   function taskNumber(value) {
@@ -574,6 +631,50 @@ const DASHBOARD_SCRIPT = `(() => {
     return visible.length > 0 ? visible.join(" ") : "0s";
   }
 
+  function tokenUsageView(task) {
+    const usage = task.metrics?.tokenUsage || {};
+    const coverage = usage.available === true
+      ? usage.coverage === "full" ? "full" : "partial"
+      : "none";
+    if (coverage === "none") {
+      return { text: "—", title: "Coverage: none\\nNo measured token usage" };
+    }
+    const number = (value) => Math.max(0, Number(value) || 0);
+    const total = number(usage.totalTokens);
+    return {
+      text: String(total) + (coverage === "partial" ? "*" : ""),
+      title: [
+        "Coverage: " + coverage + (coverage === "partial" ? " (*)" : ""),
+        "Total: " + total,
+        "Input: " + number(usage.inputTokens),
+        "Cached input: " + number(usage.cachedInputTokens),
+        "Uncached input: " + number(usage.uncachedInputTokens),
+        "Cache write input: " + number(usage.cacheWriteInputTokens),
+        "Output: " + number(usage.outputTokens),
+        "Reasoning output: " + number(usage.reasoningOutputTokens),
+        "Visible output: " + number(usage.visibleOutputTokens),
+        "Turns: " + number(usage.turns),
+      ].join("\\n"),
+    };
+  }
+
+  function retryStatsView(task) {
+    const stats = task.retryStats || task.attemptLedger?.retryStats || {};
+    const number = (value) => Math.max(0, Number(value) || 0);
+    const model = number(stats.modelRetries);
+    const automatic = number(stats.automaticRetries);
+    const manual = number(stats.manualRetries);
+    const delivery = number(stats.deliveryRetries);
+    return {
+      text: "M" + model + " D" + delivery,
+      title: "Model retries: " + model +
+        "\\nAutomatic: " + automatic +
+        "\\nManual: " + manual +
+        "\\nDelivery retries: " + delivery,
+      total: model + delivery,
+    };
+  }
+
   function filterTokens(query) {
     const tokens = [];
     let current = "";
@@ -600,10 +701,6 @@ const DASHBOARD_SCRIPT = `(() => {
   }
 
   function taskFilterValue(task, field) {
-    const external = (task.externalWorkflows || [])
-      .flatMap((item) => [item.service, item.resourceId, item.label, item.url])
-      .filter(Boolean)
-      .join(" ");
     switch (field) {
       case "id":
         return taskNumber(task.id);
@@ -636,10 +733,10 @@ const DASHBOARD_SCRIPT = `(() => {
           compactDuration(task.metrics?.lastRun?.durationMs);
       case "tokens":
         return task.metrics?.tokenUsage?.totalTokens ?? 0;
+      case "retries":
+        return retryStatsView(task).total;
       case "error":
         return task.error?.message || "";
-      case "external":
-        return external;
       default:
         return "";
     }
@@ -656,7 +753,6 @@ const DASHBOARD_SCRIPT = `(() => {
       ...(task.existingBlockers || task.blockers || []),
       ...taskBlockerNumbers(task),
       task.error?.message,
-      taskFilterValue(task, "external"),
     ]
       .filter((value) => value !== null && value !== undefined)
       .join(" ")
@@ -771,6 +867,8 @@ const DASHBOARD_SCRIPT = `(() => {
         return task.metrics?.lastRun?.durationMs ?? -1;
       case "tokens":
         return task.metrics?.tokenUsage?.totalTokens ?? -1;
+      case "retries":
+        return retryStatsView(task).total;
       default:
         return task[field] ?? "";
     }
@@ -822,11 +920,14 @@ const DASHBOARD_SCRIPT = `(() => {
   }
 
   async function loadLog(entry, quiet = false) {
+    if (quiet && selectedLog !== entry) return;
     selectedLog = entry;
     clearTimeout(logPollTimer);
+    const previousScrollTop = logContent.scrollTop;
     const wasAtBottom =
       logContent.scrollHeight - logContent.scrollTop - logContent.clientHeight < 48;
     if (!quiet) {
+      loadedLogContent = null;
       logContent.textContent = "Loading…";
       logStatus.textContent = entry.label;
     }
@@ -834,17 +935,35 @@ const DASHBOARD_SCRIPT = `(() => {
       const response = await fetch(logQuery(entry), { cache: "no-store" });
       if (!response.ok) throw new Error("HTTP " + response.status);
       const content = await response.text();
-      logContent.textContent = content || "(empty log)";
-      logStatus.textContent =
+      if (selectedLog !== entry) return;
+      const displayContent = content || "(empty log)";
+      let contentChanged = false;
+      if (quiet && loadedLogContent && content.startsWith(loadedLogContent)) {
+        const suffix = content.slice(loadedLogContent.length);
+        if (suffix) {
+          logContent.append(document.createTextNode(suffix));
+          contentChanged = true;
+        }
+      } else if (logContent.textContent !== displayContent) {
+        logContent.textContent = displayContent;
+        contentChanged = true;
+      }
+      loadedLogContent = content;
+      const statusText =
         entry.label + " · " + formatBytes(content.length) +
         (entry.modifiedAt ? " · " + formatTimestamp(entry.modifiedAt) : "");
+      if (logStatus.textContent !== statusText) logStatus.textContent = statusText;
       for (const button of logList.querySelectorAll("button[data-log-index]")) {
         button.classList.toggle(
           "selected",
           visibleLogs[Number(button.dataset.logIndex)] === entry,
         );
       }
-      if (wasAtBottom || !quiet) logContent.scrollTop = logContent.scrollHeight;
+      if (contentChanged) {
+        logContent.scrollTop = wasAtBottom || !quiet
+          ? logContent.scrollHeight
+          : previousScrollTop;
+      }
     } catch (error) {
       if (!quiet) logContent.textContent = "Could not load log: " + error.message;
       logStatus.textContent = "disconnected";
@@ -886,6 +1005,7 @@ const DASHBOARD_SCRIPT = `(() => {
   async function openLogs(taskId = null) {
     clearTimeout(logPollTimer);
     selectedLog = null;
+    loadedLogContent = null;
     logTitle.textContent = taskId ? "Logs — " + taskId : "All logs";
     logStatus.textContent = "Loading…";
     logContent.textContent = "Select a log";
@@ -975,7 +1095,14 @@ const DASHBOARD_SCRIPT = `(() => {
     row.append(cell(formatTimestamp(task.metrics?.completedAt), "time"));
     row.append(cell(compactDuration(task.metrics?.durationMs)));
     row.append(cell(compactDuration(task.metrics?.lastRun?.durationMs)));
-    row.append(cell(task.metrics?.tokenUsage?.totalTokens ?? 0));
+    const tokens = tokenUsageView(task);
+    const tokensCell = cell(tokens.text);
+    tokensCell.title = tokens.title;
+    row.append(tokensCell);
+    const retries = retryStatsView(task);
+    const retriesCell = cell(retries.text);
+    retriesCell.title = retries.title;
+    row.append(retriesCell);
     row.append(cell(task.error?.message ?? "", "error"));
     const logsCell = document.createElement("td");
     const logsButton = document.createElement("button");
@@ -985,6 +1112,66 @@ const DASHBOARD_SCRIPT = `(() => {
     logsCell.append(logsButton);
     row.append(logsCell);
     return row;
+  }
+
+  function updateTaskRow(row, task, allTasks) {
+    const nextRow = taskRow(task, allTasks);
+    const nextCells = [...nextRow.children];
+    nextCells.forEach((nextCell, index) => {
+      const currentCell = row.children[index];
+      if (!currentCell) row.append(nextCell);
+      else if (!currentCell.isEqualNode(nextCell)) currentCell.replaceWith(nextCell);
+    });
+    while (row.children.length > nextCells.length) row.lastElementChild.remove();
+  }
+
+  function reconcileTaskRows(tasks, allTasks) {
+    const existingRows = new Map(
+      [...tableBody.querySelectorAll("tr[data-task-id]")].map((row) => [
+        row.dataset.taskId,
+        row,
+      ]),
+    );
+    const rows = [];
+    if (tasks.length === 0) {
+      let row = tableBody.querySelector("tr[data-empty-state]");
+      const message = filterInput.value.trim() ? "No matching tasks" : "No tasks";
+      if (!row) {
+        row = document.createElement("tr");
+        row.dataset.emptyState = "";
+        const empty = cell(message);
+        empty.colSpan = 15;
+        row.append(empty);
+      } else {
+        const empty = row.firstElementChild;
+        if (empty.colSpan !== 15) empty.colSpan = 15;
+        if (empty.textContent !== message) empty.textContent = message;
+      }
+      rows.push(row);
+    } else {
+      for (const task of tasks) {
+        const taskId = String(task.id);
+        let row = existingRows.get(taskId);
+        if (row) {
+          existingRows.delete(taskId);
+          updateTaskRow(row, task, allTasks);
+        } else {
+          row = taskRow(task, allTasks);
+        }
+        rows.push(row);
+      }
+    }
+
+    const desiredRows = new Set(rows);
+    for (const row of [...tableBody.children]) {
+      if (!desiredRows.has(row)) row.remove();
+    }
+
+    let cursor = tableBody.firstElementChild;
+    for (const row of rows) {
+      if (row === cursor) cursor = cursor.nextElementSibling;
+      else tableBody.insertBefore(row, cursor);
+    }
   }
 
   function updateSortLinks() {
@@ -997,9 +1184,11 @@ const DASHBOARD_SCRIPT = `(() => {
       const params = new URLSearchParams(window.location.search);
       params.set("sort", field);
       params.set("dir", nextDirection);
-      link.href = "/?" + params.toString();
-      link.textContent = link.dataset.label +
+      const href = "/?" + params.toString();
+      const text = link.dataset.label +
         (active ? (sort.direction === "asc" ? " ↑" : " ↓") : "");
+      if (link.getAttribute("href") !== href) link.setAttribute("href", href);
+      if (link.textContent !== text) link.textContent = text;
     }
   }
 
@@ -1012,35 +1201,29 @@ const DASHBOARD_SCRIPT = `(() => {
       sort.field,
       sort.direction,
     );
-    const fragment = document.createDocumentFragment();
-    if (tasks.length === 0) {
-      const row = document.createElement("tr");
-      const empty = cell(filterInput.value.trim() ? "No matching tasks" : "No tasks");
-      empty.colSpan = 14;
-      row.append(empty);
-      fragment.append(row);
-    } else {
-      for (const task of tasks) fragment.append(taskRow(task, allTasks));
-    }
-
     const scrollX = window.scrollX;
     const scrollY = window.scrollY;
-    tableBody.replaceChildren(fragment);
-    window.scrollTo(scrollX, scrollY);
+    reconcileTaskRows(tasks, allTasks);
+    if (window.scrollX !== scrollX || window.scrollY !== scrollY) {
+      window.scrollTo(scrollX, scrollY);
+    }
 
     const workerCounts = payload.workers?.counts || {};
     const runnerName = payload.runner?.implementation || "unknown runner";
     const runnerVersion = payload.runner?.pluginVersion || "";
+    const runtimeState = payload.runner?.runtimeState || "offline";
     const configReloadSeconds = Math.round(
       (payload.config?.configReloadIntervalMs || 5000) / 1000,
     );
-    summary.textContent =
+    const summaryText =
       tasks.length + (tasks.length === allTasks.length ? " tasks · " :
         " of " + allTasks.length + " tasks · ") +
       (workerCounts.busy || 0) + " busy · " +
       (workerCounts.idle || 0) + " idle · " +
-      runnerName + " " + runnerVersion + " · config " +
+      runnerName + " " + runnerVersion + " · runtime " + runtimeState +
+      " · config " +
       configReloadSeconds + "s · live 1s";
+    if (summary.textContent !== summaryText) summary.textContent = summaryText;
     summary.classList.remove("disconnected");
     updateSortLinks();
   }
@@ -1095,6 +1278,7 @@ const DASHBOARD_SCRIPT = `(() => {
   logDialog.addEventListener("close", () => {
     clearTimeout(logPollTimer);
     selectedLog = null;
+    loadedLogContent = null;
   });
 
   filterInput.addEventListener("input", () => {
@@ -1176,11 +1360,15 @@ function dashboardTask(task, now) {
         ...durationFields(Math.max(0, now - claimedAt)),
         tokenUsage: {
           available: false,
+          coverage: "none",
           turns: 0,
           inputTokens: 0,
           cachedInputTokens: 0,
+          uncachedInputTokens: 0,
+          cacheWriteInputTokens: 0,
           outputTokens: 0,
           reasoningOutputTokens: 0,
+          visibleOutputTokens: 0,
           totalTokens: 0,
         },
       }
@@ -1195,6 +1383,12 @@ function dashboardTask(task, now) {
     previousDurationMs + (currentRun?.durationMs || 0);
   const tokenUsage = {
     ...(storedMetrics.tokenUsage || {}),
+    available: storedMetrics.tokenUsage?.available === true,
+    coverage: running
+      ? storedMetrics.tokenUsage?.available === true ? "partial" : "none"
+      : storedMetrics.tokenUsage?.available === true
+        ? storedMetrics.tokenUsage?.coverage === "full" ? "full" : "partial"
+        : "none",
     totalTokens: Number(storedMetrics.tokenUsage?.totalTokens) || 0,
   };
   const claim = task.claim
@@ -1256,6 +1450,8 @@ function taskValue(task, field) {
       return task.metrics?.lastRun?.durationMs ?? -1;
     case "tokens":
       return task.metrics?.tokenUsage?.totalTokens ?? -1;
+    case "retries":
+      return retryStatsView(task).total;
     default:
       return task[field] ?? "";
   }
@@ -1321,6 +1517,10 @@ function statusPayload(repoRoot) {
           protocolVersion: daemon.protocolVersion || null,
           pluginVersion: daemon.pluginVersion || null,
           pid: daemon.pid || null,
+          status: daemon.status || null,
+          runtime: daemon.runtime || null,
+          runtimeUpdate: daemon.runtimeUpdate || null,
+          runtimeState: daemonRuntimeState(daemon),
           configReload: daemon.configReload || null,
         }
       : null,
@@ -1353,7 +1553,9 @@ function renderDashboard(repoRoot, requestUrl) {
       const displayStatus = dashboardStatus(task.status);
       const safeStatus = displayStatus.replace(/[^a-z0-9_-]/gi, "");
       const profile = task.execution?.modelProfile || "";
-      return `<tr>
+      const tokens = tokenUsageView(task);
+      const retries = retryStatsView(task);
+      return `<tr data-task-id="${escapeHtml(task.id)}">
   <td>${idMarkup}</td>
   <td>${escapeHtml(task.title)}</td>
   <td><button type="button" class="filter-token status status-${escapeHtml(safeStatus)}" data-filter-field="status" data-filter-value="${escapeHtml(displayStatus)}" title="Add status filter">${escapeHtml(displayStatus)}</button></td>
@@ -1365,7 +1567,8 @@ function renderDashboard(repoRoot, requestUrl) {
   <td class="time">${escapeHtml(formatTimestamp(task.metrics?.completedAt))}</td>
   <td>${escapeHtml(compactDuration(task.metrics.durationMs))}</td>
   <td>${escapeHtml(compactDuration(task.metrics.lastRun?.durationMs))}</td>
-  <td>${escapeHtml(task.metrics.tokenUsage.totalTokens)}</td>
+  <td title="${escapeHtml(tokens.title)}">${escapeHtml(tokens.text)}</td>
+  <td title="${escapeHtml(retries.title)}">${escapeHtml(retries.text)}</td>
   <td class="error">${escapeHtml(task.error?.message ?? "")}</td>
   <td><button type="button" data-log-task="${escapeHtml(task.id)}">Logs</button></td>
 </tr>`;
@@ -1404,7 +1607,7 @@ function renderDashboard(repoRoot, requestUrl) {
     .status-blocked { color: #7c3aed; }
     .summary.disconnected { color: #dc2626; opacity: 1; }
     .time { white-space: nowrap; }
-    .error { max-width: 420px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .error { min-width: 320px; max-width: 420px; white-space: pre-wrap; overflow-wrap: anywhere; }
     dialog { width: min(1400px, calc(100vw - 32px)); height: min(880px, calc(100vh - 32px)); padding: 0; border: 1px solid #8888; background: Canvas; color: CanvasText; }
     dialog::backdrop { background: #0008; }
     .log-header { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #8885; }
@@ -1432,12 +1635,12 @@ function renderDashboard(repoRoot, requestUrl) {
     <h1>ToDo — ${escapeHtml(path.basename(repoRoot))}</h1>
     <button type="button" data-log-all>All logs</button>
   </div>
-  <p class="summary">${tasks.length}${tasks.length === payload.tasks.length ? "" : ` of ${payload.tasks.length}`} tasks · ${workerCounts.busy || 0} busy · ${workerCounts.idle || 0} idle · ${escapeHtml(payload.runner?.implementation || "unknown runner")} ${escapeHtml(payload.runner?.pluginVersion || "")} · config ${escapeHtml(Math.round((payload.config.configReloadIntervalMs || 5000) / 1000))}s · live 1s</p>
+  <p class="summary">${tasks.length}${tasks.length === payload.tasks.length ? "" : ` of ${payload.tasks.length}`} tasks · ${workerCounts.busy || 0} busy · ${workerCounts.idle || 0} idle · ${escapeHtml(payload.runner?.implementation || "unknown runner")} ${escapeHtml(payload.runner?.pluginVersion || "")} · runtime ${escapeHtml(payload.runner?.runtimeState || "offline")} · config ${escapeHtml(Math.round((payload.config.configReloadIntervalMs || 5000) / 1000))}s · live 1s</p>
   <div class="filters" role="search">
     <label for="task-filter">Filter</label>
     <input id="task-filter" type="search" value="${escapeHtml(filterQuery)}" placeholder="status:completed|rejected" autocomplete="off" spellcheck="false">
     <button id="filter-clear" type="button" data-filter-clear>Clear</button>
-    <span class="filter-help">Fields: id, task, status, worker, profile, blockers, updated, error, external · OR: value|value</span>
+    <span class="filter-help">Fields: id, task, status, worker, profile, blockers, updated, error · OR: value|value</span>
   </div>
   <table>
     <thead>
@@ -1454,11 +1657,12 @@ function renderDashboard(repoRoot, requestUrl) {
         <th>${sortLink("duration", "Duration", sort, direction, filterQuery)}</th>
         <th>${sortLink("lastRun", "Last Run", sort, direction, filterQuery)}</th>
         <th>${sortLink("tokens", "Tokens", sort, direction, filterQuery)}</th>
+        <th>${sortLink("retries", "Retries", sort, direction, filterQuery)}</th>
         <th>${sortLink("error", "Error", sort, direction, filterQuery)}</th>
         <th>Logs</th>
       </tr>
     </thead>
-    <tbody>${rows || '<tr><td colspan="14">No tasks</td></tr>'}</tbody>
+    <tbody>${rows || '<tr data-empty-state><td colspan="15">No tasks</td></tr>'}</tbody>
   </table>
   <dialog id="log-dialog" aria-labelledby="log-title">
     <div class="log-header">

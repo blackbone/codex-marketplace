@@ -5,6 +5,8 @@ description: Show the complete ToDo state with separate task, worker, runner, an
 
 # ToDo Status
 
+Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
+
 1. Call `todo_status` for the target repository.
 2. Render separate `Tasks` and `Workers` sections.
 3. For tasks show ID, status, assigned worker, blockers, and error when present.

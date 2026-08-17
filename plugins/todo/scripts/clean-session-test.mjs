@@ -85,6 +85,7 @@ process.stdin.on("end", () => {
       workers: 1,
       pollIntervalMs: 250,
       codexCommand: fakeCodex,
+      executionBackend: "exec",
       models: [
         {
           name: "fast",

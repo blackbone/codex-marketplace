@@ -5,6 +5,8 @@ description: Initialize durable ToDo routing in a Git repository by creating .to
 
 # ToDo Init
 
+Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
+
 1. Call `repo_init` for the target repository.
 2. Never overwrite an existing `.todo/config.json`.
 3. Ensure the managed ToDo routing block exists in the repository instruction file returned by `repo_init`; preserve every instruction outside that block.

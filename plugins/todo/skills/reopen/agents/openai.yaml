@@ -1,0 +1,6 @@
+interface:
+  display_name: "ToDo Reopen"
+  short_description: "Reopen a closed task in its saved Codex thread"
+  default_prompt: "Use $todo:reopen to reopen a completed or canceled ToDo task."
+policy:
+  allow_implicit_invocation: false

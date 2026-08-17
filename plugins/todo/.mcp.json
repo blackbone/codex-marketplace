@@ -2,7 +2,11 @@
   "mcpServers": {
     "todo": {
       "command": "sh",
-      "args": ["-c", "exec node \"$PLUGIN_ROOT/scripts/mcp-server.mjs\""]
+      "args": ["-c", "exec node \"$PLUGIN_ROOT/scripts/mcp-server.mjs\""],
+      "cwd": ".",
+      "env": {
+        "PLUGIN_ROOT": "."
+      }
     }
   }
 }

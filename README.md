@@ -8,7 +8,7 @@ A Git-backed Codex marketplace for plugins maintained by [blackbone](https://git
 
 | Plugin | What it does | Package |
 | --- | --- | --- |
-| ToDo | Durable repository task routing, background workers, execution history, and external-workflow synchronization. | [Documentation](plugins/todo/README.md) |
+| ToDo | Durable repository task routing with persistent per-task Codex threads, isolated Git delivery, background workers, and telemetry. | [Documentation](plugins/todo/README.md) |
 
 ![ToDo plugin details](plugins/todo/assets/screenshots/plugin-details.png)
 
@@ -63,8 +63,9 @@ Individual targets are available as `make test-contract` and
 push to `main`, pull request, and manual dispatch.
 
 The suite validates the marketplace and documentation contracts, then runs the
-ToDo runtime smoke test across MCP tools, task lifecycle, retries, metrics,
-dashboard, hooks, and external-workflow behavior.
+ToDo runtime smoke test across preflight and atomic task publication, isolated
+Git delivery, retries, attempt-local metrics, the dashboard, and safe runtime
+updates.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md), [repository architecture](docs/ARCHITECTURE.md),
 and [AGENTS.md](AGENTS.md) before changing a package.
