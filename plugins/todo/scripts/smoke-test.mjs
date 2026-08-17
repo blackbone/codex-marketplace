@@ -1132,6 +1132,78 @@ process.stdin.on("end", async () => {
     maxActive = Math.max(maxActive, state?.active?.length || 0);
     return state?.active?.length === 2;
   }, "daemon did not execute two tasks in parallel");
+  const dashboardApiResponse = await fetch(
+    new URL("/api/status", dashboardUrl),
+  );
+  const dashboardApi = await dashboardApiResponse.json();
+  const liveTask = dashboardApi.tasks.find((task) => task.status === "running");
+  const dashboardApiChecks = [
+    ["status", dashboardApiResponse.status === 200],
+    ["tasks", Array.isArray(dashboardApi.tasks)],
+    ["unbounded", dashboardApi.tasks.length > 200],
+    [
+      "first-fixture",
+      dashboardApi.tasks.some(
+        (task) => task.id === "500-dashboard-unbounded-fixture",
+      ),
+    ],
+    [
+      "last-fixture",
+      dashboardApi.tasks.some(
+        (task) => task.id === "704-dashboard-unbounded-fixture",
+      ),
+    ],
+    ["workers", Array.isArray(dashboardApi.workers?.items)],
+    ["implementation", dashboardApi.runner?.implementation === "todo"],
+    ["protocol", dashboardApi.runner?.protocolVersion === 2],
+    ["reload-interval", dashboardApi.config?.configReloadIntervalMs === 250],
+    [
+      "reload-applied",
+      typeof dashboardApi.runner?.configReload?.appliedAt === "string",
+    ],
+    ["live-duration", liveTask?.metrics?.durationMs > 0],
+    ["live-tokens", liveTask?.metrics?.tokenUsage?.totalTokens === 0],
+    ["live-start", typeof liveTask?.metrics?.startedAt === "string"],
+    ["live-end", liveTask?.metrics?.completedAt === null],
+    [
+      "live-run-start",
+      typeof liveTask?.metrics?.lastRun?.startedAt === "string",
+    ],
+    ["live-run-end", liveTask?.metrics?.lastRun?.completedAt === null],
+    ["claim-shape", !Object.hasOwn(liveTask?.claim || {}, "claimedAt")],
+  ];
+  assert(
+    dashboardApiChecks.every(([, passed]) => passed),
+    `dashboard status API did not return tasks and workers: ${dashboardApiChecks
+      .filter(([, passed]) => !passed)
+      .map(([name]) => name)
+      .join(", ")}`,
+  );
+  const taskFileResponse = await fetch(
+    new URL(
+      `/api/task?task=${encodeURIComponent(liveTask.id)}`,
+      dashboardUrl,
+    ),
+  );
+  const taskFileContent = await taskFileResponse.text();
+  const rejectedTaskFileResponse = await fetch(
+    new URL("/api/task?task=..", dashboardUrl),
+  );
+  assert(
+    taskFileResponse.status === 200 &&
+      taskFileResponse.headers.get("content-type")?.startsWith("text/markdown") &&
+      taskFileContent.includes(`# ${liveTask.title}`) &&
+      rejectedTaskFileResponse.status === 404,
+    "dashboard task Markdown endpoint was missing or accepted an invalid path",
+  );
+  await waitFor(() => {
+    const workers = listWorkerStatuses(repoRoot);
+    return workers.items.filter((worker) => worker.status === "busy").length ===
+        2 &&
+      workers.items.every(
+        (worker) => worker.taskId && worker.taskTitle && worker.pid,
+      );
+  }, "worker status did not expose two busy workers with assigned task details");
   const beforeConfigReload = readDaemonState(repoRoot);
   const reloadedRuntimeConfig = {
     ...baseRuntimeConfig,
@@ -1355,68 +1427,11 @@ process.stdin.on("end", async () => {
       ),
     "dashboard default status order was not running, blocked, completed, failed",
   );
-  const dashboardApiResponse = await fetch(
-    new URL("/api/status", dashboardUrl),
-  );
-  const dashboardApi = await dashboardApiResponse.json();
-  const liveTask = dashboardApi.tasks.find((task) => task.status === "running");
-  assert(
-    dashboardApiResponse.status === 200 &&
-      Array.isArray(dashboardApi.tasks) &&
-      dashboardApi.tasks.length > 200 &&
-      dashboardApi.tasks.some(
-        (task) => task.id === "500-dashboard-unbounded-fixture",
-      ) &&
-      dashboardApi.tasks.some(
-        (task) => task.id === "704-dashboard-unbounded-fixture",
-      ) &&
-      Array.isArray(dashboardApi.workers?.items) &&
-    dashboardApi.runner?.implementation === "todo" &&
-      dashboardApi.runner?.protocolVersion === 2 &&
-      dashboardApi.config?.configReloadIntervalMs === 250 &&
-      typeof dashboardApi.runner?.configReload?.appliedAt === "string" &&
-      liveTask?.metrics?.durationMs > 0 &&
-      liveTask?.metrics?.tokenUsage?.totalTokens === 0 &&
-      typeof liveTask?.metrics?.startedAt === "string" &&
-      liveTask?.metrics?.completedAt === null &&
-      typeof liveTask?.metrics?.lastRun?.startedAt === "string" &&
-      liveTask?.metrics?.lastRun?.completedAt === null &&
-      !Object.hasOwn(liveTask.claim || {}, "claimedAt"),
-    "dashboard status API did not return tasks and workers",
-  );
-  const taskFileResponse = await fetch(
-    new URL(
-      `/api/task?task=${encodeURIComponent(liveTask.id)}`,
-      dashboardUrl,
-    ),
-  );
-  const taskFileContent = await taskFileResponse.text();
-  const rejectedTaskFileResponse = await fetch(
-    new URL("/api/task?task=..", dashboardUrl),
-  );
-  assert(
-    taskFileResponse.status === 200 &&
-      taskFileResponse.headers.get("content-type")?.startsWith("text/markdown") &&
-      taskFileContent.includes(`# ${liveTask.title}`) &&
-      rejectedTaskFileResponse.status === 404,
-    "dashboard task Markdown endpoint was missing or accepted an invalid path",
-  );
   assert(
     dashboardHtml.includes(">Start<") &&
       dashboardHtml.includes(">End<") &&
       dashboardHtml.includes(">Last Run<"),
     "dashboard did not render task run columns",
-  );
-  const busyWorkers = listWorkerStatuses(repoRoot);
-  assert(
-    busyWorkers.items.filter((worker) => worker.status === "busy").length === 2,
-    "worker status did not show two busy workers",
-  );
-  assert(
-    busyWorkers.items.every(
-      (worker) => worker.taskId && worker.taskTitle && worker.pid,
-    ),
-    "busy workers did not expose assigned task details",
   );
   await waitFor(
     () =>

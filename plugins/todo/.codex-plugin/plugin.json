@@ -1,6 +1,6 @@
 {
   "name": "todo",
-  "version": "0.1.0+codex.20260814110310",
+  "version": "0.1.0+codex.20260817100424",
   "description": "Durable repository task routing with persistent per-task Codex threads, isolated Git delivery, and telemetry.",
   "author": {
     "name": "blackbone"
