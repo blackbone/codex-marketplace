@@ -24,10 +24,14 @@ import {
   createAttemptLedger,
 } from "./attempt-ledger.mjs";
 import {
+  abortQueuedTaskRebase,
   cleanupTaskWorktree,
   commitTaskWorktree,
+  continueQueuedTaskRebase,
   deliverTaskWorktree,
+  mergeQueuedTaskWorktree,
   prepareTaskWorktree,
+  queueTaskWorktreeForMerge,
   taskBranchName,
   taskWorktreePlan,
   verifyTaskWorktreeHead,
@@ -101,12 +105,16 @@ const TASK_GIT_PHASES = new Set([
   "model-completed",
   "committing",
   "committed",
+  "merge-queued",
+  "merge-conflict",
+  "merge-failed",
   "delivered",
 ]);
 const TASK_GIT_FINALIZER_PHASES = new Set([
   "model-completed",
   "committing",
   "committed",
+  "merge-queued",
   "delivered",
 ]);
 const REASONING_EFFORTS = new Set([
@@ -191,6 +199,50 @@ export function todoDir(repoRoot) {
 
 export function supervisorConfigPath(repoRoot) {
   return path.join(todoDir(repoRoot), "supervisor.json");
+}
+
+export function dashboardThreadRequestPath(repoRoot) {
+  return path.join(todoDir(repoRoot), "dashboard-thread.json");
+}
+
+export function normalizeDashboardThreadId(value, { required = false } = {}) {
+  if (value === undefined || value === null || value === "") {
+    if (required) throw new Error("dashboard thread ID is required");
+    return null;
+  }
+  const threadId = String(value).trim();
+  if (!threadId || threadId.length > 200 || /[\r\n]/.test(threadId)) {
+    throw new Error("dashboard thread ID must be a single-line string");
+  }
+  return threadId;
+}
+
+export function requestDashboardThread(repoRoot, value) {
+  const threadId = normalizeDashboardThreadId(value, { required: true });
+  atomicWriteJson(dashboardThreadRequestPath(repoRoot), {
+    schemaVersion: 1,
+    threadId,
+    updatedAt: new Date().toISOString(),
+  });
+  return threadId;
+}
+
+export function readDashboardThreadRequest(repoRoot) {
+  const file = dashboardThreadRequestPath(repoRoot);
+  if (!existsSync(file)) return null;
+  try {
+    const value = readJson(file);
+    return {
+      threadId: normalizeDashboardThreadId(value.threadId, { required: true }),
+      updatedAt:
+        typeof value.updatedAt === "string" &&
+        Number.isFinite(Date.parse(value.updatedAt))
+          ? new Date(value.updatedAt).toISOString()
+          : null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function taskBatchLockPath(repoRoot) {
@@ -763,6 +815,7 @@ function storedAttemptLedger(task) {
 function nextAttemptTrigger(task) {
   const attempts = storedAttemptLedger(task).attempts;
   if (attempts.length === 0) return "initial";
+  if (task.metadata.git?.phase === "merge-conflict") return "merge_conflict";
   return task.metadata.nextAttemptTrigger === "automatic_retry"
     ? "automatic_retry"
     : "manual_retry";
@@ -822,6 +875,47 @@ export function resolveTaskExecution(
     ephemeral: ephemeral === true,
     mode: runMode || "background",
   };
+}
+
+function escalatedExecution(config, current) {
+  const currentIndex = config.modelProfiles.findIndex(
+    (candidate) => candidate.name === current.modelProfile,
+  );
+  const fallbackIndex = config.modelProfiles.findIndex(
+    (candidate) => candidate.name === config.defaultModelProfile,
+  );
+  const nextIndex = Math.min(
+    config.modelProfiles.length - 1,
+    (currentIndex >= 0 ? currentIndex : Math.max(0, fallbackIndex)) + 1,
+  );
+  const nextProfile = config.modelProfiles[nextIndex];
+  return resolveTaskExecution(config, {
+    backend:
+      current.backend || config.executionBackend || DEFAULT_EXECUTION_BACKEND,
+    modelProfile: nextProfile.name,
+    ephemeral: current.ephemeral,
+    runMode: current.mode || "background",
+  });
+}
+
+export function prepareTaskMergeConflictRepair(repoRoot, taskPath) {
+  const task = readTask(taskPath);
+  if (task.metadata.git?.phase !== "merge-conflict") {
+    throw new Error(`Task is not waiting for merge repair: ${task.id}`);
+  }
+  if (task.metadata.git.mergeConflict?.profileEscalated !== true) {
+    const config = loadConfig(repoRoot);
+    const current =
+      task.metadata.execution || resolveTaskExecution(config, {});
+    task.metadata.execution = escalatedExecution(config, current);
+    task.metadata.git.mergeConflict = {
+      ...task.metadata.git.mergeConflict,
+      profileEscalated: true,
+      repairProfile: task.metadata.execution.modelProfile,
+    };
+    writeTask(task);
+  }
+  return getTaskStatus(repoRoot, task.id);
 }
 
 export function applyGitExcludes(repoRoot, patterns) {
@@ -2438,6 +2532,11 @@ export function getTaskStatus(repoRoot, id) {
   else if (task.metadata.batchReady === false) status = "staging";
   else if (task.metadata.error !== null) status = "failed";
   else if (existingBlockers.length > 0) status = "blocked";
+  else if (task.metadata.git?.phase === "merge-conflict") {
+    status = "merge-conflict";
+  } else if (task.metadata.git?.phase === "merge-queued") {
+    status = "merge-queued";
+  }
 
   let artifacts = [];
   let artifactError = null;
@@ -2528,6 +2627,29 @@ function supervisorTaskCounts(tasks) {
   return counts;
 }
 
+function groupedTaskStatusCounts(counts = {}) {
+  return {
+    running: Number(counts.running || 0),
+    queued: [
+      "queued",
+      "blocked",
+      "staging",
+      "merge-queued",
+      "merge-conflict",
+    ].reduce((total, status) => total + Number(counts[status] || 0), 0),
+    failed: Number(counts.failed || 0),
+  };
+}
+
+export function taskStatusSummary(tasks = []) {
+  return groupedTaskStatusCounts(supervisorTaskCounts(tasks));
+}
+
+export function formatSupervisorThreadTitle(counts = {}) {
+  const { running, queued, failed } = groupedTaskStatusCounts(counts);
+  return `-> ToDo (${running}r / ${queued}q / ${failed}f)`;
+}
+
 function supervisorDefinition(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("supervisor definition must be an object");
@@ -2537,6 +2659,10 @@ function supervisorDefinition(value) {
   const prompt = String(value.prompt || "").trim();
   const rrule = String(value.rrule || "").trim();
   const status = String(value.status || "").trim().toUpperCase();
+  const targetThreadId =
+    value.targetThreadId === undefined || value.targetThreadId === null
+      ? null
+      : String(value.targetThreadId).trim();
   if (!automationId || automationId.length > 200 || /[\r\n]/.test(automationId)) {
     throw new Error("supervisor automationId must be a single-line string");
   }
@@ -2557,9 +2683,18 @@ function supervisorDefinition(value) {
   if (!new Set(["ACTIVE", "PAUSED"]).has(status)) {
     throw new Error("supervisor status must be ACTIVE or PAUSED");
   }
+  if (
+    targetThreadId !== null &&
+    (!targetThreadId ||
+      targetThreadId.length > 200 ||
+      /[\r\n]/.test(targetThreadId))
+  ) {
+    throw new Error("supervisor targetThreadId must be a single-line string");
+  }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     automationId,
+    targetThreadId,
     name,
     prompt,
     rrule,
@@ -2575,6 +2710,7 @@ function supervisorDefinition(value) {
 export function getSupervisorStatus(repoRoot) {
   const file = supervisorConfigPath(repoRoot);
   const tasks = listTaskStatuses(repoRoot);
+  const counts = supervisorTaskCounts(tasks);
   const desiredStatus = tasks.length > 0 ? "ACTIVE" : "PAUSED";
   let automation = null;
   let readError = null;
@@ -2592,22 +2728,29 @@ export function getSupervisorStatus(repoRoot) {
     desiredStatus,
     actionRequired: !automation
       ? "configure"
-      : automation.status === desiredStatus
-        ? null
-        : desiredStatus === "ACTIVE"
-          ? "resume"
-          : "pause",
+      : !automation.targetThreadId
+        ? "rebind"
+        : automation.status === desiredStatus
+          ? null
+          : desiredStatus === "ACTIVE"
+            ? "resume"
+            : "pause",
     activeTasks: {
       total: tasks.length,
-      counts: supervisorTaskCounts(tasks),
+      counts,
     },
+    threadTitle: formatSupervisorThreadTitle(counts),
     readError,
   };
 }
 
 export function bindSupervisor(repoRoot, value) {
   const file = supervisorConfigPath(repoRoot);
-  atomicWriteJson(file, supervisorDefinition(value));
+  const definition = supervisorDefinition(value);
+  if (!definition.targetThreadId) {
+    throw new Error("supervisor targetThreadId is required");
+  }
+  atomicWriteJson(file, definition);
   return getSupervisorStatus(repoRoot);
 }
 
@@ -2865,6 +3008,24 @@ export async function finalizeTaskGit(repoRoot, taskPath, usagePath = null) {
       );
     }
     const pendingResult = task.metadata.git.pendingResult;
+    if (task.metadata.git.delivery === "merge") {
+      const queued = await queueTaskWorktreeForMerge(plan, task.metadata.git.headCommit);
+      task = readTask(taskPath);
+      task.metadata.git = {
+        ...task.metadata.git,
+        phase: "merge-queued",
+        mergeQueuedAt: new Date().toISOString(),
+        deliveryResult: queued,
+      };
+      task.metadata.outcome = "completed";
+      writeTask(task);
+      return {
+        result: pendingResult,
+        delivery: queued,
+        deliveryAttemptId,
+        mergeQueued: true,
+      };
+    }
     const delivery = await deliverTaskWorktree(plan, {
       headCommit: task.metadata.git.headCommit,
       noChanges: task.metadata.git.noChanges === true,
@@ -2927,6 +3088,208 @@ export async function finalizeTaskGit(repoRoot, taskPath, usagePath = null) {
   }
 }
 
+export async function processTaskMergeQueue(repoRoot, taskPath, usagePath = null) {
+  const startedAt = Date.now();
+  let deliveryAttemptId = null;
+  try {
+    let task = readTask(taskPath);
+    if (task.metadata.git?.phase !== "merge-queued") {
+      throw new Error(`Task is not queued for merge: ${task.id}`);
+    }
+    deliveryAttemptId = beginTaskDelivery(taskPath);
+    task = readTask(taskPath);
+    const plan = worktreePlan(repoRoot, task);
+    const result = await mergeQueuedTaskWorktree(
+      plan,
+      task.metadata.git.headCommit,
+    );
+    if (result.status === "conflict") {
+      task = readTask(taskPath);
+      task.metadata.git = {
+        ...task.metadata.git,
+        phase: "merge-conflict",
+        mergeConflict: {
+          ...result,
+          detectedAt: new Date().toISOString(),
+        },
+      };
+      if (task.metadata.codexThread?.id) {
+        task.metadata.codexThread = {
+          ...task.metadata.codexThread,
+          state:
+            task.metadata.codexThread.state === "archived"
+              ? "unarchive-pending"
+              : task.metadata.codexThread.state,
+        };
+      }
+      writeTask(task);
+      return { status: "conflict", taskId: task.id, conflict: result };
+    }
+
+    const completedAt = Date.now();
+    task = readTask(taskPath);
+    task.metadata.attemptLedger = appendDeliveryAttempt(
+      storedAttemptLedger(task),
+      {
+        status: "completed",
+        attemptId: deliveryAttemptId,
+        timing: deliveryTiming(startedAt, completedAt),
+        usagePath,
+      },
+    );
+    const { deliveryAttemptId: _completedAttempt, ...completedGit } =
+      task.metadata.git;
+    task.metadata.git = {
+      ...completedGit,
+      phase: "delivered",
+      headCommit: result.headCommit,
+      deliveryResult: result,
+    };
+    delete task.metadata.git.mergeConflict;
+    task.metadata.outcome = "completed";
+    writeTask(task);
+    return {
+      status: "merged",
+      result: task.metadata.git.pendingResult,
+      delivery: result,
+      deliveryAttemptId,
+    };
+  } catch (error) {
+    const completedAt = Date.now();
+    if (existsSync(taskPath)) {
+      const task = readTask(taskPath);
+      const failure = classifyFailure({
+        errorKind: error.kind || "git_delivery",
+        code: error.code,
+        message: error.message,
+      });
+      task.metadata.attemptLedger = appendDeliveryAttempt(
+        storedAttemptLedger(task),
+        {
+          status: failure.status,
+          attemptId: deliveryAttemptId || undefined,
+          errorKind: failure.errorKind,
+          timing: deliveryTiming(startedAt, completedAt),
+          usagePath,
+        },
+      );
+      const { deliveryAttemptId: _failedAttempt, ...failedGit } =
+        task.metadata.git;
+      task.metadata.git = {
+        ...failedGit,
+        phase: "merge-failed",
+        ...(typeof error.details?.headCommit === "string"
+          ? { headCommit: error.details.headCommit }
+          : {}),
+        deliveryError: String(error.message).slice(0, 4000),
+      };
+      task.metadata.error = {
+        at: new Date().toISOString(),
+        kind: failure.errorKind,
+        exit_code: null,
+        message: String(error.message).slice(0, 4000),
+      };
+      task.metadata.outcome = failure.status;
+      writeTask(task);
+      error.taskFailure = failure;
+    }
+    throw error;
+  }
+}
+
+export async function finishTaskMergeConflictRepair(
+  repoRoot,
+  taskPath,
+  claim,
+  result,
+  metrics,
+  usagePath = null,
+) {
+  let task = readTask(taskPath);
+  if (task.metadata.git?.phase !== "merge-conflict") {
+    throw new Error(`Task is not resolving a merge conflict: ${task.id}`);
+  }
+  const plan = worktreePlan(repoRoot, task);
+  if (result.status !== "completed") {
+    await abortQueuedTaskRebase(plan);
+    task = readTask(taskPath);
+    task.metadata.metrics = metrics;
+    task.metadata.attemptLedger = appendClaimedAttempt(
+      task,
+      claim,
+      "failed_permanent",
+      "merge_logical_conflict",
+      metrics,
+      usagePath,
+    );
+    task.metadata.error = {
+      at: new Date().toISOString(),
+      kind: "merge_logical_conflict",
+      exit_code: null,
+      message: String(result.error || result.summary).slice(0, 4000),
+    };
+    task.metadata.git = {
+      ...task.metadata.git,
+      phase: "merge-failed",
+      deliveryError: task.metadata.error.message,
+    };
+    task.metadata.outcome = "failed_permanent";
+    writeTask(task);
+    return { status: "failed", error: task.metadata.error };
+  }
+
+  const continued = await continueQueuedTaskRebase(plan);
+  if (continued.status === "conflict") {
+    return finishTaskMergeConflictRepair(
+      repoRoot,
+      taskPath,
+      claim,
+      {
+        status: "failed",
+        summary: "Conflict repair left unresolved rebase conflicts",
+        error: "Conflict repair left unresolved rebase conflicts",
+        validation: result.validation || [],
+      },
+      metrics,
+      usagePath,
+    );
+  }
+  task = readTask(taskPath);
+  task.metadata.metrics = metrics;
+  task.metadata.attemptLedger = appendClaimedAttempt(
+    task,
+    claim,
+    "completed",
+    null,
+    metrics,
+    usagePath,
+  );
+  task.metadata.error = null;
+  task.metadata.outcome = "completed";
+  delete task.metadata.nextAttemptTrigger;
+  task.metadata.git = {
+    ...task.metadata.git,
+    phase: "merge-queued",
+    headCommit: continued.headCommit,
+    mergeQueuedAt: new Date().toISOString(),
+  };
+  delete task.metadata.git.mergeConflict;
+  const previous = task.metadata.git.pendingResult || {
+    status: "completed",
+    summary: result.summary,
+    validation: [],
+  };
+  task.metadata.git.pendingResult = {
+    ...previous,
+    validation: [
+      ...(previous.validation || []),
+      ...(result.validation || []).map((item) => `merge repair: ${item}`),
+    ],
+  };
+  writeTask(task);
+  return { status: "requeued", headCommit: continued.headCommit };
+}
+
 export function retryTask(
   repoRoot,
   id,
@@ -2941,7 +3304,21 @@ export function retryTask(
   if (existsSync(`${taskPath}.lock`)) throw new Error(`Task is running: ${id}`);
   const task = readTask(taskPath);
   task.metadata.error = null;
-  if (!TASK_GIT_FINALIZER_PHASES.has(task.metadata.git?.phase)) {
+  const wasMergeFailed = task.metadata.git?.phase === "merge-failed";
+  const modelRetry =
+    !wasMergeFailed && !TASK_GIT_FINALIZER_PHASES.has(task.metadata.git?.phase);
+  if (wasMergeFailed) {
+    task.metadata.git = {
+      ...task.metadata.git,
+      phase: "merge-queued",
+      mergeQueuedAt: new Date().toISOString(),
+    };
+  }
+  if (modelRetry) {
+    const config = loadConfig(repoRoot);
+    const current =
+      task.metadata.execution || resolveTaskExecution(config, {});
+    task.metadata.execution = escalatedExecution(config, current);
     task.metadata.nextAttemptTrigger = trigger;
   }
   writeTask(task);
@@ -2966,7 +3343,8 @@ export function listPendingThreadArchives(repoRoot) {
     .map((name) => path.join(historyDir, name))
     .filter((file) => {
       try {
-        return readJson(file).codexThread?.state === "archive-pending";
+        const thread = readJson(file).codexThread;
+        return Boolean(thread?.id) && thread.state !== "archived";
       } catch {
         return false;
       }
@@ -3058,6 +3436,11 @@ export async function startInteractiveTask(repoRoot, id) {
   if (status.status === "blocked") {
     throw new Error(
       `Task is blocked by: ${status.existingBlockers.join(", ")}`,
+    );
+  }
+  if (status.git?.phase?.startsWith("merge-")) {
+    throw new Error(
+      `Task merge lifecycle is owned by the merge queue: ${id}`,
     );
   }
 
@@ -3158,9 +3541,12 @@ export async function finishInteractiveTask(
   }
   if (
     !Array.isArray(validation) ||
-    validation.some((item) => typeof item !== "string")
+    validation.some((item) => typeof item !== "string" || !item.trim()) ||
+    (status === "completed" && validation.length === 0)
   ) {
-    throw new Error("validation must be an array of strings");
+    throw new Error(
+      "validation must contain at least one concrete result for completed tasks",
+    );
   }
   const task = readTask(taskPath);
   const deliveryOnly = TASK_GIT_FINALIZER_PHASES.has(task.metadata.git?.phase);
@@ -3181,6 +3567,12 @@ export async function finishInteractiveTask(
     trigger: currentClaim.trigger,
     retryOf: currentClaim.retryOf,
   };
+  if (
+    task.metadata.codexThread?.id &&
+    task.metadata.codexThread.state !== "archived"
+  ) {
+    updateTaskCodexThread(taskPath, { state: "archive-pending" });
+  }
   try {
     if (status === "completed") {
       if (!deliveryOnly) {
@@ -3209,12 +3601,14 @@ export async function finishInteractiveTask(
         );
         throw finalizeError;
       }
-      completeTask(
-        repoRoot,
-        taskPath,
-        finalized.result,
-        metrics,
-      );
+      if (!finalized.mergeQueued) {
+        completeTask(
+          repoRoot,
+          taskPath,
+          finalized.result,
+          metrics,
+        );
+      }
     } else {
       const failureMessage =
         typeof error === "string" && error.trim() ? error : summary;

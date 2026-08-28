@@ -2,6 +2,36 @@
 
 ## Unreleased - 2026-08-12
 
+- Replaced dashboard worker-capacity counters with the same task lifecycle
+  counters as the supervisor title, including interactive claims in `running`.
+- Removed unsupported conditional keywords from the Codex worker output schema
+  while retaining mandatory completed-task validation in the daemon runtime.
+- Made the daemon keep the supervisor thread title synchronized as
+  `-> ToDo (Nr / Mq / Sf)` through app-server `thread/name/set`, without model
+  turns or worker-quota usage, with duplicate suppression and non-fatal retry.
+- Made `$todo:route` always decompose broad requests and lists into an atomic
+  dependency DAG, batching only same-file changes in one logical scope.
+- Selected the lowest adequate model tier per atomic task while keeping tests,
+  focused verification, and same-attempt self-review mandatory; model retries
+  now advance one configured tier.
+- Replaced inline `merge` delivery with keep-style branch preservation plus a
+  singleton local merge queue that rebases onto the latest target and
+  fast-forwards without merge commits or stale-base cherry-picks.
+- Made same-batch `merge` siblings wait for earlier same-target task IDs before
+  queue delivery, so a faster later task cannot invert the intended Git order.
+- Returned textual rebase conflicts to the task's original persistent Codex
+  thread through an out-of-quota escalated repair worker, requeued successful
+  repairs, and retained logical conflicts as recoverable task errors.
+- Added the same paused-rebase conflict-repair flow to the legacy `exec`
+  backend instead of failing with `merge_thread_unavailable`.
+- Kept OS-assigned dashboard ports stable per host-confirmed Codex thread,
+  replacing an occupied reservation and reopening the fresh URL on start.
+- Persisted the supervisor's host-confirmed target thread and made every pause
+  or resume pass it explicitly, preventing task-creation chats from taking over.
+- Archived retained background worker threads after interactive recovery and
+  reconciled legacy closed receipts left in `active` instead of only pending.
+- Treated an already-missing archived rollout as an idempotent archive success,
+  preventing closed receipts from retrying and logging forever.
 - Made `$todo:start` open the current runner-provided dashboard URL in a new
   in-app Browser tab, with runner, Browser, and supervisor outcomes separated.
 - Made every `$todo:start` invocation replace the repository heartbeat with one

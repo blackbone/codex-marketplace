@@ -60,8 +60,11 @@ for later.
   acceptance criterion; the brief narrows repeated investigation, not scope.
 - Fix all affected callers through the shared owner. When no shared owner exists,
   make only the caller changes actually required by the traced flow.
-- Keep model profile selection unchanged. Simpler scope reduces uncertainty; it
-  does not justify automatically choosing a lower-quality model.
+- Use the task's selected model profile for the current attempt. Atomic scope is
+  a reason to choose the lowest configured tier that can confidently implement,
+  test or otherwise verify, and self-review the result. Every model retry moves
+  to the next configured tier when one exists; never trade away required
+  verification to make a lower tier fit.
 - Leave one smallest runnable check for non-trivial new logic: a branch, loop,
   parser, money or security path needs the minimum check that would fail if it
   broke. Do not add a framework, fixtures, or broad per-function suites unless

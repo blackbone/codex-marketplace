@@ -713,6 +713,216 @@ async function deliverMerge(plan, headCommit) {
   }
 }
 
+async function ensureQueuedWorktreeUnlocked(plan, expectedHead) {
+  const existingHead = await assertOwnedWorktree(plan);
+  if (existingHead) {
+    const dirty = await committableStatus(plan.worktreePath);
+    if (existingHead !== expectedHead || dirty) {
+      throw lifecycleError(
+        "merge_queue_worktree_changed",
+        `Queued task worktree does not match ${expectedHead}: ${plan.worktreePath}`,
+        null,
+        { existingHead, expectedHead, dirty },
+      );
+    }
+    return existingHead;
+  }
+  const branchHead = await refHead(plan.repoRoot, plan.branch);
+  if (branchHead !== expectedHead) {
+    throw lifecycleError(
+      "merge_queue_branch_changed",
+      `Queued task branch moved from ${expectedHead} to ${branchHead || "missing"}`,
+      null,
+      { branchHead, expectedHead },
+    );
+  }
+  mkdirSync(path.dirname(plan.worktreePath), { recursive: true });
+  await git(plan.repoRoot, [
+    "worktree",
+    "add",
+    plan.worktreePath,
+    plan.branch,
+  ]);
+  return output(plan.worktreePath, ["rev-parse", "HEAD"]);
+}
+
+async function mergeConflictDetails(plan, targetHead, rebaseResult) {
+  const files = (await git(
+    plan.worktreePath,
+    ["diff", "--name-only", "--diff-filter=U"],
+    { allowFailure: true },
+  )).stdout
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return {
+    status: "conflict",
+    branch: plan.branch,
+    targetBranch: plan.targetBranch,
+    targetCommit: targetHead,
+    worktreePath: plan.worktreePath,
+    files,
+    stdout: rebaseResult.stdout.trim().slice(0, 8000),
+    stderr: rebaseResult.stderr.trim().slice(0, 8000),
+  };
+}
+
+export function queueTaskWorktreeForMerge(plan, headCommit) {
+  return withGitLock(plan.repoRoot, async () => {
+    await assertDeliveryState(plan, headCommit);
+    const cleanupWarnings = await cleanupUnlocked(plan, {
+      deleteBranch: false,
+      discardIgnored: true,
+    });
+    if (cleanupWarnings.length > 0) {
+      throw lifecycleError(
+        "merge_queue_cleanup_failed",
+        cleanupWarnings.join("; "),
+        null,
+        { cleanupWarnings },
+      );
+    }
+    return {
+      delivery: "merge",
+      branch: plan.branch,
+      headCommit,
+      queued: true,
+      cleanupWarnings,
+    };
+  });
+}
+
+export function mergeQueuedTaskWorktree(plan, expectedHead) {
+  return withGitLock(plan.repoRoot, async () => {
+    const targetHead = await assertPlanRefs(plan);
+    await ensureQueuedWorktreeUnlocked(plan, expectedHead);
+    const operations = await activeGitOperations(plan.worktreePath);
+    if (operations.length > 0) {
+      throw lifecycleError(
+        "merge_queue_operation_in_progress",
+        `Queued task already has a Git operation in progress: ${operations.join(", ")}`,
+        null,
+        { operations, worktreePath: plan.worktreePath },
+      );
+    }
+    const rebased = await git(
+      plan.worktreePath,
+      ["rebase", `refs/heads/${plan.targetBranch}`],
+      { allowFailure: true },
+    );
+    if (!rebased.ok) {
+      const operationsAfter = await activeGitOperations(plan.worktreePath);
+      if (operationsAfter.some((item) => item.startsWith("rebase-"))) {
+        return mergeConflictDetails(plan, targetHead, rebased);
+      }
+      throw lifecycleError(
+        "merge_queue_rebase_failed",
+        `Could not rebase ${plan.branch} onto ${plan.targetBranch}: ${rebased.stderr.trim() || rebased.stdout.trim()}`,
+        null,
+        { stdout: rebased.stdout, stderr: rebased.stderr },
+      );
+    }
+
+    const headCommit = await output(plan.worktreePath, ["rev-parse", "HEAD"]);
+    const target = await targetCheckout(plan);
+    try {
+      const dirty = await status(target.path);
+      if (dirty) {
+        throw lifecycleError(
+          "dirty_target",
+          `Target checkout is dirty: ${target.path}`,
+          null,
+          { dirty, headCommit },
+        );
+      }
+      const fastForwarded = await git(
+        target.path,
+        ["merge", "--ff-only", headCommit],
+        { allowFailure: true },
+      );
+      if (!fastForwarded.ok) {
+        throw lifecycleError(
+          "merge_queue_fast_forward_failed",
+          `Could not fast-forward ${plan.targetBranch} to rebased ${plan.branch}: ${fastForwarded.stderr.trim() || fastForwarded.stdout.trim()}`,
+          null,
+          {
+            stdout: fastForwarded.stdout,
+            stderr: fastForwarded.stderr,
+            headCommit,
+          },
+        );
+      }
+    } finally {
+      if (target.temporary && existsSync(target.path)) {
+        const dirty = await cleanupStatus(target.path).catch(() => "unknown");
+        if (!dirty) {
+          await git(plan.repoRoot, ["worktree", "remove", target.path], {
+            allowFailure: true,
+          });
+        }
+      }
+    }
+    const cleanupWarnings = await cleanupUnlocked(plan, {
+      deleteBranch: true,
+      forceDeleteBranch: false,
+      discardIgnored: true,
+    });
+    return {
+      status: "merged",
+      delivery: "merge",
+      strategy: "rebase-fast-forward",
+      branch: plan.branch,
+      previousHead: expectedHead,
+      headCommit,
+      targetCommit: headCommit,
+      cleanupWarnings,
+    };
+  });
+}
+
+export function continueQueuedTaskRebase(plan) {
+  return withGitLock(plan.repoRoot, async () => {
+    const operations = await activeGitOperations(plan.worktreePath);
+    if (!operations.some((item) => item.startsWith("rebase-"))) {
+      throw lifecycleError(
+        "merge_queue_rebase_missing",
+        `No queued rebase is active in ${plan.worktreePath}`,
+      );
+    }
+    await git(plan.worktreePath, ["add", "-A", "--"]);
+    const continued = await git(
+      plan.worktreePath,
+      ["-c", "core.editor=true", "rebase", "--continue"],
+      { allowFailure: true },
+    );
+    if (!continued.ok) {
+      const targetHead = await refHead(
+        plan.repoRoot,
+        `refs/heads/${plan.targetBranch}`,
+      );
+      return mergeConflictDetails(plan, targetHead, continued);
+    }
+    return {
+      status: "resolved",
+      headCommit: await output(plan.worktreePath, ["rev-parse", "HEAD"]),
+      worktreePath: plan.worktreePath,
+    };
+  });
+}
+
+export function abortQueuedTaskRebase(plan) {
+  return withGitLock(plan.repoRoot, async () => {
+    const operations = await activeGitOperations(plan.worktreePath);
+    if (operations.some((item) => item.startsWith("rebase-"))) {
+      await git(plan.worktreePath, ["rebase", "--abort"]);
+    }
+    return {
+      headCommit: await output(plan.worktreePath, ["rev-parse", "HEAD"]),
+      worktreePath: plan.worktreePath,
+    };
+  });
+}
+
 async function deliverPullRequest(
   plan,
   { title, body = "", remote = "origin" },
@@ -961,6 +1171,14 @@ export function deliverTaskWorktree(
   },
 ) {
   return withGitLock(plan.repoRoot, async () => {
+    if (plan.delivery === "merge") {
+      throw lifecycleError(
+        "merge_queue_required",
+        `Merge delivery must be processed through the merge queue for ${plan.branch}`,
+        null,
+        { branch: plan.branch, targetBranch: plan.targetBranch },
+      );
+    }
     if (
       noChanges === true &&
       (typeof baseCommit !== "string" || baseCommit !== headCommit)
@@ -989,32 +1207,6 @@ export function deliverTaskWorktree(
           cleanupWarnings: [],
         };
       }
-      if (plan.delivery === "merge") {
-        const targetRef = `refs/heads/${plan.targetBranch}`;
-        const fastForwarded = await containsCommit(
-          plan.repoRoot,
-          targetRef,
-          headCommit,
-        );
-        const cherryPicked =
-          !fastForwarded &&
-          (await containsEquivalentPatch(
-            plan.repoRoot,
-            targetRef,
-            headCommit,
-          ));
-        if (fastForwarded || cherryPicked) {
-          return {
-            delivery: plan.delivery,
-            branch: plan.branch,
-            headCommit,
-            alreadyDelivered: true,
-            strategy: fastForwarded ? "fast-forward" : "cherry-pick",
-            targetCommit: await refHead(plan.repoRoot, targetRef),
-            cleanupWarnings: [],
-          };
-        }
-      }
       throw lifecycleError(
         "missing_branch",
         `Task branch is missing: ${plan.branch}`,
@@ -1029,9 +1221,7 @@ export function deliverTaskWorktree(
     if (provenNoChanges || headCommit === targetHead) {
       result = { alreadyDelivered: true, noChanges: true };
     }
-    if (plan.delivery === "merge" && result.noChanges !== true) {
-      result = await deliverMerge(plan, headCommit);
-    } else if (plan.delivery === "pr") {
+    if (plan.delivery === "pr") {
       if (result.noChanges === true) {
         result = { alreadyDelivered: true, noChanges: true, url: null };
       } else {
@@ -1040,12 +1230,9 @@ export function deliverTaskWorktree(
     }
 
     const cleanupWarnings = await cleanupUnlocked(plan, {
-      deleteBranch:
-        plan.delivery === "merge" ||
-        result.noChanges === true,
-      forceDeleteBranch:
-        plan.delivery === "merge" && result.strategy === "cherry-pick",
-      discardIgnored: plan.delivery === "merge",
+      deleteBranch: result.noChanges === true,
+      forceDeleteBranch: false,
+      discardIgnored: false,
     });
     return {
       delivery: plan.delivery,
@@ -1173,11 +1360,16 @@ export async function runSelfCheck() {
     const ignoredMergeCommitted = await commitTaskWorktree(ignoredMergePlan, {
       expectedHead: ignoredMergePrepared.head,
     });
-    const ignoredMergeDelivered = await deliverTaskWorktree(
+    const ignoredMergeQueued = await queueTaskWorktreeForMerge(
       ignoredMergePlan,
-      ignoredMergeCommitted,
+      ignoredMergeCommitted.headCommit,
     );
-    assert.equal(ignoredMergeDelivered.strategy, "fast-forward");
+    assert.equal(ignoredMergeQueued.queued, true);
+    const ignoredMergeDelivered = await mergeQueuedTaskWorktree(
+      ignoredMergePlan,
+      ignoredMergeCommitted.headCommit,
+    );
+    assert.equal(ignoredMergeDelivered.strategy, "rebase-fast-forward");
     assert.deepEqual(ignoredMergeDelivered.cleanupWarnings, []);
     assert.equal(existsSync(ignoredMergePlan.worktreePath), false);
     assert.equal(await refHead(repoRoot, ignoredMergePlan.branch), null);
@@ -1240,7 +1432,7 @@ export async function runSelfCheck() {
       taskId: "007-operation",
       title: "Operation guard",
       targetBranch: "main",
-      delivery: "merge",
+      delivery: "keep",
     });
     const operationPrepared = await prepareTaskWorktree(operationPlan);
     writeFileSync(
@@ -1250,118 +1442,121 @@ export async function runSelfCheck() {
     const operationCommitted = await commitTaskWorktree(operationPlan, {
       expectedHead: operationPrepared.head,
     });
-    for (const operation of ["MERGE_HEAD", "CHERRY_PICK_HEAD"]) {
-      const operationPath = await gitStatePath(repoRoot, operation);
-      writeFileSync(operationPath, `${operationCommitted.headCommit}\n`, "utf8");
-      await assert.rejects(
-        deliverTaskWorktree(operationPlan, operationCommitted),
-        (error) => error.kind === "git_operation_in_progress",
-      );
-      assert.equal(existsSync(operationPath), true);
-      unlinkSync(operationPath);
-    }
-    const fastForwarded = await deliverTaskWorktree(
+    const kept = await deliverTaskWorktree(
       operationPlan,
       operationCommitted,
     );
-    assert.equal(fastForwarded.strategy, "fast-forward");
-    assert.equal(await refHead(repoRoot, "main"), operationCommitted.headCommit);
-    assert.equal(
-      (await output(repoRoot, ["rev-list", "--parents", "-n", "1", "main"]))
-        .split(/\s+/).length,
-      2,
-    );
+    assert.equal(kept.delivery, "keep");
+    assert.equal(await refHead(repoRoot, "main"), operationPrepared.head);
+    assert.equal(await refHead(repoRoot, operationPlan.branch), operationCommitted.headCommit);
 
-    const cherryPlan = taskWorktreePlan({
+    const mergeDirectPlan = taskWorktreePlan({
       repoRoot,
-      taskId: "008-cherry-pick",
-      title: "Linear cherry-pick",
+      taskId: "008-merge-direct",
+      title: "Queue-only merge delivery",
       targetBranch: "main",
       delivery: "merge",
     });
-    const cherryPrepared = await prepareTaskWorktree(cherryPlan);
-    writeFileSync(path.join(cherryPlan.worktreePath, "cherry.txt"), "task\n");
-    const cherryCommitted = await commitTaskWorktree(cherryPlan, {
-      expectedHead: cherryPrepared.head,
-    });
-    writeFileSync(path.join(repoRoot, "main-advance.txt"), "main\n");
-    await git(repoRoot, ["add", "main-advance.txt"]);
-    await git(repoRoot, ["commit", "--quiet", "-m", "advance main"]);
-    const cherryDelivered = await deliverTaskWorktree(
-      cherryPlan,
-      cherryCommitted,
-    );
-    assert.equal(cherryDelivered.strategy, "cherry-pick");
-    assert.notEqual(cherryDelivered.targetCommit, cherryCommitted.headCommit);
-    assert.equal(
-      await containsEquivalentPatch(
-        repoRoot,
-        "refs/heads/main",
-        cherryCommitted.headCommit,
-      ),
-      true,
-    );
-    assert.equal(
-      (await output(repoRoot, ["rev-list", "--parents", "-n", "1", "main"]))
-        .split(/\s+/).length,
-      2,
-    );
-    assert.equal(await refHead(repoRoot, cherryPlan.branch), null);
-    const replayedCherry = await deliverTaskWorktree(
-      cherryPlan,
-      cherryCommitted,
-    );
-    assert.equal(replayedCherry.alreadyDelivered, true);
-    assert.equal(replayedCherry.strategy, "cherry-pick");
-
-    writeFileSync(path.join(repoRoot, "conflict.txt"), "base\n", "utf8");
-    await git(repoRoot, ["add", "conflict.txt"]);
-    await git(repoRoot, ["commit", "--quiet", "-m", "conflict base"]);
-    const conflictPlan = taskWorktreePlan({
-      repoRoot,
-      taskId: "009-conflict",
-      title: "Cherry-pick conflict",
-      targetBranch: "main",
-      delivery: "merge",
-    });
-    const conflictPrepared = await prepareTaskWorktree(conflictPlan);
+    const mergeDirectPrepared = await prepareTaskWorktree(mergeDirectPlan);
     writeFileSync(
-      path.join(conflictPlan.worktreePath, "conflict.txt"),
+      path.join(mergeDirectPlan.worktreePath, "conflict.txt"),
       "task\n",
       "utf8",
     );
-    const conflictCommitted = await commitTaskWorktree(conflictPlan, {
-      expectedHead: conflictPrepared.head,
+    const mergeDirectCommitted = await commitTaskWorktree(mergeDirectPlan, {
+      expectedHead: mergeDirectPrepared.head,
     });
-    writeFileSync(path.join(repoRoot, "conflict.txt"), "main\n", "utf8");
-    await git(repoRoot, ["add", "conflict.txt"]);
-    await git(repoRoot, ["commit", "--quiet", "-m", "conflict main"]);
-    const conflictTargetHead = await refHead(repoRoot, "main");
     await assert.rejects(
-      deliverTaskWorktree(conflictPlan, conflictCommitted),
-      (error) => error.kind === "cherry_pick_failed",
+      deliverTaskWorktree(mergeDirectPlan, mergeDirectCommitted),
+      (error) => error.kind === "merge_queue_required",
     );
+
+    const queuePlan = taskWorktreePlan({
+      repoRoot,
+      taskId: "011-merge-queue",
+      title: "Merge queue rebase",
+      targetBranch: "main",
+      delivery: "merge",
+    });
+    const queuePrepared = await prepareTaskWorktree(queuePlan);
+    writeFileSync(path.join(queuePlan.worktreePath, "queued.txt"), "task\n");
+    const queueCommitted = await commitTaskWorktree(queuePlan, {
+      expectedHead: queuePrepared.head,
+    });
+    const queued = await queueTaskWorktreeForMerge(
+      queuePlan,
+      queueCommitted.headCommit,
+    );
+    assert.equal(queued.queued, true);
+    assert.equal(existsSync(queuePlan.worktreePath), false);
+    assert.equal(await refHead(repoRoot, queuePlan.branch), queueCommitted.headCommit);
+    writeFileSync(path.join(repoRoot, "queue-advance.txt"), "main\n");
+    await git(repoRoot, ["add", "queue-advance.txt"]);
+    await git(repoRoot, ["commit", "--quiet", "-m", "advance before queue"]);
+    const queueTarget = await refHead(repoRoot, "main");
+    const queueMerged = await mergeQueuedTaskWorktree(
+      queuePlan,
+      queueCommitted.headCommit,
+    );
+    assert.equal(queueMerged.status, "merged");
+    assert.equal(queueMerged.strategy, "rebase-fast-forward");
+    assert.notEqual(queueMerged.headCommit, queueCommitted.headCommit);
     assert.equal(
-      existsSync(await gitStatePath(repoRoot, "CHERRY_PICK_HEAD")),
-      false,
+      await containsCommit(repoRoot, queueMerged.headCommit, queueTarget),
+      true,
     );
-    assert.equal(await refHead(repoRoot, "main"), conflictTargetHead);
-    assert.equal(readFileSync(path.join(repoRoot, "conflict.txt"), "utf8"), "main\n");
+    assert.equal(await refHead(repoRoot, queuePlan.branch), null);
+    assert.equal(existsSync(queuePlan.worktreePath), false);
+
+    writeFileSync(path.join(repoRoot, "queue-conflict.txt"), "base\n");
+    await git(repoRoot, ["add", "queue-conflict.txt"]);
+    await git(repoRoot, ["commit", "--quiet", "-m", "queue conflict base"]);
+    const queueConflictPlan = taskWorktreePlan({
+      repoRoot,
+      taskId: "012-merge-queue-conflict",
+      title: "Merge queue conflict",
+      targetBranch: "main",
+      delivery: "merge",
+    });
+    const queueConflictPrepared = await prepareTaskWorktree(queueConflictPlan);
+    writeFileSync(
+      path.join(queueConflictPlan.worktreePath, "queue-conflict.txt"),
+      "task\n",
+    );
+    const queueConflictCommitted = await commitTaskWorktree(queueConflictPlan, {
+      expectedHead: queueConflictPrepared.head,
+    });
+    await queueTaskWorktreeForMerge(
+      queueConflictPlan,
+      queueConflictCommitted.headCommit,
+    );
+    writeFileSync(path.join(repoRoot, "queue-conflict.txt"), "main\n");
+    await git(repoRoot, ["add", "queue-conflict.txt"]);
+    await git(repoRoot, ["commit", "--quiet", "-m", "queue conflict main"]);
+    const queueConflict = await mergeQueuedTaskWorktree(
+      queueConflictPlan,
+      queueConflictCommitted.headCommit,
+    );
+    assert.equal(queueConflict.status, "conflict");
+    assert.deepEqual(queueConflict.files, ["queue-conflict.txt"]);
+    writeFileSync(
+      path.join(queueConflictPlan.worktreePath, "queue-conflict.txt"),
+      "main and task\n",
+    );
+    const resolvedQueueConflict = await continueQueuedTaskRebase(
+      queueConflictPlan,
+    );
+    assert.equal(resolvedQueueConflict.status, "resolved");
+    const queueConflictMerged = await mergeQueuedTaskWorktree(
+      queueConflictPlan,
+      resolvedQueueConflict.headCommit,
+    );
+    assert.equal(queueConflictMerged.status, "merged");
     assert.equal(
-      await refHead(repoRoot, conflictPlan.branch),
-      conflictCommitted.headCommit,
+      readFileSync(path.join(repoRoot, "queue-conflict.txt"), "utf8"),
+      "main and task\n",
     );
-    assert.equal(existsSync(conflictPlan.worktreePath), true);
-    await git(repoRoot, ["revert", "--no-edit", conflictTargetHead]);
-    await git(repoRoot, ["cherry-pick", "-x", conflictCommitted.headCommit]);
-    const recoveredConflict = await deliverTaskWorktree(
-      conflictPlan,
-      conflictCommitted,
-    );
-    assert.equal(recoveredConflict.alreadyDelivered, true);
-    assert.equal(recoveredConflict.strategy, "cherry-pick");
-    assert.equal(await refHead(repoRoot, conflictPlan.branch), null);
-    assert.equal(existsSync(conflictPlan.worktreePath), false);
+    assert.equal(await refHead(repoRoot, queueConflictPlan.branch), null);
 
     const { lockPath, recoveryPath } = gitLockPaths(repoRoot);
     writeFileSync(

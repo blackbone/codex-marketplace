@@ -21,12 +21,14 @@ import {
   daemonStopRequestPath,
   ensureLayout,
   findLegacyRunner,
+  getSupervisorStatus,
   isActivated,
   isCurrentDaemonState,
   listTaskFiles,
   loadConfig,
   processIsAlive,
   readDaemonState,
+  requestDashboardThread,
   todoDir,
 } from "./lib.mjs";
 import {
@@ -454,7 +456,14 @@ function runningDaemonResult(
   };
 }
 
-function waitForDaemonStartup(repoRoot, pid, targetRuntime, startedAt, timeoutMs) {
+function waitForDaemonStartup(
+  repoRoot,
+  pid,
+  targetRuntime,
+  startedAt,
+  timeoutMs,
+  dashboardThreadId = null,
+) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
     const state = readDaemonState(repoRoot);
@@ -470,6 +479,8 @@ function waitForDaemonStartup(repoRoot, pid, targetRuntime, startedAt, timeoutMs
       isCurrentDaemonState(state) &&
       (state.runtime?.fingerprint || state.runtimeFingerprint) ===
         targetRuntime.fingerprint &&
+      (!dashboardThreadId ||
+        state.dashboard?.threadId === dashboardThreadId) &&
       heartbeatAt >= startedAt &&
       configAppliedAt >= startedAt &&
       processIsAlive(pid)
@@ -484,6 +495,36 @@ function waitForDaemonStartup(repoRoot, pid, targetRuntime, startedAt, timeoutMs
     );
   }
   return null;
+}
+
+function waitForDashboardThread(repoRoot, pid, threadId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const state = readDaemonState(repoRoot);
+    if (
+      state?.pid === pid &&
+      state.status === "running" &&
+      state.dashboard?.threadId === threadId &&
+      processIsAlive(pid)
+    ) {
+      return state;
+    }
+    Atomics.wait(
+      startupWait,
+      0,
+      0,
+      Math.min(25, Math.max(1, deadline - Date.now())),
+    );
+  }
+  return null;
+}
+
+function wakeDashboardThreadSync(pid) {
+  try {
+    process.kill(pid, "SIGUSR2");
+  } catch (error) {
+    if (error.code !== "ESRCH" && error.code !== "EINVAL") throw error;
+  }
 }
 
 function discardFailedStartup(repoRoot, pid, spawnedIdentity) {
@@ -514,7 +555,10 @@ function discardFailedStartup(repoRoot, pid, spawnedIdentity) {
   }
 }
 
-export function ensureDaemon(repoRoot, { startupTimeoutMs = 5000 } = {}) {
+export function ensureDaemon(
+  repoRoot,
+  { startupTimeoutMs = 5000, dashboardThreadId = null } = {},
+) {
   if (process.env.TODO_RUNNER_WORKER === "1") {
     return { status: "worker-bypass" };
   }
@@ -523,18 +567,48 @@ export function ensureDaemon(repoRoot, { startupTimeoutMs = 5000 } = {}) {
   }
 
   ensureLayout(repoRoot);
+  const dashboardOwner =
+    dashboardThreadId ||
+    getSupervisorStatus(repoRoot).automation?.targetThreadId ||
+    null;
+  const requestedDashboardThreadId = dashboardOwner
+    ? requestDashboardThread(repoRoot, dashboardOwner)
+    : null;
   const config = loadConfig(repoRoot);
   const targetRuntime = runtimeDescriptor(pluginRoot);
   const addedExcludes = applyGitExcludes(repoRoot, config.gitExclude);
   const running = liveDaemon(repoRoot);
   if (running) {
-    return runningDaemonResult(
+    const result = runningDaemonResult(
       repoRoot,
       running,
       addedExcludes,
       targetRuntime,
       config,
     );
+    if (!requestedDashboardThreadId || result.status !== "running") {
+      return result;
+    }
+    wakeDashboardThreadSync(running.pid);
+    const updated = waitForDashboardThread(
+      repoRoot,
+      running.pid,
+      requestedDashboardThreadId,
+      startupTimeoutMs,
+    );
+    return updated
+      ? runningDaemonResult(
+          repoRoot,
+          updated,
+          addedExcludes,
+          targetRuntime,
+          config,
+        )
+      : {
+          ...result,
+          status: "dashboard-update-pending",
+          reason: `dashboard did not bind for thread ${requestedDashboardThreadId} within ${startupTimeoutMs}ms`,
+        };
   }
   const legacy = findLegacyRunner(repoRoot);
   if (legacy) {
@@ -549,13 +623,36 @@ export function ensureDaemon(repoRoot, { startupTimeoutMs = 5000 } = {}) {
   try {
     const secondCheck = liveDaemon(repoRoot);
     if (secondCheck) {
-      return runningDaemonResult(
+      const result = runningDaemonResult(
         repoRoot,
         secondCheck,
         addedExcludes,
         targetRuntime,
         config,
       );
+      if (!requestedDashboardThreadId || result.status !== "running") {
+        return result;
+      }
+      wakeDashboardThreadSync(secondCheck.pid);
+      const updated = waitForDashboardThread(
+        repoRoot,
+        secondCheck.pid,
+        requestedDashboardThreadId,
+        startupTimeoutMs,
+      );
+      return updated
+        ? runningDaemonResult(
+            repoRoot,
+            updated,
+            addedExcludes,
+            targetRuntime,
+            config,
+          )
+        : {
+            ...result,
+            status: "dashboard-update-pending",
+            reason: `dashboard did not bind for thread ${requestedDashboardThreadId} within ${startupTimeoutMs}ms`,
+          };
     }
 
     if (!targetRuntime.available || config.readError) {
@@ -597,6 +694,7 @@ export function ensureDaemon(repoRoot, { startupTimeoutMs = 5000 } = {}) {
       targetRuntime,
       startedAt,
       startupTimeoutMs,
+      requestedDashboardThreadId,
     );
     if (ready) {
       return runningDaemonResult(

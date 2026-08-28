@@ -1,15 +1,15 @@
 {
   "name": "todo",
-  "version": "0.1.0+codex.20260817115735",
-  "description": "Durable repository task routing with persistent per-task Codex threads, isolated Git delivery, and telemetry.",
+  "version": "0.1.0+codex.20260828131047",
+  "description": "Atomic repository task routing with tiered retries, persistent threads, a local rebase merge queue, and telemetry.",
   "author": {
     "name": "blackbone"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "ToDo",
-    "shortDescription": "Persistent-thread durable task execution",
-    "longDescription": "Routes repository mutations through durable local tasks, runs one Codex app-server per repository with a persistent thread per task, opens the current local dashboard in the in-app Browser on start, archives each thread between worker attempts and restores it for retries or reopen, validates connectors and Git state before atomic publication, executes in runner-owned worktrees, and records attempt telemetry.",
+    "shortDescription": "Atomic tasks with a persistent merge queue",
+    "longDescription": "Decomposes repository mutations into an atomic task DAG, selects the lowest adequate model tier and escalates retries, executes in runner-owned worktrees with persistent per-task Codex threads, and sends merge delivery through a singleton local rebase queue that returns conflicts to the original thread before fast-forwarding the target. Connector and Git preflight, owner-thread dashboard lifecycle, and attempt telemetry remain durable and repository-local.",
     "developerName": "blackbone",
     "category": "Productivity",
     "capabilities": [

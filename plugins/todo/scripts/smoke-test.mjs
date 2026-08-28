@@ -12,6 +12,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import {
   addTaskArtifacts,
@@ -23,6 +24,7 @@ import {
   clearSupervisor,
   createTask,
   finishInteractiveTask,
+  formatSupervisorThreadTitle,
   getTaskDetails,
   getTaskStatus,
   getSupervisorStatus,
@@ -34,10 +36,12 @@ import {
   readDaemonState,
   releaseClaim,
   startInteractiveTask,
+  taskStatusSummary,
   taskArtifactDir,
   taskArtifactManifestPath,
   taskBatchLockPath,
   updateTask,
+  updateTaskCodexThread,
   writeHistory,
 } from "./lib.mjs";
 import { ensureDaemon } from "./ensure-daemon.mjs";
@@ -80,6 +84,26 @@ function assertStrictObjectSchemas(schema, location = "$") {
       );
     } else if (value && typeof value === "object") {
       assertStrictObjectSchemas(value, `${location}.${key}`);
+    }
+  }
+}
+
+function assertSupportedOutputSchema(schema, location = "$") {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return;
+  const unsupported = ["allOf", "if", "then", "else"];
+  for (const keyword of unsupported) {
+    assert(
+      !Object.hasOwn(schema, keyword),
+      `${location} uses unsupported output-schema keyword: ${keyword}`,
+    );
+  }
+  for (const [key, value] of Object.entries(schema)) {
+    if (Array.isArray(value)) {
+      value.forEach((item, index) =>
+        assertSupportedOutputSchema(item, `${location}.${key}[${index}]`),
+      );
+    } else if (value && typeof value === "object") {
+      assertSupportedOutputSchema(value, `${location}.${key}`);
     }
   }
 }
@@ -265,10 +289,17 @@ async function callMcp() {
   const createTool = toolsResponse.result.tools.find(
     (tool) => tool.name === "task_create",
   );
+  const runnerStartTool = toolsResponse.result.tools.find(
+    (tool) => tool.name === "runner_start",
+  );
   assert(
     createTool?.inputSchema?.properties?.runMode &&
       createTool.inputSchema.properties.allowWorkerTaskCreation,
     "MCP did not expose execution and worker delegation fields",
+  );
+  assert(
+    runnerStartTool?.inputSchema?.properties?.dashboardThreadId,
+    "MCP runner_start did not expose sticky dashboard thread ownership",
   );
   assert(
     statusResponse?.result?.structuredContent?.runner?.activated === true,
@@ -277,14 +308,18 @@ async function callMcp() {
   assert(
     statusResponse.result.structuredContent.runner.dashboardUrl?.startsWith(
       "http://127.0.0.1:",
-    ),
-    "MCP todo_status did not expose the dashboard URL",
+    ) &&
+      statusResponse.result.structuredContent.runner.dashboardThreadId ===
+        "00000000-0000-7000-8000-000000000001",
+    "MCP todo_status did not expose the dashboard URL and owner thread",
   );
   assert(
     statusResponse.result.structuredContent.runner.configReloadIntervalMs ===
         250 &&
       typeof statusResponse.result.structuredContent.runner.configReload
-        ?.appliedAt === "string",
+        ?.appliedAt === "string" &&
+      typeof statusResponse.result.structuredContent.runner
+        .supervisorThreadTitle?.status === "string",
     "MCP todo_status did not expose applied config reload state",
   );
   assert(
@@ -401,6 +436,7 @@ try {
     readFileSync(path.join(scriptDir, "result.schema.json"), "utf8"),
   );
   assertStrictObjectSchemas(outputSchema);
+  assertSupportedOutputSchema(outputSchema);
   const expectedResultFields = [
     "error",
     "interactiveReason",
@@ -488,24 +524,79 @@ try {
   );
   const unconfiguredSupervisor = getSupervisorStatus(repoRoot);
   assert(
+    formatSupervisorThreadTitle({
+      running: 2,
+      queued: 1,
+      blocked: 1,
+      staging: 1,
+      "merge-queued": 1,
+      "merge-conflict": 1,
+      failed: 3,
+    }) === "-> ToDo (2r / 5q / 3f)",
+    "supervisor thread title did not group task lifecycle states",
+  );
+  assert(
+    JSON.stringify(
+      taskStatusSummary([
+        { status: "running" },
+        { status: "running" },
+        { status: "queued" },
+        { status: "blocked" },
+        { status: "staging" },
+        { status: "merge-queued" },
+        { status: "merge-conflict" },
+        { status: "failed" },
+        { status: "failed" },
+        { status: "failed" },
+        { status: "completed" },
+      ]),
+    ) === JSON.stringify({ running: 2, queued: 5, failed: 3 }),
+    "task status summary did not match the supervisor counter contract",
+  );
+  assert(
     unconfiguredSupervisor.configured === false &&
       unconfiguredSupervisor.desiredStatus === "PAUSED" &&
       unconfiguredSupervisor.actionRequired === "configure" &&
-      unconfiguredSupervisor.activeTasks.total === 0,
+      unconfiguredSupervisor.activeTasks.total === 0 &&
+      unconfiguredSupervisor.threadTitle === "-> ToDo (0r / 0q / 0f)",
     "empty repository did not request a paused supervisor binding",
   );
   const supervisorDefinition = {
     automationId: "todo-smoke-supervisor",
+    targetThreadId: "00000000-0000-7000-8000-000000000001",
     name: "Keep smoke ToDo running",
     prompt: `Use $todo:supervise in scheduled-run mode for ${repoRoot}.`,
     rrule: "FREQ=MINUTELY;INTERVAL=15",
     status: "PAUSED",
   };
+  writeFileSync(
+    path.join(repoRoot, ".todo", "supervisor.json"),
+    `${JSON.stringify(
+      Object.fromEntries(
+        Object.entries(supervisorDefinition).filter(
+          ([key]) => key !== "targetThreadId",
+        ),
+      ),
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  const legacySupervisor = getSupervisorStatus(repoRoot);
+  assert(
+    legacySupervisor.configured === true &&
+      legacySupervisor.automation.targetThreadId === null &&
+      legacySupervisor.actionRequired === "rebind",
+    "legacy supervisor binding did not require an owner-chat rebind",
+  );
+  clearSupervisor(repoRoot);
   const boundSupervisor = bindSupervisor(repoRoot, supervisorDefinition);
   assert(
     boundSupervisor.configured === true &&
       boundSupervisor.automation.automationId ===
         supervisorDefinition.automationId &&
+      boundSupervisor.automation.targetThreadId ===
+        supervisorDefinition.targetThreadId &&
       boundSupervisor.automation.status === "PAUSED" &&
       boundSupervisor.actionRequired === null,
     "paused supervisor binding was not persisted for an idle repository",
@@ -565,6 +656,7 @@ try {
     fakeCodex,
     `#!/usr/bin/env node
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 if (args[0] === "app-server" && args.includes("--help")) {
   process.stdout.write(Array.from(
@@ -616,6 +708,10 @@ process.stdin.on("end", async () => {
 	  const interactiveRequiredFixture = input.includes(
 	    "This task requires a current-thread browser capability.",
 	  );
+	  const mergeOrderSlowFixture = input.includes("MERGE_QUEUE_ORDER_SLOW_FIXTURE");
+	  const mergeOrderFastFixture = input.includes("MERGE_QUEUE_ORDER_FAST_FIXTURE");
+	  const mergeConflictExecFixture = input.includes("MERGE_CONFLICT_EXEC_FIXTURE");
+	  const mergeConflictRepair = input.includes("merge-conflict repair attempt");
   const retryAttempt = retryFixture
     ? readFileSync(${JSON.stringify(invocationLog)}, "utf8")
         .trim()
@@ -625,8 +721,24 @@ process.stdin.on("end", async () => {
         .filter((entry) => entry.input.includes("Retry this task after first failure."))
         .length
     : 0;
+	  if (mergeOrderSlowFixture) {
+	    writeFileSync(process.env.TODO_RUNNER_WORKTREE + "/merge-order-slow.txt", "slow\\n");
+	  }
+	  if (mergeOrderFastFixture) {
+	    writeFileSync(process.env.TODO_RUNNER_WORKTREE + "/merge-order-fast.txt", "fast\\n");
+	  }
+	  if (mergeConflictExecFixture) {
+	    writeFileSync(process.env.TODO_RUNNER_WORKTREE + "/merge-conflict-exec.txt", "task\\n");
+	    writeFileSync(process.env.TODO_RUNNER_REPO_ROOT + "/merge-conflict-exec.txt", "main\\n");
+	    spawnSync("git", ["-C", process.env.TODO_RUNNER_REPO_ROOT, "add", "merge-conflict-exec.txt"]);
+	    spawnSync("git", ["-C", process.env.TODO_RUNNER_REPO_ROOT, "commit", "--quiet", "-m", "advance exec merge target"]);
+	  }
+	  if (mergeConflictRepair && input.includes("merge-conflict-exec.txt")) {
+	    writeFileSync(process.env.TODO_RUNNER_WORKTREE + "/merge-conflict-exec.txt", "main and task\\n");
+	  }
 	  const shouldFail =
 	    (retryFixture && retryAttempt === 1) || interactiveRequiredFixture;
+	  const delayMs = mergeOrderSlowFixture ? 1800 : mergeOrderFastFixture ? 100 : 1200;
   setTimeout(() => {
     process.stdout.write(JSON.stringify({
       type: "item.completed",
@@ -664,7 +776,7 @@ process.stdin.on("end", async () => {
 	        : null
 	    }));
     process.exit(0);
-  }, 1200);
+  }, delayMs);
 });
 `,
     "utf8",
@@ -728,6 +840,11 @@ process.stdin.on("end", async () => {
   const sourceDir = path.join(repoRoot, "src");
   mkdirSync(sourceDir, { recursive: true });
   writeFileSync(
+    path.join(repoRoot, ".gitignore"),
+    "codex-invocations.jsonl\n",
+    "utf8",
+  );
+  writeFileSync(
     path.join(sourceDir, "example.js"),
     "export function example() {\n  return true;\n}\n",
     "utf8",
@@ -751,7 +868,15 @@ process.stdin.on("end", async () => {
   }
   const stagedFixture = spawnSync(
     "git",
-    ["-C", repoRoot, "add", "AGENTS.md", "src/example.js", "fake-codex.mjs"],
+    [
+      "-C",
+      repoRoot,
+      "add",
+      "AGENTS.md",
+      ".gitignore",
+      "src/example.js",
+      "fake-codex.mjs",
+    ],
     { encoding: "utf8" },
   );
   assert(stagedFixture.status === 0, stagedFixture.stderr || "git add failed");
@@ -820,7 +945,8 @@ process.stdin.on("end", async () => {
     activeSupervisor.desiredStatus === "ACTIVE" &&
       activeSupervisor.actionRequired === "resume" &&
       activeSupervisor.activeTasks.total === 1 &&
-      activeSupervisor.activeTasks.counts.queued === 1,
+      activeSupervisor.activeTasks.counts.queued === 1 &&
+      activeSupervisor.threadTitle === "-> ToDo (0r / 1q / 0f)",
     "new task did not request supervisor resume",
   );
   const resumedSupervisor = bindSupervisor(repoRoot, {
@@ -1098,6 +1224,8 @@ process.stdin.on("end", async () => {
   assert(
     startSkillText.includes("current invoking chat") &&
       startSkillText.includes("$browser:control-in-app-browser") &&
+      startSkillText.includes("targetThreadId") &&
+      startSkillText.includes("dashboardThreadId") &&
       startSkillText.includes("new in-app Browser tab") &&
       startSkillText.includes("exact returned URL") &&
       startSkillText.includes("Never guess a dashboard URL") &&
@@ -1106,9 +1234,19 @@ process.stdin.on("end", async () => {
       startSkillText.includes("FREQ=MINUTELY;INTERVAL=15") &&
       startSkillText.includes("destination `thread`") &&
       startSkillText.includes("idle repository starts as `PAUSED`") &&
-      startSkillText.includes("supervisor_bind"),
+      startSkillText.includes("supervisor_bind") &&
+      startSkillText.indexOf("supervisor_bind") <
+        startSkillText.indexOf("runner_start"),
     "start skill does not rebind supervision to the invoking chat",
   );
+  for (const skill of ["create", "reopen", "retry", "route", "stop", "supervise"]) {
+    assert(
+      readFileSync(path.join(scriptDir, "..", "skills", skill, "SKILL.md"), "utf8").includes(
+        "targetThreadId",
+      ),
+      `${skill} skill can retarget the configured supervisor`,
+    );
+  }
   const runSkillDir = path.join(scriptDir, "..", "skills", "run");
   const runSkillText = readFileSync(path.join(runSkillDir, "SKILL.md"), "utf8");
   assert(existsSync(path.join(runSkillDir, "SKILL.md")), "missing run skill");
@@ -1201,7 +1339,9 @@ process.stdin.on("end", async () => {
     "runner_start did not reject an incompatible live daemon",
   );
   unlinkSync(daemonStateFile);
-  ensureDaemon(repoRoot);
+  ensureDaemon(repoRoot, {
+    dashboardThreadId: supervisorDefinition.targetThreadId,
+  });
   daemonPid = await waitFor(() => {
     const state = readDaemonState(repoRoot);
     return processIsAlive(state?.pid) ? state.pid : null;
@@ -1239,6 +1379,22 @@ process.stdin.on("end", async () => {
       ),
     ],
     ["workers", Array.isArray(dashboardApi.workers?.items)],
+    [
+      "task-counts",
+      dashboardApi.taskCounts?.running === 2 &&
+        dashboardApi.taskCounts.queued ===
+          dashboardApi.tasks.filter((task) =>
+            [
+              "queued",
+              "blocked",
+              "staging",
+              "merge-queued",
+              "merge-conflict",
+            ].includes(task.status),
+          ).length &&
+        dashboardApi.taskCounts.failed ===
+          dashboardApi.tasks.filter((task) => task.status === "failed").length,
+    ],
     ["implementation", dashboardApi.runner?.implementation === "todo"],
     ["protocol", dashboardApi.runner?.protocolVersion === 2],
     ["reload-interval", dashboardApi.config?.configReloadIntervalMs === 250],
@@ -1433,6 +1589,12 @@ process.stdin.on("end", async () => {
     ["first-unbounded", dashboardHtml.includes("500-dashboard-unbounded-fixture")],
     ["last-unbounded", dashboardHtml.includes("704-dashboard-unbounded-fixture")],
     [
+      "task-status-summary",
+      /tasks · \d+ running · \d+ queued\/blocked · \d+ failed · merge/.test(
+        dashboardHtml,
+      ) && !/tasks · \d+ busy · \d+ idle/.test(dashboardHtml),
+    ],
+    [
       "sort-order",
       dashboardHtml.indexOf("004-parallel-task") <
         dashboardHtml.indexOf("001-first-task"),
@@ -1499,8 +1661,17 @@ process.stdin.on("end", async () => {
     ),
   ].map((match) => match[1]);
   const renderedStatusRanks = renderedStatuses.map((status) => {
-    const rank = ["running", "blocked", "completed", "failed"].indexOf(status);
-    return rank < 0 ? 4 : rank;
+    const rank = [
+      "running",
+      "queued",
+      "merge-queued",
+      "blocked",
+      "merge-conflict",
+      "failed",
+      "completed",
+      "rejected",
+    ].indexOf(status);
+    return rank < 0 ? 8 : rank;
   });
   assert(
     defaultDashboardResponse.status === 200 &&
@@ -1510,7 +1681,7 @@ process.stdin.on("end", async () => {
       renderedStatusRanks.every(
         (rank, index) => index === 0 || rank >= renderedStatusRanks[index - 1],
       ),
-    "dashboard default status order was not running, blocked, completed, failed",
+    "dashboard default status order was not running, queued, failed, completed, rejected",
   );
   assert(
     dashboardHtml.includes(">Start<") &&
@@ -1775,6 +1946,7 @@ process.stdin.on("end", async () => {
   const retrying = createTask(repoRoot, {
     title: "Retry metrics task",
     description: `Retry this task after first failure.\n\n${retryImplementationBrief}`,
+    modelProfile: "fast",
   });
   await waitFor(
     () => getTaskStatus(repoRoot, retrying.id).status === "completed",
@@ -1847,6 +2019,9 @@ process.stdin.on("end", async () => {
       ) &&
       retryUsageFiles[0].status === "failed_transient" &&
       retryUsageFiles[1].status === "completed" &&
+      retryUsageFiles[0].modelProfile === "fast" &&
+      retryUsageFiles[1].modelProfile === "expert" &&
+      retriedReceipt.execution?.modelProfile === "expert" &&
       retryPrompts.length === 2 &&
       retryPrompts.every(
         (prompt) =>
@@ -1864,6 +2039,96 @@ process.stdin.on("end", async () => {
       retriedReceipt.retryStats?.deliveryRetries === 0 &&
       retriedRunnerLog.includes("event=task_auto_retry"),
     "automatic retry did not accumulate time and token usage",
+  );
+  const mergeBatchId = "smoke-merge-order-batch";
+  const mergeOrderSlow = createTask(repoRoot, {
+    title: "Merge order slow sibling",
+    description: "MERGE_QUEUE_ORDER_SLOW_FIXTURE",
+    modelProfile: "fast",
+    delivery: "merge",
+    batchId: mergeBatchId,
+  });
+  const mergeOrderFast = createTask(repoRoot, {
+    title: "Merge order fast sibling",
+    description: "MERGE_QUEUE_ORDER_FAST_FIXTURE",
+    modelProfile: "fast",
+    delivery: "merge",
+    batchId: mergeBatchId,
+  });
+  await waitFor(() => {
+    const slow = getTaskStatus(repoRoot, mergeOrderSlow.id).status;
+    const fast = getTaskStatus(repoRoot, mergeOrderFast.id).status;
+    return slow === "completed" && fast === "completed";
+  }, "same-batch merge siblings did not both complete", 30000);
+  const mergeOrderSlowReceipt = getTaskStatus(repoRoot, mergeOrderSlow.id);
+  const mergeOrderFastReceipt = getTaskStatus(repoRoot, mergeOrderFast.id);
+  assert(
+    spawnSync(
+      "git",
+      [
+        "-C",
+        repoRoot,
+        "merge-base",
+        "--is-ancestor",
+        mergeOrderSlowReceipt.git.deliveryResult.targetCommit,
+        mergeOrderFastReceipt.git.deliveryResult.targetCommit,
+      ],
+      { encoding: "utf8" },
+    ).status === 0,
+    "later same-batch merge task did not rebase on the earlier delivered sibling",
+  );
+  writeFileSync(
+    path.join(repoRoot, "merge-conflict-exec.txt"),
+    "base\n",
+    "utf8",
+  );
+  const execConflictBase = spawnSync(
+    "git",
+    ["-C", repoRoot, "add", "merge-conflict-exec.txt"],
+    { encoding: "utf8" },
+  );
+  assert(execConflictBase.status === 0, execConflictBase.stderr || "git add failed");
+  const execConflictCommit = spawnSync(
+    "git",
+    ["-C", repoRoot, "commit", "--quiet", "-m", "exec merge conflict base"],
+    { encoding: "utf8" },
+  );
+  assert(
+    execConflictCommit.status === 0,
+    execConflictCommit.stderr || "git commit failed",
+  );
+  const execConflictTask = createTask(repoRoot, {
+    title: "Exec merge conflict repair",
+    description: "MERGE_CONFLICT_EXEC_FIXTURE",
+    modelProfile: "fast",
+    delivery: "merge",
+  });
+  await waitFor(
+    () => getTaskStatus(repoRoot, execConflictTask.id).status === "completed",
+    "exec merge conflict repair did not complete",
+    20000,
+  );
+  const execConflictReceipt = getTaskStatus(repoRoot, execConflictTask.id);
+  const execConflictInvocations = readFileSync(invocationLog, "utf8")
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter(
+      (entry) =>
+        entry.input.includes(execConflictTask.id) ||
+        entry.input.includes("MERGE_CONFLICT_EXEC_FIXTURE"),
+    );
+  assert(
+    execConflictReceipt.git.deliveryResult.strategy === "rebase-fast-forward" &&
+      execConflictReceipt.attemptLedger.attempts.length === 2 &&
+      execConflictReceipt.attemptLedger.attempts[1].trigger ===
+        "merge_conflict" &&
+      readFileSync(path.join(repoRoot, "merge-conflict-exec.txt"), "utf8") ===
+        "main and task\n" &&
+      execConflictInvocations.length === 2 &&
+      execConflictInvocations[1].input.includes("merge-conflict repair attempt"),
+    "exec backend did not repair a paused rebase conflict through a second worker turn",
   );
   const explicitClaim = await startInteractiveTask(
     repoRoot,
@@ -1915,7 +2180,10 @@ process.stdin.on("end", async () => {
       secondInteractiveTask.metrics.tokenUsage.totalTokens === 0 &&
       typeof secondInteractiveTask.metrics.startedAt === "string" &&
       secondInteractiveTask.metrics.completedAt === null &&
-      secondInteractiveTask.metrics.lastRun.completedAt === null,
+      secondInteractiveTask.metrics.lastRun.completedAt === null &&
+      secondLiveInteractive.taskCounts.running ===
+        secondLiveInteractive.tasks.filter((task) => task.status === "running")
+          .length,
     "interactive duration was not live or tokens did not default to zero",
   );
   const interactiveReceipt = await finishInteractiveTask(
@@ -2276,6 +2544,74 @@ process.stdin.on("end", async () => {
   await callMcp();
   await callMcpStop();
 
+  const stickyThreadId = supervisorDefinition.targetThreadId;
+  const secondThreadId = "00000000-0000-7000-8000-000000000002";
+  const initialDashboardPort = Number.parseInt(new URL(dashboardUrl).port, 10);
+  ensureDaemon(repoRoot, { dashboardThreadId: stickyThreadId });
+  let stickyState = await waitFor(() => {
+    const state = readDaemonState(repoRoot);
+    return state?.dashboard?.threadId === stickyThreadId ? state : null;
+  }, "same-thread dashboard restart did not publish its owner");
+  daemonPid = stickyState.pid;
+  assert(
+    stickyState.dashboard.port === initialDashboardPort,
+    "same thread did not reuse its available dashboard port",
+  );
+  await callMcpStop();
+
+  const occupiedPort = createServer();
+  await new Promise((resolve, reject) => {
+    occupiedPort.once("error", reject);
+    occupiedPort.listen(initialDashboardPort, "127.0.0.1", resolve);
+  });
+  try {
+    ensureDaemon(repoRoot, { dashboardThreadId: stickyThreadId });
+    stickyState = await waitFor(() => {
+      const state = readDaemonState(repoRoot);
+      return state?.dashboard?.threadId === stickyThreadId &&
+        state.dashboard.port !== initialDashboardPort
+        ? state
+        : null;
+    }, "occupied sticky dashboard port was not replaced");
+    daemonPid = stickyState.pid;
+  } finally {
+    await new Promise((resolve) => occupiedPort.close(resolve));
+  }
+  const replacementDashboardPort = stickyState.dashboard.port;
+  await callMcpStop();
+
+  ensureDaemon(repoRoot, { dashboardThreadId: stickyThreadId });
+  stickyState = await waitFor(() => {
+    const state = readDaemonState(repoRoot);
+    return state?.dashboard?.threadId === stickyThreadId ? state : null;
+  }, "replacement dashboard port restart did not publish its owner");
+  daemonPid = stickyState.pid;
+  assert(
+    stickyState.dashboard.port === replacementDashboardPort,
+    "replacement dashboard port was not persisted for the thread",
+  );
+
+  ensureDaemon(repoRoot, { dashboardThreadId: secondThreadId });
+  const secondThreadState = await waitFor(() => {
+    const state = readDaemonState(repoRoot);
+    return state?.dashboard?.threadId === secondThreadId ? state : null;
+  }, "running daemon did not switch dashboard owner threads");
+  assert(
+    secondThreadState.dashboard.port !== replacementDashboardPort,
+    "different dashboard threads did not keep independent reservations",
+  );
+  ensureDaemon(repoRoot, { dashboardThreadId: stickyThreadId });
+  stickyState = await waitFor(() => {
+    const state = readDaemonState(repoRoot);
+    return state?.dashboard?.threadId === stickyThreadId ? state : null;
+  }, "dashboard did not switch back to the original owner thread");
+  daemonPid = stickyState.pid;
+  assert(
+    stickyState.dashboard.port === replacementDashboardPort,
+    "original thread did not recover its reserved dashboard port",
+  );
+  await callMcpStop();
+
   writeFileSync(configFile, '{"retries":-1}\n', "utf8");
   assert(
     loadConfig(repoRoot).retries === -1 &&
@@ -2339,6 +2675,8 @@ process.stdin.on("end", async () => {
       backgroundFailureRequiresInteractive: true,
       strictResultSchemaObjects: true,
       daemonConflictProtection: true,
+      stickyDashboardPortPerThread: true,
+      occupiedDashboardPortReplacement: true,
       unownedSigtermIgnored: true,
       taskUpdate: true,
       shortTaskIds: true,

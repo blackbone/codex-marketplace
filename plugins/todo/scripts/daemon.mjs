@@ -29,6 +29,7 @@ import {
   daemonStopRequestPath,
   emptyTokenUsage,
   ensureLayout,
+  getSupervisorStatus,
   getTaskStatus,
   isActivated,
   isCurrentDaemonState,
@@ -40,12 +41,16 @@ import {
   markTaskModelCompleted,
   markClosedTaskThreadArchived,
   prepareTaskGit,
+  prepareTaskMergeConflictRepair,
+  processTaskMergeQueue,
   readDaemonState,
+  readDashboardThreadRequest,
   readTask,
   releaseClaim,
   resolveTaskExecution,
   retryTask,
   setTaskError,
+  finishTaskMergeConflictRepair,
   taskBatchPublicationActive,
   taskMetrics,
   taskIdFromFilename,
@@ -91,6 +96,27 @@ let deactivationDeferred = false;
 let runtimeUpdateRequest = null;
 let appServer = null;
 let appServerStartPromise = null;
+let dashboardSyncPromise = null;
+let supervisorTitleSyncPromise = null;
+let supervisorTitleSyncQueued = false;
+let lastSupervisorTitleSuccessKey = null;
+let lastSupervisorTitleAttemptKey = null;
+let lastSupervisorTitleAttemptAt = 0;
+let supervisorThreadTitleState = {
+  status: "unbound",
+  threadId: null,
+  title: null,
+  updatedAt: null,
+  error: null,
+};
+
+const SUPERVISOR_TITLE_RETRY_MS = 5000;
+
+function implementationActiveCount() {
+  return [...active.values()].filter(
+    (entry) => Number.isInteger(entry.workerId),
+  ).length;
+}
 
 ensureLayout(repoRoot);
 const existingDaemon = readDaemonState(repoRoot);
@@ -143,7 +169,9 @@ function writeState(status = null) {
     });
   }
   for (const entry of active.values()) {
-    if (entry.workerId <= config.workers) continue;
+    if (!Number.isInteger(entry.workerId) || entry.workerId <= config.workers) {
+      continue;
+    }
     workerStates.push({
       id: entry.workerId,
       status: "draining",
@@ -154,6 +182,12 @@ function writeState(status = null) {
       taskTitle: entry.taskTitle,
     });
   }
+  const mergeEntry = [...active.values()].find(
+    (entry) => entry.workerId === "merge-queue",
+  );
+  const repairEntry = [...active.values()].find(
+    (entry) => entry.workerId === "merge-repair",
+  );
   atomicWriteJson(daemonStatePath(repoRoot), {
     implementation: DAEMON_IMPLEMENTATION,
     protocolVersion: DAEMON_PROTOCOL_VERSION,
@@ -201,10 +235,23 @@ function writeState(status = null) {
           host: dashboard.host,
           port: dashboard.port,
           url: dashboard.url,
+          threadId: dashboard.threadId || null,
         }
       : null,
     active: [...active.keys()],
     workerStates,
+    mergeWorker: {
+      status: mergeEntry ? "busy" : "idle",
+      taskId: mergeEntry?.taskId || null,
+      taskTitle: mergeEntry?.taskTitle || null,
+    },
+    mergeRepairWorker: {
+      status: repairEntry ? "busy" : "idle",
+      pid: repairEntry?.threadId ? appServer?.pid || null : null,
+      taskId: repairEntry?.taskId || null,
+      taskTitle: repairEntry?.taskTitle || null,
+    },
+    supervisorThreadTitle: supervisorThreadTitleState,
     startedAt: daemonStartedAt,
     heartbeatAt: new Date().toISOString(),
   });
@@ -266,7 +313,11 @@ async function reloadDashboard(previousConfig, nextConfig) {
 
   let replacement;
   try {
-    replacement = await startDashboard(repoRoot, nextConfig.dashboardPort);
+    replacement = await startDashboard(
+      repoRoot,
+      nextConfig.dashboardPort,
+      dashboard?.threadId || null,
+    );
   } catch (error) {
     log("dashboard_config_reload_error", {
       requestedPort: nextConfig.dashboardPort,
@@ -283,6 +334,50 @@ async function reloadDashboard(previousConfig, nextConfig) {
     requestedPort: nextConfig.dashboardPort,
     dashboardUrl: dashboard.url,
   });
+}
+
+async function syncDashboardThread() {
+  const threadId = readDashboardThreadRequest(repoRoot)?.threadId || null;
+  if (!threadId || dashboard?.threadId === threadId) return false;
+  if (runtimeConfig.dashboardPort !== 0) {
+    dashboard.threadId = threadId;
+    writeState();
+    log("dashboard_thread_reloaded", {
+      threadId,
+      dashboardUrl: dashboard.url,
+    });
+    return true;
+  }
+
+  let replacement;
+  try {
+    replacement = await startDashboard(repoRoot, 0, threadId);
+  } catch (error) {
+    log("dashboard_thread_reload_error", {
+      threadId,
+      error: error.message,
+    });
+    return false;
+  }
+  watchDashboardErrors(replacement);
+  const previous = dashboard;
+  dashboard = replacement;
+  writeState();
+  await closeDashboard(previous?.server);
+  log("dashboard_thread_reloaded", {
+    threadId,
+    dashboardUrl: dashboard.url,
+  });
+  return true;
+}
+
+function scheduleDashboardThreadSync() {
+  if (!dashboardSyncPromise) {
+    dashboardSyncPromise = syncDashboardThread().finally(() => {
+      dashboardSyncPromise = null;
+    });
+  }
+  return dashboardSyncPromise;
 }
 
 async function reloadRuntimeConfig() {
@@ -341,6 +436,10 @@ function parseResult(resultFile) {
     (result.status !== "completed" && result.status !== "failed") ||
     typeof result.summary !== "string" ||
     !Array.isArray(result.validation) ||
+    result.validation.some(
+      (item) => typeof item !== "string" || !item.trim(),
+    ) ||
+    (result.status === "completed" && result.validation.length === 0) ||
     typeof result.requiresInteractive !== "boolean" ||
     (result.requiresInteractive &&
       (result.status !== "failed" ||
@@ -373,7 +472,7 @@ function buildPrompt(task, worktreePath) {
     "Do not create, switch, commit, merge, cherry-pick, rebase, push, or delete Git branches and do not create pull requests. The ToDo runner owns all mutating Git operations.",
     "Read-only Git inspection such as status, diff, and log is allowed.",
     "Do not edit or delete .todo task, claim, history, daemon, log, or config files.",
-    "Complete only this task and run the smallest relevant validation.",
+    "Complete only this task, run the smallest relevant tests or verification, and report at least one concrete validation result. A completed result with no validation evidence is invalid.",
     "Reuse tool results within this attempt. Prefer narrow field filters, limits, and targeted log ranges; do not repeatedly fetch unchanged resources.",
     "Do not ask for user input. If blocked, return status failed with one concrete actionable error.",
     "Set requiresInteractive=true only when the task cannot be completed without current-thread Browser, Chrome, Computer Use, user approval, or user interaction. Include one concrete interactiveReason. For every other result set requiresInteractive=false and interactiveReason=null.",
@@ -401,6 +500,24 @@ function buildAppServerPrompt(task, worktreePath, claim) {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function buildMergeConflictPrompt(task, worktreePath, claim) {
+  const conflict = task.metadata.git?.mergeConflict || {};
+  return [
+    `Continue original ToDo task ${task.id} in its existing Codex thread.`,
+    `This is merge-conflict repair attempt ${claim.attempt || 1}.`,
+    `The merge queue rebased ${task.metadata.git?.branch} onto the current ${task.metadata.git?.targetBranch} at ${conflict.targetCommit || "the latest target commit"}.`,
+    `The rebase is paused in ${worktreePath}.`,
+    conflict.files?.length
+      ? `Conflicted files: ${conflict.files.join(", ")}.`
+      : "Inspect the paused rebase to identify every conflict.",
+    "Resolve the files so the original task functionality remains correct while preserving the newer target-branch functionality and contracts.",
+    "Review the target changes made since the task branch diverged and check affected callers; do not choose one side mechanically.",
+    "Edit the conflicted files and run the smallest relevant tests or verification. Do not run git add, commit, merge, cherry-pick, rebase, push, or branch commands; the merge worker owns the paused rebase and will continue it after your result.",
+    "If the two requirements are logically incompatible or a safe resolution needs a product decision, return status failed with the concrete logical conflict. The task will leave the merge queue with that error.",
+    "Return only the JSON object required by the existing output schema.",
+  ].join("\n");
 }
 
 function markInteractiveRequired(
@@ -558,6 +675,92 @@ async function ensureAppServer(config) {
   }
 }
 
+async function syncSupervisorThreadTitle(config) {
+  const supervisor = getSupervisorStatus(repoRoot);
+  const threadId = supervisor.automation?.targetThreadId || null;
+  const title = supervisor.threadTitle;
+  if (!threadId) {
+    lastSupervisorTitleSuccessKey = null;
+    lastSupervisorTitleAttemptKey = null;
+    lastSupervisorTitleAttemptAt = 0;
+    supervisorThreadTitleState = {
+      status: "unbound",
+      threadId: null,
+      title,
+      updatedAt: null,
+      error: supervisor.readError || null,
+    };
+    return false;
+  }
+
+  const key = `${threadId}\n${title}`;
+  if (key === lastSupervisorTitleSuccessKey) return false;
+  const now = Date.now();
+  if (
+    key === lastSupervisorTitleAttemptKey &&
+    now - lastSupervisorTitleAttemptAt < SUPERVISOR_TITLE_RETRY_MS
+  ) {
+    return false;
+  }
+  lastSupervisorTitleAttemptKey = key;
+  lastSupervisorTitleAttemptAt = now;
+  supervisorThreadTitleState = {
+    status: "syncing",
+    threadId,
+    title,
+    updatedAt: new Date(now).toISOString(),
+    error: null,
+  };
+
+  try {
+    const client = await ensureAppServer(config);
+    await client.setThreadName(threadId, title);
+    lastSupervisorTitleSuccessKey = key;
+    supervisorThreadTitleState = {
+      status: "synced",
+      threadId,
+      title,
+      updatedAt: new Date().toISOString(),
+      error: null,
+    };
+    log("supervisor_thread_title_updated", { threadId, title });
+    return true;
+  } catch (error) {
+    supervisorThreadTitleState = {
+      status: "error",
+      threadId,
+      title,
+      updatedAt: new Date().toISOString(),
+      error: String(error.message).slice(0, 4000),
+    };
+    log("supervisor_thread_title_error", {
+      threadId,
+      title,
+      error: error.message,
+    });
+    return false;
+  }
+}
+
+function scheduleSupervisorThreadTitleSync(config) {
+  if (supervisorTitleSyncPromise) {
+    supervisorTitleSyncQueued = true;
+    return;
+  }
+  supervisorTitleSyncPromise = syncSupervisorThreadTitle(config)
+    .catch((error) => {
+      log("supervisor_thread_title_unhandled_error", {
+        error: error.message,
+      });
+    })
+    .finally(() => {
+      supervisorTitleSyncPromise = null;
+      if (!supervisorTitleSyncQueued || stopping) return;
+      supervisorTitleSyncQueued = false;
+      scheduleSupervisorThreadTitleSync(runtimeConfig || config);
+    });
+}
+
 async function loadTaskThread(taskPath, execution, worktreePath, config) {
   const client = await ensureAppServer(config);
   let task = readTask(taskPath);
@@ -604,12 +807,24 @@ async function archiveTaskThread(taskPath, config) {
   if (!thread || thread.state === "archived") return;
   updateTaskCodexThread(taskPath, { state: "archive-pending" });
   const client = await ensureAppServer(config);
-  await client.archiveThread(thread.id);
+  await archiveThreadIdempotently(client, thread.id);
   updateTaskCodexThread(taskPath, {
     state: "archived",
     archivedAt: new Date().toISOString(),
   });
   log("task_thread_archived", { task: task.id, threadId: thread.id });
+}
+
+function isMissingArchivedThread(error) {
+  return /no rollout found for thread id/i.test(error?.message || "");
+}
+
+async function archiveThreadIdempotently(client, threadId) {
+  try {
+    await client.archiveThread(threadId);
+  } catch (error) {
+    if (!isMissingArchivedThread(error)) throw error;
+  }
 }
 
 async function processPendingThreadArchives(config) {
@@ -618,6 +833,7 @@ async function processPendingThreadArchives(config) {
     try {
       task = readTask(taskPath);
       if (active.has(task.id)) continue;
+      if (existsSync(`${taskPath}.lock`)) continue;
       if (task.metadata.codexThread?.state !== "archive-pending") continue;
       await archiveTaskThread(taskPath, config);
     } catch (error) {
@@ -632,7 +848,7 @@ async function processPendingThreadArchives(config) {
     try {
       receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
       const client = await ensureAppServer(config);
-      await client.archiveThread(receipt.codexThread.id);
+      await archiveThreadIdempotently(client, receipt.codexThread.id);
       markClosedTaskThreadArchived(receiptPath);
       log("closed_task_thread_archived", {
         task: receipt.id,
@@ -671,7 +887,7 @@ async function executeDeliveryOnly(taskPath, claim, workerId, config) {
       path.relative(repoRoot, deliveryPath),
     );
     atomicWriteJson(deliveryPath, {
-      status: "completed",
+      status: finalized.mergeQueued ? "merge-queued" : "completed",
       deliveryAttemptId: finalized.deliveryAttemptId,
       startedAt: new Date(startedAt).toISOString(),
       completedAt: new Date().toISOString(),
@@ -683,12 +899,14 @@ async function executeDeliveryOnly(taskPath, claim, workerId, config) {
     ) {
       await archiveTaskThread(taskPath, config);
     }
-    completeTask(
-      repoRoot,
-      taskPath,
-      finalized.result,
-      task.metadata.metrics || null,
-    );
+    if (!finalized.mergeQueued) {
+      completeTask(
+        repoRoot,
+        taskPath,
+        finalized.result,
+        task.metadata.metrics || null,
+      );
+    }
   } catch (error) {
     const deliveryAttemptId = getTaskStatus(
       repoRoot,
@@ -739,6 +957,7 @@ async function executeDeliveryOnly(taskPath, claim, workerId, config) {
 
 async function executeTaskWithExec(taskPath, claim, workerId, config) {
   const task = readTask(taskPath);
+  const isMergeRepair = task.metadata.git?.phase === "merge-conflict";
   if (
     ["model-completed", "committing", "committed", "delivered"].includes(
       task.metadata.git?.phase,
@@ -752,7 +971,12 @@ async function executeTaskWithExec(taskPath, claim, workerId, config) {
     task.metadata.execution || resolveTaskExecution(config, {});
   let preparedGit;
   try {
-    preparedGit = await prepareTaskGit(repoRoot, taskPath);
+    preparedGit = isMergeRepair
+      ? {
+          worktreePath: task.metadata.git.worktreePath,
+          expectedHead: task.metadata.git.headCommit,
+        }
+      : await prepareTaskGit(repoRoot, taskPath);
   } catch (error) {
     setTaskError(
       taskPath,
@@ -784,7 +1008,9 @@ async function executeTaskWithExec(taskPath, claim, workerId, config) {
   const resultPath = path.join(attemptDir, "result.json");
   const usagePath = path.join(attemptDir, "usage.json");
   const promptPath = path.join(attemptDir, "prompt.txt");
-  const executionPrompt = buildPrompt(task, preparedGit.worktreePath);
+  const executionPrompt = isMergeRepair
+    ? buildMergeConflictPrompt(task, preparedGit.worktreePath, claim)
+    : buildPrompt(task, preparedGit.worktreePath);
   writeFileSync(promptPath, `${executionPrompt}\n`, "utf8");
   const stdoutFd = openSync(stdoutPath, "a");
   const stderrFd = openSync(stderrPath, "a");
@@ -940,6 +1166,46 @@ async function executeTaskWithExec(taskPath, claim, workerId, config) {
   }
 
   try {
+    if (isMergeRepair) {
+      let repairResult;
+      if (spawnError) {
+        repairResult = {
+          status: "failed",
+          summary: spawnError.message,
+          error: spawnError.message,
+          validation: [],
+        };
+      } else if (exitCode !== 0) {
+        const detail = readLogTail(stderrPath) || readLogTail(stdoutPath);
+        const message = detail || `codex exec exited with code ${exitCode}`;
+        repairResult = {
+          status: "failed",
+          summary: message,
+          error: message,
+          validation: [],
+        };
+      } else {
+        try {
+          repairResult = parseResult(resultPath);
+        } catch (error) {
+          repairResult = {
+            status: "failed",
+            summary: error.message,
+            error: error.message,
+            validation: [],
+          };
+        }
+      }
+      await finishTaskMergeConflictRepair(
+        repoRoot,
+        taskPath,
+        claim,
+        repairResult,
+        metrics,
+        path.relative(repoRoot, usagePath),
+      );
+      return;
+    }
     if (spawnError) {
       setTaskError(
         taskPath,
@@ -1045,11 +1311,13 @@ async function executeTaskWithExec(taskPath, claim, workerId, config) {
         path.relative(repoRoot, path.join(attemptDir, "delivery.json")),
       );
       atomicWriteJson(path.join(attemptDir, "delivery.json"), {
-        status: "completed",
+        status: finalized.mergeQueued ? "merge-queued" : "completed",
         deliveryAttemptId: finalized.deliveryAttemptId,
         delivery: finalized.delivery,
       });
-      completeTask(repoRoot, taskPath, finalized.result, metrics);
+      if (!finalized.mergeQueued) {
+        completeTask(repoRoot, taskPath, finalized.result, metrics);
+      }
     } catch (error) {
       const deliveryAttemptId = getTaskStatus(
         repoRoot,
@@ -1144,6 +1412,7 @@ async function executeTaskWithExec(taskPath, claim, workerId, config) {
 
 async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
   const task = readTask(taskPath);
+  const isMergeRepair = task.metadata.git?.phase === "merge-conflict";
   if (
     ["model-completed", "committing", "committed", "delivered"].includes(
       task.metadata.git?.phase,
@@ -1157,7 +1426,12 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
   const previousMetrics = task.metadata.metrics || null;
   let preparedGit;
   try {
-    preparedGit = await prepareTaskGit(repoRoot, taskPath);
+    preparedGit = isMergeRepair
+      ? {
+          worktreePath: task.metadata.git.worktreePath,
+          expectedHead: task.metadata.git.headCommit,
+        }
+      : await prepareTaskGit(repoRoot, taskPath);
   } catch (error) {
     setTaskError(
       taskPath,
@@ -1190,11 +1464,9 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
   const resultPath = path.join(attemptDir, "result.json");
   const usagePath = path.join(attemptDir, "usage.json");
   const promptPath = path.join(attemptDir, "prompt.txt");
-  const executionPrompt = buildAppServerPrompt(
-    task,
-    preparedGit.worktreePath,
-    claim,
-  );
+  const executionPrompt = isMergeRepair
+    ? buildMergeConflictPrompt(task, preparedGit.worktreePath, claim)
+    : buildAppServerPrompt(task, preparedGit.worktreePath, claim);
   const outputSchema = JSON.parse(readFileSync(resultSchema, "utf8"));
   writeFileSync(promptPath, `${executionPrompt}\n`, "utf8");
   const claimedAt = Date.parse(claim.claimedAt);
@@ -1321,6 +1593,37 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
   );
 
   try {
+    if (isMergeRepair) {
+      let repairResult;
+      if (runError) {
+        repairResult = {
+          status: "failed",
+          summary: runError.message,
+          error: runError.message,
+          validation: [],
+        };
+      } else {
+        try {
+          repairResult = parseResult(resultPath);
+        } catch (error) {
+          repairResult = {
+            status: "failed",
+            summary: error.message,
+            error: error.message,
+            validation: [],
+          };
+        }
+      }
+      await finishTaskMergeConflictRepair(
+        repoRoot,
+        taskPath,
+        claim,
+        repairResult,
+        metrics,
+        path.relative(repoRoot, usagePath),
+      );
+      return;
+    }
     if (runError) {
       const kind = runError.kind || "app_server";
       setTaskError(
@@ -1408,12 +1711,14 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
         path.relative(repoRoot, deliveryPath),
       );
       atomicWriteJson(deliveryPath, {
-        status: "completed",
+        status: finalized.mergeQueued ? "merge-queued" : "completed",
         deliveryAttemptId: finalized.deliveryAttemptId,
         delivery: finalized.delivery,
       });
       await archiveTaskThread(taskPath, config);
-      completeTask(repoRoot, taskPath, finalized.result, metrics);
+      if (!finalized.mergeQueued) {
+        completeTask(repoRoot, taskPath, finalized.result, metrics);
+      }
     } catch (error) {
       setTaskError(
         taskPath,
@@ -1492,10 +1797,218 @@ async function executeTask(taskPath, claim, workerId, config) {
     : executeTaskWithAppServer(taskPath, claim, workerId, config);
 }
 
+function hasSpecialWorker(workerId) {
+  return [...active.values()].some((entry) => entry.workerId === workerId);
+}
+
+const MERGE_QUEUE_BLOCKING_STATUSES = new Set([
+  "queued",
+  "running",
+  "blocked",
+  "staging",
+  "merge-queued",
+  "merge-conflict",
+]);
+
+function taskSequenceValue(taskId) {
+  const match = /^([0-9]+)/.exec(String(taskId));
+  return match ? BigInt(match[1]) : null;
+}
+
+function mergeQueueEntry(taskPath) {
+  const status = getTaskStatus(repoRoot, taskIdFromFilename(path.basename(taskPath)));
+  let batchId = null;
+  try {
+    batchId = readTask(taskPath).metadata.batchId || null;
+  } catch {
+    batchId = null;
+  }
+  return { taskPath, status, batchId };
+}
+
+function mergeQueueBlockedByEarlierBatchSibling(candidate, entries) {
+  const candidateSequence = taskSequenceValue(candidate.status.id);
+  const candidateBatch = candidate.batchId;
+  const targetBranch = candidate.status.git?.targetBranch || null;
+  if (candidateSequence === null || !candidateBatch || !targetBranch) {
+    return false;
+  }
+  return entries.some((entry) => {
+    if (entry.taskPath === candidate.taskPath) return false;
+    if (entry.batchId !== candidateBatch) return false;
+    if (entry.status.git?.delivery !== "merge") return false;
+    if (entry.status.git?.targetBranch !== targetBranch) return false;
+    if (!MERGE_QUEUE_BLOCKING_STATUSES.has(entry.status.status)) return false;
+    const entrySequence = taskSequenceValue(entry.status.id);
+    return entrySequence !== null && entrySequence < candidateSequence;
+  });
+}
+
+function queuedMergeCandidates() {
+  const entries = listTaskFiles(repoRoot).map(mergeQueueEntry);
+  return entries
+    .filter(({ status }) => status.status === "merge-queued")
+    .filter((candidate) => !mergeQueueBlockedByEarlierBatchSibling(candidate, entries))
+    .sort((left, right) => {
+      const leftSequence = taskSequenceValue(left.status.id);
+      const rightSequence = taskSequenceValue(right.status.id);
+      if (leftSequence !== null && rightSequence !== null && leftSequence !== rightSequence) {
+        return leftSequence < rightSequence ? -1 : 1;
+      }
+      const leftAt = Date.parse(left.status.git?.mergeQueuedAt || left.status.updatedAt);
+      const rightAt = Date.parse(right.status.git?.mergeQueuedAt || right.status.updatedAt);
+      return leftAt - rightAt || left.status.id.localeCompare(right.status.id);
+    });
+}
+
+function startMergeQueueWorker(config) {
+  if (taskBatchPublicationActive(repoRoot) || hasSpecialWorker("merge-queue")) {
+    return;
+  }
+  const candidate = queuedMergeCandidates().find(
+    ({ status }) => !active.has(status.id),
+  );
+  if (!candidate) return;
+  const { taskPath, status } = candidate;
+  let claim;
+  try {
+    claim = claimTask(taskPath, "merge-queue");
+  } catch (error) {
+    if (error.code !== "EEXIST") {
+      log("merge_queue_claim_error", { task: status.id, error: error.message });
+    }
+    return;
+  }
+  const entry = {
+    claim,
+    child: null,
+    taskPath,
+    workerId: "merge-queue",
+    taskId: status.id,
+    taskTitle: status.title,
+    promise: null,
+  };
+  active.set(status.id, entry);
+  writeState();
+  const promise = (async () => {
+    const attemptDir = path.join(
+      todoDir(repoRoot),
+      "logs",
+      status.id,
+      `merge-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+    );
+    mkdirSync(attemptDir, { recursive: true });
+    const deliveryPath = path.join(attemptDir, "delivery.json");
+    log("merge_queue_start", { task: status.id, target: status.git?.targetBranch });
+    try {
+      const merged = await processTaskMergeQueue(
+        repoRoot,
+        taskPath,
+        path.relative(repoRoot, deliveryPath),
+      );
+      atomicWriteJson(deliveryPath, merged);
+      if (merged.status === "merged") {
+        if ((status.execution?.backend || config.executionBackend) === "app-server") {
+          await archiveTaskThread(taskPath, config);
+        }
+        completeTask(repoRoot, taskPath, merged.result, status.metrics || null);
+        log("merge_queue_merged", {
+          task: status.id,
+          targetCommit: merged.delivery?.targetCommit,
+        });
+      } else {
+        log("merge_queue_conflict", {
+          task: status.id,
+          files: merged.conflict?.files || [],
+        });
+      }
+    } catch (error) {
+      atomicWriteJson(deliveryPath, {
+        status: "failed",
+        errorKind: error.taskFailure?.errorKind || error.kind || "git_delivery",
+        error: String(error.message).slice(0, 4000),
+      });
+      log("merge_queue_error", { task: status.id, error: error.message });
+    } finally {
+      releaseClaim(claim);
+      active.delete(status.id);
+      writeState();
+    }
+  })();
+  entry.promise = promise;
+}
+
+function startMergeConflictRepair(config) {
+  if (hasSpecialWorker("merge-repair")) return;
+  const candidate = listTaskFiles(repoRoot)
+    .map((taskPath) => ({ taskPath, status: getTaskStatus(repoRoot, taskIdFromFilename(path.basename(taskPath))) }))
+    .find(({ status }) => status.status === "merge-conflict" && !active.has(status.id));
+  if (!candidate) return;
+  const { taskPath } = candidate;
+  let status = candidate.status;
+  const backend = status.execution?.backend || config.executionBackend;
+  if (backend === "app-server" && !status.codexThread?.id) {
+    const task = readTask(taskPath);
+    task.metadata.git = {
+      ...task.metadata.git,
+      phase: "merge-failed",
+      deliveryError: "Merge conflict repair requires the original persistent app-server thread",
+    };
+    task.metadata.error = {
+      at: new Date().toISOString(),
+      kind: "merge_thread_unavailable",
+      exit_code: null,
+      message: task.metadata.git.deliveryError,
+    };
+    task.metadata.outcome = "failed_permanent";
+    writeTask(task);
+    log("merge_repair_unavailable", { task: status.id });
+    return;
+  }
+  try {
+    status = prepareTaskMergeConflictRepair(repoRoot, taskPath);
+  } catch (error) {
+    log("merge_repair_prepare_error", { task: status.id, error: error.message });
+    return;
+  }
+  let claim;
+  try {
+    claim = claimTask(taskPath, "merge-repair");
+  } catch (error) {
+    if (error.code !== "EEXIST") {
+      log("merge_repair_claim_error", { task: status.id, error: error.message });
+    }
+    return;
+  }
+  const entry = {
+    claim,
+    child: null,
+    taskPath,
+    workerId: "merge-repair",
+    taskId: status.id,
+    taskTitle: status.title,
+    promise: null,
+  };
+  active.set(status.id, entry);
+  writeState();
+  const promise = executeTask(
+    taskPath,
+    claim,
+    "merge-repair",
+    config,
+  ).catch((error) => {
+    log("merge_repair_error", { task: status.id, error: error.message });
+    if (existsSync(`${taskPath}.lock`)) releaseClaim(claim);
+    active.delete(status.id);
+    writeState();
+  });
+  entry.promise = promise;
+}
+
 function startReadyTasks(config) {
   if (taskBatchPublicationActive(repoRoot)) return;
   for (const taskPath of listTaskFiles(repoRoot)) {
-    if (active.size >= config.workers) return;
+    if (implementationActiveCount() >= config.workers) return;
     const id = taskIdFromFilename(path.basename(taskPath));
     if (active.has(id)) continue;
     let status = getTaskStatus(repoRoot, id);
@@ -1746,19 +2259,34 @@ runtimeConfig = loadConfig(repoRoot);
 configLastCheckedAt = new Date().toISOString();
 configAppliedAt = configLastCheckedAt;
 configReloadWarning = runtimeConfig.warning;
+const initialDashboardThreadId =
+  readDashboardThreadRequest(repoRoot)?.threadId || null;
 try {
-  dashboard = await startDashboard(repoRoot, runtimeConfig.dashboardPort);
+  dashboard = await startDashboard(
+    repoRoot,
+    runtimeConfig.dashboardPort,
+    initialDashboardThreadId,
+  );
 } catch (error) {
   if (runtimeConfig.dashboardPort === 0) throw error;
   log("dashboard_port_fallback", {
     requestedPort: runtimeConfig.dashboardPort,
     error: error.message,
   });
-  dashboard = await startDashboard(repoRoot, 0);
+  dashboard = await startDashboard(repoRoot, 0, initialDashboardThreadId);
 }
 watchDashboardErrors(dashboard);
-log("daemon_start", { repoRoot, dashboardUrl: dashboard.url });
+log("daemon_start", {
+  repoRoot,
+  dashboardThreadId: dashboard.threadId,
+  dashboardUrl: dashboard.url,
+});
 cleanupStaleClaims(repoRoot);
+process.on("SIGUSR2", () => {
+  scheduleDashboardThreadSync().catch((error) => {
+    log("dashboard_thread_reload_error", { error: error.message });
+  });
+});
 writeState();
 
 let nextTaskPollAt = Date.now();
@@ -1801,6 +2329,8 @@ while (!stopping) {
     log("config_reactivated", { activeTasksPreserved: active.size });
   }
 
+  await scheduleDashboardThreadSync();
+
   const now = Date.now();
   if (now >= nextConfigReloadAt) {
     const changed = await reloadRuntimeConfig();
@@ -1812,7 +2342,11 @@ while (!stopping) {
   if (Date.now() >= nextTaskPollAt) {
     cleanupStaleClaims(repoRoot);
     await processPendingThreadArchives(runtimeConfig);
+    scheduleSupervisorThreadTitleSync(runtimeConfig);
     startReadyTasks(runtimeConfig);
+    startMergeQueueWorker(runtimeConfig);
+    startMergeConflictRepair(runtimeConfig);
+    scheduleSupervisorThreadTitleSync(runtimeConfig);
     writeState();
     nextTaskPollAt = Date.now() + runtimeConfig.pollIntervalMs;
   }

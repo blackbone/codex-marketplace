@@ -21,7 +21,7 @@ for await (const line of createInterface({ input: process.stdin })) {
   if (message.method === "initialize") send({ id: message.id, result: { userAgent: "fake" } });
   else if (message.method === "thread/start") send({ id: message.id, result: { thread: { id: "thread-1" } } });
   else if (message.method === "thread/resume") send({ id: message.id, result: { thread: { id: message.params.threadId } } });
-  else if (message.method === "thread/archive" || message.method === "thread/unarchive" || message.method === "turn/interrupt") send({ id: message.id, result: {} });
+  else if (message.method === "thread/archive" || message.method === "thread/unarchive" || message.method === "thread/name/set" || message.method === "turn/interrupt") send({ id: message.id, result: {} });
   else if (message.method === "turn/start") {
     const threadId = message.params.threadId;
     const turn = { id: "turn-1", status: "inProgress", items: [] };
@@ -72,6 +72,7 @@ assert.equal(stats.requestStats.reason, "app_server_protocol_has_turn_totals_onl
 
 await client.archiveThread(thread.id);
 await client.unarchiveThread(thread.id);
+await client.setThreadName(thread.id, "-> ToDo (1r / 2q / 0f)");
 await client.resumeThread(thread.id, { cwd: root });
 await client.close();
 
@@ -84,6 +85,10 @@ assert.equal(requests.find((item) => item.method === "thread/start").params.ephe
 assert.equal(requests.filter((item) => item.method === "turn/start").length, 1);
 assert.equal(requests.filter((item) => item.method === "thread/archive").length, 1);
 assert.equal(requests.filter((item) => item.method === "thread/unarchive").length, 1);
+assert.deepEqual(
+  requests.find((item) => item.method === "thread/name/set").params,
+  { threadId: "thread-1", name: "-> ToDo (1r / 2q / 0f)" },
+);
 assert.equal(requests.filter((item) => item.method === "thread/resume").length, 1);
 
 process.stdout.write("todo app-server client test passed\n");

@@ -11,7 +11,7 @@ Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
 2. Render separate `Tasks` and `Workers` sections.
 3. For tasks show ID, status, assigned worker, blockers, and error when present.
 4. For finished attempts, show attempt count, final completion, cumulative human duration, and cumulative total tokens.
-5. For workers show ID, state, PID, and current task.
-6. Include runner state and the dashboard URL when returned.
-7. Include the supervisor's configured status, desired status, required action, and active-task count when returned.
+5. For workers show ID, state, PID, and current task. Report the singleton merge worker and out-of-quota merge-repair worker separately from the configured implementation worker count.
+6. Include runner state, merge worker state, and the dashboard URL when returned.
+7. Include the supervisor's configured status, desired status, required action, persisted `targetThreadId`, computed `threadTitle`, active-task count, and the runner's `supervisorThreadTitle` synchronization state when returned.
 8. Preserve status values exactly as returned.

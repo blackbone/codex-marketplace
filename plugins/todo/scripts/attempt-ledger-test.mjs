@@ -68,6 +68,23 @@ assert.deepEqual(manual.retryStats, {
   deliveryRetries: 0,
 });
 
+const implemented = appendModelAttempt(createAttemptLedger(), {
+  status: "completed",
+  timing,
+  tokenUsage: usage,
+});
+const mergeRepaired = appendModelAttempt(implemented, {
+  trigger: "merge_conflict",
+  status: "completed",
+  timing,
+  tokenUsage: usage,
+});
+assert.equal(mergeRepaired.attempts[1].trigger, "merge_conflict");
+assert.equal(
+  mergeRepaired.attempts[1].retryOf,
+  mergeRepaired.attempts[0].attemptId,
+);
+
 const deliveryFailed = appendDeliveryAttempt(manual, {
   status: "failed_transient",
   errorKind: "network_error",

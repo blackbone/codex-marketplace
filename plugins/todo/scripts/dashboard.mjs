@@ -9,11 +9,15 @@ import {
 } from "node:fs";
 import path from "node:path";
 import {
+  atomicWriteJson,
   listTaskStatuses,
   listWorkerStatuses,
   loadConfig,
   metricRuns,
+  normalizeDashboardThreadId,
   readDaemonState,
+  readJson,
+  taskStatusSummary,
   todoDir,
 } from "./lib.mjs";
 
@@ -47,9 +51,13 @@ const SORT_FIELDS = new Set([
 ]);
 const STATUS_ORDER = new Map([
   ["running", 0],
-  ["blocked", 1],
-  ["completed", 2],
-  ["failed", 3],
+  ["queued", 1],
+  ["merge-queued", 2],
+  ["blocked", 3],
+  ["merge-conflict", 4],
+  ["failed", 5],
+  ["completed", 6],
+  ["rejected", 7],
 ]);
 
 function regularFile(filePath) {
@@ -549,9 +557,13 @@ function dashboardTaskMarkdown(repoRoot, taskId) {
 const DASHBOARD_SCRIPT = `(() => {
   const statusOrder = new Map([
     ["running", 0],
-    ["blocked", 1],
-    ["completed", 2],
-    ["failed", 3],
+    ["queued", 1],
+    ["merge-queued", 2],
+    ["blocked", 3],
+    ["merge-conflict", 4],
+    ["failed", 5],
+    ["completed", 6],
+    ["rejected", 7],
   ]);
   const summary = document.querySelector(".summary");
   const tableBody = document.querySelector("tbody");
@@ -1208,18 +1220,21 @@ const DASHBOARD_SCRIPT = `(() => {
       window.scrollTo(scrollX, scrollY);
     }
 
-    const workerCounts = payload.workers?.counts || {};
+    const taskCounts = payload.taskCounts || {};
     const runnerName = payload.runner?.implementation || "unknown runner";
     const runnerVersion = payload.runner?.pluginVersion || "";
     const runtimeState = payload.runner?.runtimeState || "offline";
+    const mergeState = payload.runner?.mergeWorker?.status || "offline";
     const configReloadSeconds = Math.round(
       (payload.config?.configReloadIntervalMs || 5000) / 1000,
     );
     const summaryText =
       tasks.length + (tasks.length === allTasks.length ? " tasks · " :
         " of " + allTasks.length + " tasks · ") +
-      (workerCounts.busy || 0) + " busy · " +
-      (workerCounts.idle || 0) + " idle · " +
+      (taskCounts.running || 0) + " running · " +
+      (taskCounts.queued || 0) + " queued/blocked · " +
+      (taskCounts.failed || 0) + " failed · " +
+      "merge " + mergeState + " · " +
       runnerName + " " + runnerVersion + " · runtime " + runtimeState +
       " · config " +
       configReloadSeconds + "s · live 1s";
@@ -1522,9 +1537,12 @@ function statusPayload(repoRoot) {
           runtimeUpdate: daemon.runtimeUpdate || null,
           runtimeState: daemonRuntimeState(daemon),
           configReload: daemon.configReload || null,
+          mergeWorker: daemon.mergeWorker || null,
+          mergeRepairWorker: daemon.mergeRepairWorker || null,
         }
       : null,
     tasks,
+    taskCounts: taskStatusSummary(tasks),
     workers: listWorkerStatuses(repoRoot),
   };
 }
@@ -1542,7 +1560,7 @@ function renderDashboard(repoRoot, requestUrl) {
     sort,
     direction,
   );
-  const workerCounts = payload.workers.counts || {};
+  const taskCounts = payload.taskCounts || {};
   const rows = tasks
     .map((task) => {
       const updated = task.updatedAt || task.closedAt || "";
@@ -1601,6 +1619,8 @@ function renderDashboard(repoRoot, requestUrl) {
     .status { font-weight: 700; }
     .filter-token { padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
     .status-running { color: #d97706; }
+    .status-merge-queued { color: #0284c7; }
+    .status-merge-conflict { color: #ea580c; }
     .status-completed { color: #16a34a; }
     .status-rejected { color: #84cc16; }
     .status-failed { color: #dc2626; }
@@ -1635,7 +1655,7 @@ function renderDashboard(repoRoot, requestUrl) {
     <h1>ToDo — ${escapeHtml(path.basename(repoRoot))}</h1>
     <button type="button" data-log-all>All logs</button>
   </div>
-  <p class="summary">${tasks.length}${tasks.length === payload.tasks.length ? "" : ` of ${payload.tasks.length}`} tasks · ${workerCounts.busy || 0} busy · ${workerCounts.idle || 0} idle · ${escapeHtml(payload.runner?.implementation || "unknown runner")} ${escapeHtml(payload.runner?.pluginVersion || "")} · runtime ${escapeHtml(payload.runner?.runtimeState || "offline")} · config ${escapeHtml(Math.round((payload.config.configReloadIntervalMs || 5000) / 1000))}s · live 1s</p>
+  <p class="summary">${tasks.length}${tasks.length === payload.tasks.length ? "" : ` of ${payload.tasks.length}`} tasks · ${taskCounts.running || 0} running · ${taskCounts.queued || 0} queued/blocked · ${taskCounts.failed || 0} failed · merge ${escapeHtml(payload.runner?.mergeWorker?.status || "offline")} · ${escapeHtml(payload.runner?.implementation || "unknown runner")} ${escapeHtml(payload.runner?.pluginVersion || "")} · runtime ${escapeHtml(payload.runner?.runtimeState || "offline")} · config ${escapeHtml(Math.round((payload.config.configReloadIntervalMs || 5000) / 1000))}s · live 1s</p>
   <div class="filters" role="search">
     <label for="task-filter">Filter</label>
     <input id="task-filter" type="search" value="${escapeHtml(filterQuery)}" placeholder="status:completed|rejected" autocomplete="off" spellcheck="false">
@@ -1679,7 +1699,52 @@ function renderDashboard(repoRoot, requestUrl) {
 </html>`;
 }
 
-export function startDashboard(repoRoot, port = 0) {
+function dashboardPortReservationsPath(repoRoot) {
+  return path.join(todoDir(repoRoot), "dashboard-ports.json");
+}
+
+function readDashboardPortReservations(repoRoot) {
+  const file = dashboardPortReservationsPath(repoRoot);
+  if (!existsSync(file)) return [];
+  try {
+    const value = readJson(file);
+    if (!Array.isArray(value.reservations)) return [];
+    return value.reservations.filter(
+      (item) =>
+        normalizeDashboardThreadId(item?.threadId) !== null &&
+        Number.isInteger(item?.port) &&
+        item.port >= 1 &&
+        item.port <= 65535,
+    );
+  } catch {
+    return [];
+  }
+}
+
+function reservedDashboardPort(repoRoot, threadId) {
+  return (
+    readDashboardPortReservations(repoRoot).find(
+      (item) => item.threadId === threadId,
+    )?.port || 0
+  );
+}
+
+function persistDashboardPort(repoRoot, threadId, port) {
+  const reservations = readDashboardPortReservations(repoRoot).filter(
+    (item) => item.threadId !== threadId,
+  );
+  reservations.push({
+    threadId,
+    port,
+    updatedAt: new Date().toISOString(),
+  });
+  atomicWriteJson(dashboardPortReservationsPath(repoRoot), {
+    schemaVersion: 1,
+    reservations,
+  });
+}
+
+function createDashboardServer(repoRoot, port) {
   const server = createServer((request, response) => {
     try {
       if (request.method !== "GET") {
@@ -1802,4 +1867,22 @@ export function startDashboard(repoRoot, port = 0) {
       });
     });
   });
+}
+
+export async function startDashboard(repoRoot, port = 0, threadId = null) {
+  const owner = normalizeDashboardThreadId(threadId);
+  const reservedPort = port === 0 && owner
+    ? reservedDashboardPort(repoRoot, owner)
+    : 0;
+  let dashboard;
+  try {
+    dashboard = await createDashboardServer(repoRoot, reservedPort || port);
+  } catch (error) {
+    if (!reservedPort || error.code !== "EADDRINUSE") throw error;
+    dashboard = await createDashboardServer(repoRoot, 0);
+  }
+  if (port === 0 && owner) {
+    persistDashboardPort(repoRoot, owner, dashboard.port);
+  }
+  return { ...dashboard, threadId: owner };
 }

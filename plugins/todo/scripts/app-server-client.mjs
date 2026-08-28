@@ -169,6 +169,10 @@ export class AppServerClient {
     await this.request("thread/unarchive", { threadId });
   }
 
+  async setThreadName(threadId, name) {
+    await this.request("thread/name/set", { threadId, name });
+  }
+
   async startTurn(params, onMessage) {
     this.threadHandlers.set(params.threadId, onMessage);
     let response;

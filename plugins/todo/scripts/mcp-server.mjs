@@ -167,7 +167,12 @@ const taskInputProperties = {
     maxItems: 64,
     default: [],
   },
-  modelProfile: { type: "string", minLength: 1 },
+  modelProfile: {
+    type: "string",
+    minLength: 1,
+    description:
+      "Lowest configured model tier that can confidently implement, verify, and self-review this atomic task. Model retries advance to the next configured tier.",
+  },
   ephemeral: { type: "boolean", default: false },
   runMode: {
     type: "string",
@@ -178,7 +183,7 @@ const taskInputProperties = {
     type: "string",
     enum: ["keep", "merge", "pr"],
     description:
-      "Git delivery. pr must be explicitly requested; otherwise the repository default is used.",
+      "Git delivery. merge preserves the completed branch and sends it through the singleton local rebase queue; pr must be explicitly requested; otherwise the repository default is used.",
   },
   allowWorkerTaskCreation: { type: "boolean", default: false },
 };
@@ -236,7 +241,7 @@ const tools = [
   {
     name: "task_batch_create",
     description:
-      "Create a fully validated batch only after a current matching preflight receipt; failed validation creates zero runnable tasks.",
+      "Atomically publish a fully validated task DAG after a current matching preflight receipt. Prefer independently implementable and verifiable tasks; failed validation creates zero runnable tasks.",
     inputSchema: {
       type: "object",
       properties: {
@@ -547,6 +552,7 @@ const tools = [
       properties: {
         repoPath: { type: "string" },
         automationId: { type: "string", minLength: 1, maxLength: 200 },
+        targetThreadId: { type: "string", minLength: 1, maxLength: 200 },
         name: { type: "string", minLength: 1, maxLength: 200 },
         prompt: { type: "string", minLength: 1, maxLength: 20000 },
         rrule: { type: "string", minLength: 1, maxLength: 1000 },
@@ -555,6 +561,7 @@ const tools = [
       required: [
         "repoPath",
         "automationId",
+        "targetThreadId",
         "name",
         "prompt",
         "rrule",
@@ -740,6 +747,13 @@ const tools = [
       type: "object",
       properties: {
         repoPath: { type: "string" },
+        dashboardThreadId: {
+          type: "string",
+          minLength: 1,
+          maxLength: 200,
+          description:
+            "Host-confirmed Codex thread that owns the sticky random dashboard port.",
+        },
       },
       required: ["repoPath"],
       additionalProperties: false,
@@ -1010,6 +1024,44 @@ function runnerStatus(repoRoot) {
       daemonRunning || daemonRestartPending
         ? daemon.dashboard?.url || null
         : null,
+    dashboardThreadId:
+      daemonRunning || daemonRestartPending
+        ? daemon.dashboard?.threadId || null
+        : null,
+    mergeWorker:
+      daemonRunning || daemonRestartPending
+        ? daemon.mergeWorker || { status: "idle", taskId: null, taskTitle: null }
+        : { status: "offline", taskId: null, taskTitle: null },
+    mergeRepairWorker:
+      daemonRunning || daemonRestartPending
+        ? daemon.mergeRepairWorker || {
+            status: "idle",
+            pid: null,
+            taskId: null,
+            taskTitle: null,
+          }
+        : {
+            status: "offline",
+            pid: null,
+            taskId: null,
+            taskTitle: null,
+          },
+    supervisorThreadTitle:
+      daemonRunning || daemonRestartPending
+        ? daemon.supervisorThreadTitle || {
+            status: "unbound",
+            threadId: null,
+            title: null,
+            updatedAt: null,
+            error: null,
+          }
+        : {
+            status: "offline",
+            threadId: null,
+            title: null,
+            updatedAt: null,
+            error: null,
+          },
     modelProfiles: appliedConfig?.modelProfiles ?? config.modelProfiles,
     defaultModelProfile:
       appliedConfig?.defaultModelProfile ?? config.defaultModelProfile,
@@ -1073,6 +1125,10 @@ function todoStatus(repoRoot, args = {}) {
       configReloadIntervalMs: runner.configReloadIntervalMs,
       retries: runner.retries,
       dashboardUrl: runner.dashboardUrl,
+      dashboardThreadId: runner.dashboardThreadId,
+      mergeWorker: runner.mergeWorker,
+      mergeRepairWorker: runner.mergeRepairWorker,
+      supervisorThreadTitle: runner.supervisorThreadTitle,
       conflictingDaemon: runner.conflictingDaemon,
       modelProfiles: runner.modelProfiles,
       defaultModelProfile: runner.defaultModelProfile,
@@ -1455,7 +1511,22 @@ async function callTool(name, args = {}) {
     }
     case "worker_list": {
       const repoRoot = activatedRepo(args);
-      return { repoRoot, ...listWorkerStatuses(repoRoot) };
+      const daemon = readDaemonState(repoRoot);
+      return {
+        repoRoot,
+        ...listWorkerStatuses(repoRoot),
+        mergeWorker: daemon?.mergeWorker || {
+          status: daemon ? "idle" : "offline",
+          taskId: null,
+          taskTitle: null,
+        },
+        mergeRepairWorker: daemon?.mergeRepairWorker || {
+          status: daemon ? "idle" : "offline",
+          pid: null,
+          taskId: null,
+          taskTitle: null,
+        },
+      };
     }
     case "todo_status":
       return todoStatus(resolveRepo(args), args);
@@ -1479,12 +1550,22 @@ async function callTool(name, args = {}) {
     }
     case "task_run_start":
       return startInteractiveTask(activatedRepo(args), args.id);
-    case "task_run_finish":
-      return finishInteractiveTask(
-        activatedRepo(args),
-        args.id,
-        args,
-      );
+    case "task_run_finish": {
+      const repoRoot = activatedRepo(args);
+      try {
+        const receipt = await finishInteractiveTask(repoRoot, args.id, args);
+        if (receipt.codexThread?.state === "archive-pending") {
+          ensureDaemon(repoRoot);
+        }
+        return receipt;
+      } catch (error) {
+        const task = getTaskStatus(repoRoot, args.id);
+        if (task.codexThread?.state === "archive-pending") {
+          ensureDaemon(repoRoot);
+        }
+        throw error;
+      }
+    }
     case "task_cancel": {
       const repoRoot = activatedRepo(args);
       const receipt = await cancelTask(repoRoot, args.id);
@@ -1497,7 +1578,9 @@ async function callTool(name, args = {}) {
       return runnerStatus(resolveRepo(args));
     case "runner_start": {
       const repoRoot = activatedRepo(args);
-      return ensureDaemon(repoRoot);
+      return ensureDaemon(repoRoot, {
+        dashboardThreadId: args.dashboardThreadId || null,
+      });
     }
     case "runner_stop":
       return stopRunner(activatedRepo(args), args.force === true);
@@ -1525,7 +1608,7 @@ async function handle(message) {
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: "todo", version: pluginVersion },
       instructions:
-        "In repositories containing .todo/config.json, route every mutation through $todo:route even when the user does not mention ToDo: create it with task_create before changing repository state and leave it queued for codex exec by default. Interactive execution is allowed only when the user explicitly requests it, or after a background attempt reports that it cannot proceed without a current-thread-only capability. Task IDs use an unbounded monotonic numeric sequence and continue past 999. A claimed background worker must implement directly and cannot create follow-up tasks unless its parent task records allowWorkerTaskCreation from an explicit user instruction. Authorized follow-up tasks automatically depend on the parent and cannot propagate that permission. Read-only work stays inline. Use repo_init to activate durable routing. Never edit .todo task files directly.",
+        "In repositories containing .todo/config.json, route every mutation through $todo:route even when the user does not mention ToDo. Decompose lists and broad changes into independently implementable and verifiable tasks, batching only edits to the same files in one logical scope, select the lowest adequate configured model tier, and publish the complete dependency DAG with one task_batch_create before changing repository state. Model retries advance one configured tier. merge delivery preserves completed branches for the singleton local rebase queue and returns textual conflicts to the original persistent task thread. Interactive execution is allowed only when the user explicitly requests it, or after a background attempt reports that it cannot proceed without a current-thread-only capability. A claimed background worker must implement directly and cannot create follow-up tasks unless its parent records explicit user authorization. Read-only work stays inline. Use repo_init to activate durable routing. Never edit .todo task files directly.",
     });
   }
   if (message.method === "ping") return success(message.id, {});

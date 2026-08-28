@@ -1,9 +1,10 @@
 # ToDo
 
-ToDo gives Codex a durable, repository-local task queue with Ponytail full task
-formation and execution, connector and Git preflight, atomic publication,
-isolated worktree delivery, persistent per-task Codex threads, configurable
-background workers, per-attempt retry and usage telemetry, and a live dashboard.
+ToDo gives Codex a durable, repository-local task queue with automatic atomic
+decomposition, Ponytail full task formation and execution, connector and Git
+preflight, atomic DAG publication, isolated worktree delivery, persistent
+per-task Codex threads, tier-escalating retries, a local rebase merge queue,
+per-attempt telemetry, and a live dashboard.
 
 | Plugin details | Local dashboard |
 | --- | --- |
@@ -34,6 +35,13 @@ In an activated repository, `$todo:route` applies to repository mutations even
 when ToDo is not mentioned explicitly. Read-only analysis, planning, status, and
 inspection stay in the current thread.
 
+Routing always prefers independently implementable and independently verifiable
+tasks over one broad change. Lists, separate owners, runtime layers, migrations,
+and validation surfaces are split into an atomic dependency DAG. Changes are
+batched only when they touch the same files in one logical scope and splitting
+would create artificial conflicts or an invalid intermediate state, such as one
+surface's related layout and style edits.
+
 Before any task is created, the interactive agent makes one minimal ping or
 fetch through every connector the task will need. It passes only normalized
 connector, scope, access, and outcome reports to `task_preflight`; credentials
@@ -48,7 +56,9 @@ including a one-task batch, behind a publication lock. A failed preflight,
 expired or mismatched receipt, missing required capability, or failed publication
 creates zero runnable tasks.
 
-Tasks run in background workers by default. Choose interactive execution only
+Each atomic task uses the lowest configured model tier that can confidently
+implement, test or otherwise verify, and self-review it. Every model retry moves
+to the next configured tier when one exists. Tasks run in background workers by default. Choose interactive execution only
 when requested or when a worker records a concrete current-thread-only capability
 requirement. A claim token prevents background and interactive execution of the
 same task at the same time.
@@ -134,12 +144,26 @@ Invoke `$todo:start` in the project chat that should own recovery. In addition
 to starting the runner, every invocation replaces any previously bound
 heartbeat with one 15-minute heartbeat owned by the current chat. An empty
 queue creates it paused; active work creates it active. The host automation ID
-and non-secret definition are stored in ignored `.todo/supervisor.json` only
-after the host confirms creation. `$todo:supervise` can also configure or
+and non-secret definition, including the host-confirmed `targetThreadId`, are
+stored in ignored `.todo/supervisor.json` only after the host confirms
+creation. Every later pause or resume passes that exact target explicitly, so
+task creation in another chat cannot take ownership. Legacy bindings without a
+target require `$todo:start` in the intended owner chat instead of guessing.
+`$todo:supervise` can also configure or
 synchronize the heartbeat directly. Scheduled runs leave healthy work alone.
 For a failed task, the supervisor claims the original task and delegates
 bounded diagnosis or repair to one subagent inside that existing task worktree
 without creating a helper ToDo task.
+
+While the runner is active, its shared Codex app-server connection keeps the
+bound supervisor thread named `-> ToDo (Nr / Mq / Sf)`. `r` counts running
+tasks, `q` combines queued, blocked, staging, merge-queued, and merge-conflict
+tasks, and `f` counts failed tasks. The daemon synchronizes before and after
+each scheduling pass, sends `thread/name/set` only when the target or title
+changes, and needs no model turn or worker slot. Rename failures are non-fatal,
+visible in runner state and logs, and retried with a short backoff. Without a
+persisted `targetThreadId`, title synchronization stays unbound until
+`$todo:start` rebinds the owner thread.
 
 The host scheduler exposes recurring active and paused states, not a repository
 event trigger. The heartbeat therefore makes one final run to observe that the
@@ -154,11 +178,19 @@ Supervisor automation requires the Codex desktop host. Core queue execution and
 transient retry remain independent of it, and a failure to resume the heartbeat
 is reported separately from successful task publication.
 
-After startup status resolves the current dynamic dashboard URL, `$todo:start`
-opens that exact URL in a new in-app Browser tab. It does not guess a port,
-reuse a URL from an earlier runner session, substitute Chrome, or inspect the
-dashboard unless requested. Browser opening, runner startup, and supervisor
-binding are reported as separate outcomes.
+App-server worker threads are archived after every attempt. Interactive recovery
+marks any retained background worker thread `archive-pending` before closing or
+failing the claim, and the daemon reconciles every non-archived closed receipt,
+including legacy receipts incorrectly left `active`.
+
+`$todo:start` resolves and persists the host-confirmed owner thread before
+starting the dashboard. In the default random-port mode, the successfully bound
+port is saved per thread under ignored `.todo` state and reused on later starts.
+If that port is occupied, the daemon binds and saves a new free port. Fresh
+startup status then supplies the exact URL that `$todo:start` opens again in a
+new in-app Browser tab. It does not guess a port, reuse stale status, substitute
+Chrome, or inspect the dashboard unless requested. Browser opening, runner
+startup, and supervisor binding are reported as separate outcomes.
 
 ## Git execution
 
@@ -173,13 +205,34 @@ Delivery is selected per task, with the repository default used when omitted:
 | Mode | Result |
 | --- | --- |
 | `keep` | Remove the clean worktree and keep the committed task branch; remove a no-change branch. |
-| `merge` | Fast-forward the target when possible; otherwise cherry-pick the task commit. The runner creates no merge commit, then removes the task worktree and branch. |
+| `merge` | Commit and preserve the branch like `keep`, enqueue it for the singleton local merge worker, rebase it onto the latest target, then fast-forward and remove the task branch. |
 | `pr` | Push the branch and create a pull request with `gh`; this mode must be explicitly requested. |
 
 The preflight checks the exact requested mode, including a clean checked-out
 merge target or GitHub remote and authentication for a pull request. A Git
 failure preserves recoverable state. Delivery is recorded separately and can be
 retried without rerunning the completed model attempt.
+
+### Local merge queue
+
+`merge` implementation workers stop after validation, self-review, and the task
+commit. The task then becomes `merge-queued`, its clean worktree is removed, and
+its branch is retained. One daemon-owned merge worker, outside the configured
+implementation-worker quota, rebases each queued branch onto the current target
+and fast-forwards the target, so merge commits and stale-base cherry-picks are
+not created. When multiple same-target `merge` tasks were published in one batch,
+later siblings wait until every earlier sibling leaves the runnable merge
+lifecycle, so faster model completion cannot invert the intended Git order.
+
+A textual rebase conflict moves the task to `merge-conflict` without blocking
+other queued branches. ToDo unarchives the task's original persistent Codex
+thread, raises it by one configured model tier, and starts one out-of-quota
+merge-repair turn in the paused rebase worktree. The repair must preserve both
+the task functionality and newer target contracts, run focused verification,
+and leave Git continuation to the runner. A successful repair re-enters the
+queue and must pass a fresh rebase before fast-forward. A reported logical
+conflict becomes `merge_logical_conflict`, leaves the queue, and retains its
+recoverable branch and error evidence.
 
 ## Configuration
 
@@ -230,9 +283,14 @@ The default `.todo/config.json` is:
 }
 ```
 
-`workers` accepts 1–32. Poll and reload intervals accept 250–60000 ms.
-`dashboardPort: 0` selects a free local port. `retries` is a non-negative integer
-or `-1` for unlimited retries. `executionBackend` defaults to `app-server`;
+`workers` accepts 1–32. Poll and reload intervals accept 250–60000 ms. The
+`models` array is ordered from the lowest to the highest tier; task formation
+selects the lowest adequate entry and each model retry advances by one entry,
+staying on the final entry after the highest tier is reached.
+`dashboardPort: 0` selects a free local port and keeps the successful port for
+each host-confirmed Codex thread. An occupied reservation is atomically replaced
+after a new listener succeeds. `retries` is a non-negative integer or `-1` for
+unlimited retries. `executionBackend` defaults to `app-server`;
 `exec` is retained as an explicit legacy fallback. `git.delivery` accepts
 `keep` or `merge`; pull
 requests are an explicit per-task choice. `git.targetBranch: null` resolves to the
@@ -247,14 +305,16 @@ snapshotted backend and model profile.
 
 ## Dashboard and records
 
-The dashboard shows tasks separately from worker state, including dependencies,
-model and delivery retries, timing, attempt-local token usage, coverage, errors,
-and links to logs. It patches keyed rows and cells in place and appends log text,
+The dashboard shows tasks separately from worker state, including the singleton
+merge worker, merge-queue and merge-conflict states, dependencies, model and
+delivery retries, timing, attempt-local token usage, coverage, errors, and links
+to logs. It patches keyed rows and cells in place and appends log text,
 so polling does not rebuild unchanged completed tasks or disrupt text selection,
-scroll positions, filters, or controls. Its URL and port are ephemeral; query
-`$todo:dashboard` or `$todo:status` instead of bookmarking one. Prompts, readable
-transcripts, worker JSONL event logs, results, and metrics remain in `.todo/` for
-audit and debugging.
+scroll positions, filters, or controls. The default random port is sticky within
+its owning Codex thread, but can change after a collision; query
+`$todo:dashboard` or `$todo:status` for current status instead of relying on a
+stale URL. Prompts, readable transcripts, worker JSONL event logs, results, and
+metrics remain in `.todo/` for audit and debugging.
 
 Dependency IDs link to their task Markdown when the referenced task is available.
 Canceled lifecycle records are labeled `rejected` in the dashboard. Field filters
@@ -307,6 +367,10 @@ or invalid configuration reports `update-blocked` instead of interrupting work.
   queue before it can pause; it performs no recurring runs after that pause.
 - `$todo:start` cannot move supervision to its current chat if deletion of the
   previously bound host heartbeat fails; runner startup is reported separately.
+- Existing supervisor bindings created before `targetThreadId` persistence must
+  be rebound once with `$todo:start`; lifecycle actions refuse to guess a chat.
+- The runner leaves the last synchronized `-> ToDo (...)` title in place after
+  it stops; it cannot publish later task-state changes while it is offline.
 - Opening the dashboard from `$todo:start` requires the bundled in-app Browser;
   Browser failure does not roll back an otherwise successful runner start.
 - Archiving a Codex thread hides it from the active thread list but does not
@@ -319,6 +383,9 @@ or invalid configuration reports `update-blocked` instead of interrupting work.
   filesystem and process permissions.
 - Worker-created follow-up tasks require explicit user authorization on the
   claimed parent; audits, findings, or complexity never imply that permission.
+- Merge-conflict repair reuses the original persistent app-server thread when it
+  exists. With the legacy `exec` backend, the runner falls back to a one-shot
+  repair turn in the paused rebase worktree instead of inventing a new thread.
 - A running daemon or queued task does not prove that implementation succeeded;
   inspect the task result and validation receipt.
 
