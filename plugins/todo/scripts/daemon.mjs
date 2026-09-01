@@ -66,6 +66,7 @@ import {
 } from "./execution-stats.mjs";
 import { AppServerClient } from "./app-server-client.mjs";
 import { classifyFailure } from "./attempt-ledger.mjs";
+import { loadPipelineSnapshot, runPipeline } from "./pipeline.mjs";
 import { TODO_PONYTAIL_FULL_CONTOUR } from "./ponytail-policy.mjs";
 import {
   daemonRestartDecision,
@@ -76,6 +77,10 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(scriptDir, "..");
 const ownRuntime = runtimeDescriptor(pluginRoot);
 const resultSchema = path.join(scriptDir, "result.schema.json");
+const pipelineResultSchema = path.join(
+  scriptDir,
+  "pipeline-result.schema.json",
+);
 const repoIndex = process.argv.indexOf("--repo");
 const repoRoot =
   repoIndex >= 0 && process.argv[repoIndex + 1]
@@ -271,6 +276,7 @@ const RUNTIME_CONFIG_KEYS = [
   "defaultModelProfile",
   "routingMode",
   "git",
+  "pipeline",
 ];
 
 function changedConfigKeys(previous, next) {
@@ -452,6 +458,58 @@ function parseResult(resultFile) {
   return result;
 }
 
+function parsePipelineStepResult(resultFile) {
+  const result = JSON.parse(readFileSync(resultFile, "utf8"));
+  if (
+    !result ||
+    (result.status !== "completed" && result.status !== "failed") ||
+    typeof result.summary !== "string" ||
+    !result.summary.trim() ||
+    !Array.isArray(result.validation) ||
+    result.validation.some(
+      (item) => typeof item !== "string" || !item.trim(),
+    ) ||
+    typeof result.requiresInteractive !== "boolean" ||
+    (result.requiresInteractive &&
+      (result.status !== "failed" ||
+        typeof result.interactiveReason !== "string" ||
+        !result.interactiveReason.trim())) ||
+    (!result.requiresInteractive && result.interactiveReason !== null)
+  ) {
+    throw new Error("Codex returned an invalid pipeline step result");
+  }
+  return result;
+}
+
+function combinedTokenUsage(records) {
+  const available = records.filter((record) => record?.available);
+  if (available.length === 0) return emptyTokenUsage();
+  const keys = [
+    "inputTokens",
+    "cachedInputTokens",
+    "uncachedInputTokens",
+    "cacheWriteInputTokens",
+    "outputTokens",
+    "reasoningOutputTokens",
+    "visibleOutputTokens",
+    "totalTokens",
+  ];
+  const usage = {
+    available: true,
+    coverage: available.every((record) => record.coverage === "full")
+      ? "full"
+      : "partial",
+    turns: available.reduce((total, record) => total + (record.turns || 0), 0),
+  };
+  for (const key of keys) {
+    usage[key] = available.reduce(
+      (total, record) => total + (Number(record[key]) || 0),
+      0,
+    );
+  }
+  return usage;
+}
+
 function buildPrompt(task, worktreePath) {
   const taskCreationInstructions =
     task.metadata.allowWorkerTaskCreation === true
@@ -500,6 +558,83 @@ function buildAppServerPrompt(task, worktreePath, claim) {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function buildPipelineStepPrompt(
+  task,
+  worktreePath,
+  step,
+  context,
+  { continueThread = false } = {},
+) {
+  const previousSummaries = context.executions
+    .filter(
+      (execution) =>
+        execution.status === "completed" &&
+        typeof execution.summary === "string" &&
+        execution.summary.trim(),
+    )
+    .slice(-6)
+    .map((execution) => `- ${execution.stepId}: ${execution.summary.trim()}`);
+  const failure = context.failure;
+  const failurePayload = failure
+    ? JSON.stringify(
+        {
+          step: failure.step.id,
+          type: failure.step.type,
+          round: context.repairRound,
+          summary: failure.result.summary,
+          error: failure.result.error || null,
+          receipt: failure.result.receipt || null,
+        },
+        null,
+        2,
+      ).slice(0, 16000)
+    : null;
+  const stage = [
+    `Pipeline step: ${step.id} (${step.type}).`,
+    step.prompt,
+    previousSummaries.length > 0
+      ? `Previously completed pipeline steps:\n${previousSummaries.join("\n")}`
+      : null,
+    failurePayload
+      ? `The deterministic pipeline step failed. Repair the worktree so the step passes. Do not lower quality thresholds, disable checks, or remove meaningful tests unless the task explicitly requires it.\n\nFailure receipt:\n${failurePayload}`
+      : null,
+    "The runner executes the configured shell gates authoritatively after agent steps. Do not proactively rerun those full commands inside this Codex step; use only a narrower diagnostic command when it is necessary to implement or repair the change.",
+    "Do not run Git mutation or delivery commands; the ToDo runner owns Git finalization.",
+    "Return only the JSON object required by the pipeline step output schema. Validation may be empty because the runner executes authoritative shell gates.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  if (continueThread) {
+    return [
+      `Continue ToDo task ${task.id} in its existing Codex thread.`,
+      `The current task worktree is ${worktreePath}.`,
+      "Reuse the requirements and repository findings already present in this thread.",
+      stage,
+    ].join("\n\n");
+  }
+  const taskCreationInstructions =
+    task.metadata.allowWorkerTaskCreation === true
+      ? "The task records explicit user authorization for follow-up ToDo tasks; use it only within the task's stated scope."
+      : "Do not create follow-up ToDo tasks and do not call ToDo MCP tools.";
+  return [
+    `You are a ToDo pipeline worker in the task worktree ${worktreePath}.`,
+    "Implement only the claimed task directly and preserve unrelated changes.",
+    taskCreationInstructions,
+    "Read AGENTS.md and applicable nested AGENTS.md files before editing.",
+    "Do not edit or delete .todo runtime files.",
+    "Do not ask for user input. If current-thread-only interaction is required, return a failed result with requiresInteractive=true and one concrete interactiveReason.",
+    "For all other results set requiresInteractive=false and interactiveReason=null.",
+    "",
+    TODO_PONYTAIL_FULL_CONTOUR,
+    "",
+    `Task ID: ${task.id}`,
+    "",
+    task.body,
+    "",
+    stage,
+  ].join("\n");
 }
 
 function buildMergeConflictPrompt(task, worktreePath, claim) {
@@ -1788,8 +1923,713 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
   }
 }
 
+async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
+  const task = readTask(taskPath);
+  if (
+    ["model-completed", "committing", "committed", "delivered"].includes(
+      task.metadata.git?.phase,
+    )
+  ) {
+    await executeDeliveryOnly(taskPath, claim, workerId, config);
+    return;
+  }
+  const previousMetrics = task.metadata.metrics || null;
+  let pipeline;
+  let preparedGit;
+  try {
+    pipeline = loadPipelineSnapshot(repoRoot, task.metadata.pipeline);
+    preparedGit = await prepareTaskGit(repoRoot, taskPath);
+  } catch (error) {
+    setTaskError(
+      taskPath,
+      error.message.includes("pipeline") ? "pipeline_config" : error.kind || "git_prepare",
+      null,
+      error.message,
+      previousMetrics,
+    );
+    releaseClaim(claim);
+    active.delete(task.id);
+    log("task_pre_model_failure", {
+      task: task.id,
+      kind: error.message.includes("pipeline")
+        ? "pipeline_config"
+        : error.kind || "git_prepare",
+      error: error.message,
+    });
+    writeState();
+    return;
+  }
+
+  beginModelAttempt(taskPath, claim);
+  const attemptDir = path.join(
+    todoDir(repoRoot),
+    "logs",
+    task.id,
+    `attempt-${String(claim.attempt || 1).padStart(3, "0")}-${claim.attemptId}`,
+  );
+  mkdirSync(attemptDir, { recursive: true });
+  const usagePath = path.join(attemptDir, "usage.json");
+  const pipelineRunPath = path.join(attemptDir, "pipeline.json");
+  const startedAt = Number.isFinite(Date.parse(claim.claimedAt))
+    ? Date.parse(claim.claimedAt)
+    : Date.now();
+  const baseExecution =
+    task.metadata.execution || resolveTaskExecution(config, {});
+  const outputSchema = JSON.parse(readFileSync(pipelineResultSchema, "utf8"));
+  const stepStats = [];
+  let stepSequence = 0;
+  let threadTurns = 0;
+  let threadId = null;
+  let turnId = null;
+  let metrics = null;
+  let pipelineResult = null;
+  let runError = null;
+
+  const stepDirectory = (step, context) => {
+    stepSequence += 1;
+    const suffix = context.mode === "repair" ? `repair-${context.repairRound}` : "run";
+    const directory = path.join(
+      attemptDir,
+      "pipeline",
+      `${String(stepSequence).padStart(3, "0")}-${step.id}-${suffix}`,
+    );
+    mkdirSync(directory, { recursive: true });
+    return directory;
+  };
+
+  const stepExecution = (step, backend) => {
+    if (step.modelProfile && step.model && step.reasoningEffort) {
+      return {
+        backend,
+        modelProfile: step.modelProfile,
+        model: step.model,
+        reasoningEffort: step.reasoningEffort,
+        ephemeral: baseExecution.ephemeral,
+        mode: "background",
+      };
+    }
+    return {
+      ...baseExecution,
+      backend,
+      mode: "background",
+    };
+  };
+
+  const runExecStep = async (step, context) => {
+    const execution = stepExecution(step, "exec");
+    const directory = stepDirectory(step, context);
+    const stdoutPath = path.join(directory, "stdout.log");
+    const stderrPath = path.join(directory, "stderr.log");
+    const resultPath = path.join(directory, "result.json");
+    const promptPath = path.join(directory, "prompt.txt");
+    const receiptPath = path.join(directory, "receipt.json");
+    const prompt = buildPipelineStepPrompt(
+      readTask(taskPath),
+      preparedGit.worktreePath,
+      step,
+      context,
+    );
+    writeFileSync(promptPath, `${prompt}\n`, "utf8");
+    const stdoutFd = openSync(stdoutPath, "a");
+    const stderrFd = openSync(stderrPath, "a");
+    const args = [
+      "exec",
+      ...(execution.ephemeral ? ["--ephemeral"] : []),
+      "--model",
+      execution.model,
+      "-c",
+      `model_reasoning_effort=${JSON.stringify(execution.reasoningEffort)}`,
+      "--sandbox",
+      config.codexSandbox,
+      "-c",
+      'approval_policy="never"',
+      "-C",
+      preparedGit.worktreePath,
+      "--color",
+      "never",
+      "--json",
+      "--output-schema",
+      pipelineResultSchema,
+      "--output-last-message",
+      resultPath,
+      "-",
+    ];
+    log("pipeline_step_start", {
+      task: task.id,
+      step: step.id,
+      type: step.type,
+      repairRound: context.repairRound,
+      modelProfile: execution.modelProfile,
+    });
+    let child;
+    let spawnError = null;
+    let exitCode = null;
+    try {
+      child = spawn(config.codexCommand, args, {
+        cwd: preparedGit.worktreePath,
+        env: {
+          ...process.env,
+          TODO_RUNNER_WORKER: "1",
+          TODO_RUNNER_REPO_ROOT: repoRoot,
+          TODO_RUNNER_TASK_FILE: taskPath,
+        },
+        stdio: ["pipe", stdoutFd, stderrFd],
+      });
+      const entry = active.get(task.id);
+      if (entry) entry.child = child;
+      child.stdin.end(prompt);
+      exitCode = await new Promise((resolve) => {
+        child.once("error", (error) => {
+          spawnError = error;
+          resolve(null);
+        });
+        child.once("close", (code) => resolve(code));
+      });
+    } finally {
+      closeSync(stdoutFd);
+      closeSync(stderrFd);
+      const entry = active.get(task.id);
+      if (entry?.child === child) entry.child = null;
+    }
+    const stats = parseExecutionStats(
+      existsSync(stdoutPath) ? readFileSync(stdoutPath, "utf8") : "",
+    );
+    stepStats.push({ stepId: step.id, type: step.type, execution, stats });
+    if (spawnError || exitCode !== 0) {
+      const detail = readLogTail(stderrPath) || readLogTail(stdoutPath);
+      const error = new Error(
+        spawnError?.message || detail || `codex exec exited with code ${exitCode}`,
+      );
+      error.kind = spawnError ? "codex_spawn" : "codex_exec";
+      error.code = exitCode;
+      throw error;
+    }
+    let result;
+    try {
+      result = parsePipelineStepResult(resultPath);
+    } catch (error) {
+      error.kind = "invalid_result";
+      throw error;
+    }
+    const receipt = {
+      status: result.status,
+      summary: result.summary,
+      modelProfile: execution.modelProfile,
+      resultPath: path.relative(repoRoot, resultPath),
+      stdoutPath: path.relative(repoRoot, stdoutPath),
+      stderrPath: path.relative(repoRoot, stderrPath),
+    };
+    atomicWriteJson(receiptPath, receipt);
+    log("pipeline_step_end", {
+      task: task.id,
+      step: step.id,
+      type: step.type,
+      status: result.status,
+      repairRound: context.repairRound,
+    });
+    return { ...result, receipt };
+  };
+
+  const runThreadStep = async (step, context) => {
+    const execution = stepExecution(step, "app-server");
+    const directory = stepDirectory(step, context);
+    const stdoutPath = path.join(directory, "stdout.log");
+    const stderrPath = path.join(directory, "stderr.log");
+    const resultPath = path.join(directory, "result.json");
+    const promptPath = path.join(directory, "prompt.txt");
+    const receiptPath = path.join(directory, "receipt.json");
+    const prompt = buildPipelineStepPrompt(
+      readTask(taskPath),
+      preparedGit.worktreePath,
+      step,
+      context,
+      { continueThread: threadTurns > 0 },
+    );
+    writeFileSync(promptPath, `${prompt}\n`, "utf8");
+    const thread = await loadTaskThread(
+      taskPath,
+      execution,
+      preparedGit.worktreePath,
+      config,
+    );
+    threadId = thread.id;
+    const client = await ensureAppServer(config);
+    const entry = active.get(task.id);
+    if (entry) entry.threadId = threadId;
+    let finalMessage = null;
+    log("pipeline_step_start", {
+      task: task.id,
+      step: step.id,
+      type: step.type,
+      repairRound: context.repairRound,
+      modelProfile: execution.modelProfile,
+      threadId,
+    });
+    try {
+      turnId = await client.startTurn(
+        {
+          threadId,
+          input: [{ type: "text", text: prompt }],
+          cwd: preparedGit.worktreePath,
+          model: execution.model,
+          effort: execution.reasoningEffort,
+          approvalPolicy: "never",
+          outputSchema,
+        },
+        (message, line) => {
+          appendFileSync(stdoutPath, `${line}\n`, "utf8");
+          const item = message.params?.item;
+          if (
+            message.method === "item/completed" &&
+            item?.type === "agentMessage" &&
+            typeof item.text === "string"
+          ) {
+            finalMessage = item.text;
+          }
+        },
+      );
+      updateTaskCodexThread(taskPath, { state: "active", lastTurnId: turnId });
+      if (entry) entry.turnId = turnId;
+      const turn = await client.waitForTurn(threadId, turnId);
+      if (turn.status !== "completed") {
+        const error = new Error(
+          turn.error?.message || `Codex turn ended with status ${turn.status}`,
+        );
+        error.kind = turn.status === "interrupted" ? "interrupted" : "app_server";
+        throw error;
+      }
+      if (!finalMessage) {
+        const item = [...(turn.items || [])]
+          .reverse()
+          .find((candidate) => candidate?.type === "agentMessage");
+        finalMessage = item?.text || null;
+      }
+      if (!finalMessage) throw new Error("Codex app-server returned no pipeline result");
+      writeFileSync(resultPath, finalMessage, "utf8");
+    } catch (error) {
+      appendFileSync(stderrPath, `${error.stack || error.message}\n`, "utf8");
+      throw error;
+    } finally {
+      threadTurns += 1;
+    }
+    const stats = parseAppServerExecutionStats(
+      existsSync(stdoutPath) ? readFileSync(stdoutPath, "utf8") : "",
+      turnId,
+    );
+    stats.threadId = threadId;
+    stepStats.push({ stepId: step.id, type: step.type, execution, stats });
+    let result;
+    try {
+      result = parsePipelineStepResult(resultPath);
+    } catch (error) {
+      error.kind = "invalid_result";
+      throw error;
+    }
+    const receipt = {
+      status: result.status,
+      summary: result.summary,
+      modelProfile: execution.modelProfile,
+      threadId,
+      turnId,
+      resultPath: path.relative(repoRoot, resultPath),
+      stdoutPath: path.relative(repoRoot, stdoutPath),
+      stderrPath: path.relative(repoRoot, stderrPath),
+    };
+    atomicWriteJson(receiptPath, receipt);
+    log("pipeline_step_end", {
+      task: task.id,
+      step: step.id,
+      type: step.type,
+      status: result.status,
+      repairRound: context.repairRound,
+      threadId,
+      turnId,
+    });
+    return { ...result, receipt };
+  };
+
+  const runShellStep = async (step, context) => {
+    const directory = stepDirectory(step, { ...context, mode: "shell" });
+    const stdoutPath = path.join(directory, "stdout.log");
+    const stderrPath = path.join(directory, "stderr.log");
+    const receiptPath = path.join(directory, "receipt.json");
+    const cwd = path.resolve(preparedGit.worktreePath, step.cwd);
+    const stdoutFd = openSync(stdoutPath, "a");
+    const stderrFd = openSync(stderrPath, "a");
+    const shellStartedAt = Date.now();
+    let child;
+    let spawnError = null;
+    let exitCode = null;
+    let signal = null;
+    let timedOut = false;
+    log("pipeline_step_start", {
+      task: task.id,
+      step: step.id,
+      type: step.type,
+      repairRound: context.repairRound,
+      command: step.command,
+      cwd: step.cwd,
+    });
+    try {
+      child = spawn(step.command, {
+        cwd,
+        env: {
+          ...process.env,
+          TODO_RUNNER_WORKER: "1",
+          TODO_RUNNER_REPO_ROOT: repoRoot,
+          TODO_RUNNER_TASK_FILE: taskPath,
+        },
+        shell: true,
+        stdio: ["ignore", stdoutFd, stderrFd],
+      });
+      const entry = active.get(task.id);
+      if (entry) entry.child = child;
+      let forceKill = null;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGTERM");
+          forceKill = setTimeout(() => {
+            if (child.exitCode === null && child.signalCode === null) {
+              child.kill("SIGKILL");
+            }
+          }, 2000);
+        }
+      }, step.timeoutSeconds * 1000);
+      ({ exitCode, signal } = await new Promise((resolve) => {
+        child.once("error", (error) => {
+          spawnError = error;
+          resolve({ exitCode: null, signal: null });
+        });
+        child.once("close", (code, closedSignal) =>
+          resolve({ exitCode: code, signal: closedSignal }),
+        );
+      }));
+      clearTimeout(timeout);
+      if (forceKill) clearTimeout(forceKill);
+    } finally {
+      closeSync(stdoutFd);
+      closeSync(stderrFd);
+      const entry = active.get(task.id);
+      if (entry?.child === child) entry.child = null;
+    }
+    const passed = !spawnError && !timedOut && exitCode === 0;
+    const receipt = {
+      status: passed ? "completed" : "failed",
+      command: step.command,
+      cwd: step.cwd,
+      exitCode,
+      signal,
+      timedOut,
+      durationMs: Date.now() - shellStartedAt,
+      stdoutPath: path.relative(repoRoot, stdoutPath),
+      stderrPath: path.relative(repoRoot, stderrPath),
+      stdoutTail: readLogTail(stdoutPath, 6000),
+      stderrTail: readLogTail(stderrPath, 6000),
+    };
+    atomicWriteJson(receiptPath, receipt);
+    log("pipeline_step_end", {
+      task: task.id,
+      step: step.id,
+      type: step.type,
+      status: receipt.status,
+      repairRound: context.repairRound,
+      exitCode,
+      signal,
+      timedOut,
+    });
+    const error = passed
+      ? null
+      : spawnError?.message ||
+        (timedOut
+          ? `timed out after ${step.timeoutSeconds}s`
+          : receipt.stderrTail || receipt.stdoutTail || `exit code ${exitCode}`);
+    return {
+      status: receipt.status,
+      summary: passed
+        ? `${step.id} passed: ${step.command}`
+        : `${step.id} failed: ${error}`,
+      error,
+      validation: passed ? [`${step.id}: ${step.command}`] : [],
+      requiresInteractive: false,
+      interactiveReason: null,
+      receipt,
+    };
+  };
+
+  log("task_start", {
+    task: task.id,
+    worker: workerId,
+    backend: "pipeline",
+    pipeline: pipeline.source,
+    pipelineDigest: pipeline.digest,
+    attempt: claim.attempt,
+    attemptId: claim.attemptId,
+    worktreePath: preparedGit.worktreePath,
+  });
+  atomicWriteJson(usagePath, {
+    schemaVersion: 2,
+    taskId: task.id,
+    attempt: claim.attempt,
+    attemptId: claim.attemptId,
+    status: "running",
+    startedAt: new Date(startedAt).toISOString(),
+    completedAt: null,
+    durationMs: 0,
+    modelProfile: baseExecution.modelProfile,
+    model: baseExecution.model,
+    reasoningEffort: baseExecution.reasoningEffort,
+    threadId: null,
+    source: "ToDo repository pipeline",
+    tokenUsage: emptyTokenUsage(),
+    observable: { pipeline: { source: pipeline.source, digest: pipeline.digest } },
+    requestStats: {
+      available: false,
+      coverage: "none",
+      requests: [],
+      transportRetries: 0,
+      reason: "pipeline_running",
+    },
+  });
+
+  try {
+    pipelineResult = await runPipeline(pipeline, {
+      runCodex: (step, context) =>
+        step.type === "codex-exec"
+          ? runExecStep(step, context)
+          : runThreadStep(step, context),
+      runShell: runShellStep,
+      onState: async (state) => {
+        atomicWriteJson(pipelineRunPath, {
+          schemaVersion: 1,
+          taskId: task.id,
+          attemptId: claim.attemptId,
+          pipeline: {
+            source: pipeline.source,
+            digest: pipeline.digest,
+            name: pipeline.name,
+          },
+          updatedAt: new Date().toISOString(),
+          ...state,
+        });
+      },
+    });
+  } catch (error) {
+    runError = error;
+  }
+
+  const executionStats = {
+    threadId,
+    tokenUsage: combinedTokenUsage(stepStats.map((entry) => entry.stats.tokenUsage)),
+    observable: {
+      pipeline: {
+        source: pipeline.source,
+        digest: pipeline.digest,
+        steps: stepStats.map((entry) => ({
+          id: entry.stepId,
+          type: entry.type,
+          modelProfile: entry.execution.modelProfile,
+        })),
+      },
+    },
+    requestStats: {
+      available: false,
+      coverage: "none",
+      requests: [],
+      transportRetries: 0,
+      reason: "pipeline_aggregates_step_usage",
+    },
+  };
+  metrics = cumulativeTaskMetrics(
+    previousMetrics,
+    taskMetrics(startedAt, Date.now(), executionStats.tokenUsage),
+  );
+
+  try {
+    if (runError) {
+      const kind = runError.kind || "pipeline_runner";
+      setTaskError(
+        taskPath,
+        kind,
+        runError.code || null,
+        runError.message,
+        metrics,
+        attemptFailure(
+          claim,
+          kind,
+          runError.code || null,
+          runError.message,
+          path.relative(repoRoot, usagePath),
+        ),
+      );
+      return;
+    }
+    if (pipelineResult.status === "failed") {
+      const failure = pipelineResult.failure;
+      if (failure.requiresInteractive) {
+        setTaskError(
+          taskPath,
+          "interactive_required",
+          null,
+          failure.interactiveReason,
+          metrics,
+          attemptFailure(
+            claim,
+            "interactive_required",
+            null,
+            failure.interactiveReason,
+            path.relative(repoRoot, usagePath),
+            true,
+          ),
+        );
+      } else {
+        const message =
+          failure.error || failure.summary || `pipeline step ${pipelineResult.failedStep.id} failed`;
+        setTaskError(
+          taskPath,
+          pipelineResult.failedStep.type === "shell"
+            ? "pipeline_validation"
+            : "agent_reported_failure",
+          failure.receipt?.exitCode ?? null,
+          message,
+          metrics,
+          attemptFailure(
+            claim,
+            pipelineResult.failedStep.type === "shell"
+              ? "pipeline_validation"
+              : "agent_reported_failure",
+            failure.receipt?.exitCode ?? null,
+            message,
+            path.relative(repoRoot, usagePath),
+          ),
+        );
+      }
+      return;
+    }
+
+    const finalShellResults = new Map();
+    for (const execution of pipelineResult.executions) {
+      if (execution.type === "shell" && execution.status === "completed") {
+        finalShellResults.set(execution.stepId, execution);
+      }
+    }
+    const validation = pipeline.steps
+      .filter((step) => step.type === "shell")
+      .map((step) => finalShellResults.get(step.id)?.validation?.[0])
+      .filter(Boolean);
+    if (validation.length === 0) {
+      validation.push(`pipeline ${pipeline.name}: completed`);
+    }
+    const result = {
+      status: "completed",
+      summary: `Pipeline ${pipeline.name} completed${
+        pipelineResult.repairRound > 0
+          ? ` after ${pipelineResult.repairRound} repair round${pipelineResult.repairRound === 1 ? "" : "s"}`
+          : ""
+      }.`,
+      validation,
+    };
+    markTaskModelCompleted(
+      taskPath,
+      claim,
+      result,
+      metrics,
+      path.relative(repoRoot, usagePath),
+    );
+    try {
+      const deliveryPath = path.join(attemptDir, "delivery.json");
+      const finalized = await finalizeTaskGit(
+        repoRoot,
+        taskPath,
+        path.relative(repoRoot, deliveryPath),
+      );
+      atomicWriteJson(deliveryPath, {
+        status: finalized.mergeQueued ? "merge-queued" : "completed",
+        deliveryAttemptId: finalized.deliveryAttemptId,
+        delivery: finalized.delivery,
+      });
+      if (threadId) await archiveTaskThread(taskPath, config);
+      if (!finalized.mergeQueued) {
+        completeTask(repoRoot, taskPath, finalized.result, metrics);
+      }
+    } catch (error) {
+      setTaskError(
+        taskPath,
+        error.taskFailure?.errorKind || error.kind || "git_delivery",
+        null,
+        error.message,
+        metrics,
+        error.taskFailure
+          ? {
+              status: error.taskFailure.status,
+              errorKind: error.taskFailure.errorKind,
+            }
+          : null,
+      );
+    }
+  } finally {
+    if (threadId) {
+      try {
+        await archiveTaskThread(taskPath, config);
+      } catch (error) {
+        log("task_thread_archive_error", { task: task.id, error: error.message });
+      }
+    }
+    releaseClaim(claim);
+    active.delete(task.id);
+    const finalStatus = getTaskStatus(repoRoot, task.id);
+    const attemptStatus =
+      finalStatus.attemptLedger?.attempts?.find(
+        (attempt) => attempt.attemptId === claim.attemptId,
+      )?.status || finalStatus.status;
+    try {
+      atomicWriteJson(usagePath, {
+        ...buildAttemptUsageV2({
+          taskId: task.id,
+          attempt: claim.attempt,
+          status: attemptStatus,
+          startedAt: metrics?.lastRun?.startedAt,
+          completedAt: metrics?.lastRun?.completedAt,
+          durationMs: metrics?.lastRun?.durationMs,
+          modelProfile: baseExecution.modelProfile,
+          model: baseExecution.model,
+          reasoningEffort: baseExecution.reasoningEffort,
+          stats: executionStats,
+          source: "ToDo repository pipeline",
+        }),
+        attemptId: claim.attemptId,
+        retryOf: claim.retryOf,
+        trigger: claim.trigger,
+        pipelineFile: pipeline.source,
+        pipelineDigest: pipeline.digest,
+        pipelineRunFile: path.basename(pipelineRunPath),
+      });
+    } catch (error) {
+      log("usage_log_error", { task: task.id, error: error.message });
+    }
+    log("task_end", {
+      task: task.id,
+      status: finalStatus.status,
+      backend: "pipeline",
+      pipeline: pipeline.source,
+      pipelineDigest: pipeline.digest,
+      threadId,
+      turnId,
+      attempt: claim.attempt,
+      totalTokens: metrics?.lastRun?.tokenUsage?.totalTokens || 0,
+    });
+    writeState();
+  }
+}
+
 async function executeTask(taskPath, claim, workerId, config) {
   const task = readTask(taskPath);
+  if (
+    task.metadata.pipeline &&
+    task.metadata.git?.phase !== "merge-conflict"
+  ) {
+    return executeTaskWithPipeline(taskPath, claim, workerId, config);
+  }
   const execution =
     task.metadata.execution || resolveTaskExecution(config, {});
   return execution.backend === "exec"

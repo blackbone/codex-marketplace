@@ -8,7 +8,7 @@ A Git-backed Codex marketplace for plugins maintained by [blackbone](https://git
 
 | Plugin | What it does | Package |
 | --- | --- | --- |
-| ToDo | Atomic repository task routing with tiered retries, persistent threads, a local rebase merge queue, and telemetry. | [Documentation](plugins/todo/README.md) |
+| ToDo | Atomic repository task routing with optional YAML execution pipelines, persistent threads, deterministic gates, and telemetry. | [Documentation](plugins/todo/README.md) |
 
 ![ToDo plugin details](plugins/todo/assets/screenshots/plugin-details.png)
 

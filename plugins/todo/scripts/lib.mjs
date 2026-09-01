@@ -36,6 +36,10 @@ import {
   taskWorktreePlan,
   verifyTaskWorktreeHead,
 } from "./git-worktree.mjs";
+import {
+  loadConfiguredPipeline,
+  storePipelineSnapshot,
+} from "./pipeline.mjs";
 
 export const DEFAULT_WORKERS = 4;
 export const DEFAULT_POLL_INTERVAL_MS = 2000;
@@ -320,6 +324,7 @@ export function ensureLayout(repoRoot) {
   mkdirSync(path.join(root, "artifacts"), { recursive: true });
   mkdirSync(path.join(root, "history"), { recursive: true });
   mkdirSync(path.join(root, "logs"), { recursive: true });
+  mkdirSync(path.join(root, "pipelines"), { recursive: true });
   return root;
 }
 
@@ -407,6 +412,7 @@ export function loadConfig(repoRoot) {
       defaultModelProfile: DEFAULT_MODEL_PROFILE,
       routingMode: DEFAULT_ROUTING_MODE,
       git: { ...DEFAULT_CONFIG.git },
+      pipeline: null,
       warning: null,
       readError: null,
     };
@@ -472,6 +478,19 @@ export function loadConfig(repoRoot) {
     warning = warning
       ? `${warning}; defaultModelProfile is not present in models`
       : "defaultModelProfile is not present in models";
+  }
+  let pipeline = null;
+  if (!readError) {
+    try {
+      pipeline = loadConfiguredPipeline(
+        repoRoot,
+        raw.pipeline,
+        normalizedProfiles.profiles,
+      );
+    } catch (error) {
+      readError = `Could not load pipeline: ${error.message}`;
+      warning = readError;
+    }
   }
   const retries =
     Number.isInteger(raw.retries) && raw.retries >= -1
@@ -560,6 +579,7 @@ export function loadConfig(repoRoot) {
     defaultModelProfile,
     routingMode,
     git: { delivery: gitDelivery, targetBranch, remote },
+    pipeline,
     warning,
     readError,
   };
@@ -1269,6 +1289,20 @@ export function readTask(taskPath) {
       !Array.isArray(preflight.capabilities)
     ) {
       throw new Error("invalid preflight metadata");
+    }
+  }
+  if (metadata.pipeline !== undefined) {
+    const pipeline = metadata.pipeline;
+    if (
+      !pipeline ||
+      typeof pipeline !== "object" ||
+      Array.isArray(pipeline) ||
+      typeof pipeline.source !== "string" ||
+      !pipeline.source ||
+      typeof pipeline.digest !== "string" ||
+      !/^[a-f0-9]{64}$/.test(pipeline.digest)
+    ) {
+      throw new Error("invalid pipeline metadata");
     }
   }
   if (metadata.git !== undefined) {
@@ -2130,12 +2164,20 @@ export function createTask(
     ephemeral,
     runMode,
   });
+  if (config.pipeline && execution.mode === "interactive") {
+    throw new Error(
+      "interactive tasks cannot bypass a configured repository pipeline",
+    );
+  }
   const metadata = {
     version: 1,
     blockers: blockerFiles,
     error: null,
     execution,
     batchReady,
+    ...(config.pipeline
+      ? { pipeline: storePipelineSnapshot(repoRoot, config.pipeline) }
+      : {}),
     ...(batchId ? { batchId } : {}),
     ...(preflightId
       ? {
@@ -2563,6 +2605,7 @@ export function getTaskStatus(repoRoot, id) {
     attemptLedger,
     retryStats: attemptLedger.retryStats,
     preflight: task.metadata.preflight || null,
+    pipeline: task.metadata.pipeline || null,
     execution: storedTaskExecution(repoRoot, task),
     codexThread: task.metadata.codexThread || null,
     allowWorkerTaskCreation:
@@ -3402,6 +3445,7 @@ export function reopenTask(repoRoot, id) {
       blockers: [],
       error: null,
       execution: receipt.execution,
+      ...(receipt.pipeline ? { pipeline: receipt.pipeline } : {}),
       batchReady: true,
       codexThread: {
         ...receipt.codexThread,
@@ -3436,6 +3480,11 @@ export async function startInteractiveTask(repoRoot, id) {
   if (status.status === "blocked") {
     throw new Error(
       `Task is blocked by: ${status.existingBlockers.join(", ")}`,
+    );
+  }
+  if (status.pipeline) {
+    throw new Error(
+      `Task ${id} has a runner-owned repository pipeline and cannot be claimed interactively`,
     );
   }
   if (status.git?.phase?.startsWith("merge-")) {
@@ -3681,6 +3730,7 @@ export async function cancelTask(repoRoot, id) {
       attemptLedger,
       retryStats: attemptLedger.retryStats,
       preflight: task.metadata.preflight || null,
+      pipeline: task.metadata.pipeline || null,
       allowWorkerTaskCreation:
         task.metadata.allowWorkerTaskCreation === true,
       parentTaskId: task.metadata.parentTaskId || null,
@@ -3897,6 +3947,7 @@ export function completeTask(repoRoot, taskPath, result, metrics = null) {
       task.metadata.attemptLedger?.retryStats ||
       createAttemptLedger().retryStats,
     preflight: task.metadata.preflight || null,
+    pipeline: task.metadata.pipeline || null,
     summary: result.summary,
     validation: result.validation,
     allowWorkerTaskCreation:

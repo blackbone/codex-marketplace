@@ -36,6 +36,8 @@ const REQUIRED_RUNTIME_FILES = [
   "scripts/git-worktree.mjs",
   "scripts/lib.mjs",
   "scripts/mcp-server.mjs",
+  "scripts/pipeline.mjs",
+  "scripts/pipeline-result.schema.json",
   "scripts/ponytail-policy.mjs",
   "scripts/preflight.mjs",
   "scripts/result.schema.json",

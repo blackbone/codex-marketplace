@@ -2,6 +2,10 @@
 
 ## Unreleased - 2026-08-12
 
+- Added optional repository-defined YAML task pipelines with snapshotted
+  `codex-exec`, persistent `codex-thread`, and deterministic `shell` steps,
+  bounded repair loops, full shell receipts, and strict legacy fallback when no
+  pipeline is configured.
 - Replaced dashboard worker-capacity counters with the same task lifecycle
   counters as the supervisor title, including interactive claims in `running`.
 - Removed unsupported conditional keywords from the Codex worker output schema

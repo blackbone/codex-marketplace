@@ -37,6 +37,15 @@ The detached daemon polls durable tasks, executes background Codex workers, and
 serves a local dashboard. Interactive tasks are explicitly claimed by the current
 thread so the daemon cannot run the same task concurrently.
 
+Repositories may optionally select one versioned YAML execution pipeline from
+`.todo/config.json`. The pipeline is validated and snapshotted when a task is
+published. Agent steps use either independent `codex exec` runs or the task's
+persistent app-server thread; deterministic shell gates run directly in the
+task worktree. A failed shell gate emits a bounded receipt to the configured
+repair agent step, then restarts all shell gates. Pipeline tasks stay
+runner-owned so interactive execution cannot bypass the configured gates. With
+no pipeline selected, the existing single-attempt lifecycle remains unchanged.
+
 By default the daemon owns one Codex `app-server` child process for the
 repository and multiplexes active tasks over JSON-RPC. Each task stores a unique,
 persistent Codex thread ID; attempts are turns in that thread. A transient

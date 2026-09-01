@@ -2,9 +2,10 @@
 
 ToDo gives Codex a durable, repository-local task queue with automatic atomic
 decomposition, Ponytail full task formation and execution, connector and Git
-preflight, atomic DAG publication, isolated worktree delivery, persistent
-per-task Codex threads, tier-escalating retries, a local rebase merge queue,
-per-attempt telemetry, and a live dashboard.
+preflight, atomic DAG publication, optional repository-defined execution
+pipelines, isolated worktree delivery, persistent per-task Codex threads,
+tier-escalating retries, a local rebase merge queue, per-attempt telemetry, and
+a live dashboard.
 
 | Plugin details | Local dashboard |
 | --- | --- |
@@ -302,6 +303,92 @@ Advanced local execution fields `codexCommand` and `codexSandbox` are also
 supported. The default sandbox is `workspace-write`. A change to the backend or
 Codex command takes effect for newly claimed tasks; existing tasks retain their
 snapshotted backend and model profile.
+
+## Repository execution pipelines
+
+When `pipeline` is absent from `.todo/config.json`, ToDo uses the existing
+single Codex attempt lifecycle without any behavior change. To apply one
+mandatory pipeline to every newly published background task, point the config
+at a repository-relative YAML file:
+
+```json
+{
+  "pipeline": {
+    "file": ".codex/todo/pipelines/default.yaml"
+  }
+}
+```
+
+Keep each additional scenario in its own `.yaml` or `.yml` file and change the
+configured file for future tasks. At publication, ToDo validates and snapshots
+the normalized pipeline under ignored runtime state. Queued and reopened tasks
+therefore retain the exact pipeline and explicit model-profile resolutions they
+were created with even if the source YAML or config changes later. A configured
+file that is missing or invalid fails configuration and preflight instead of
+silently falling back. Only an absent `pipeline` section selects the legacy
+lifecycle.
+
+The v1 format is deliberately linear. `codex-exec` and `codex-thread` agent
+steps must come before all `shell` gates. `codex-exec` starts an independent
+structured Codex execution; `codex-thread` creates or continues the task's
+persistent app-server thread. Both accept an optional `modelProfile` and a
+required `prompt`. Omitting `modelProfile` uses the task's snapshotted profile.
+
+```yaml
+version: 1
+name: required-quality
+steps:
+  - id: inspect
+    type: codex-exec
+    modelProfile: fast
+    prompt: |
+      Inspect the bounded task and identify the smallest implementation path.
+
+  - id: implement
+    type: codex-thread
+    prompt: |
+      Implement the task and self-review the resulting diff.
+
+  - id: build
+    type: shell
+    command: npm run build
+    timeoutSeconds: 600
+
+  - id: test
+    type: shell
+    command: npm test
+    timeoutSeconds: 900
+
+repair:
+  type: codex-thread
+  modelProfile: expert
+  maxRounds: 3
+  prompt: |
+    Repair the failed deterministic validation step without weakening it.
+```
+
+Shell commands run in the task worktree through the platform shell. `cwd`
+defaults to `.` and may name only a path inside that worktree;
+`timeoutSeconds` defaults to 600 and accepts 1–3600. Each execution writes full
+stdout, stderr, and a structured receipt under the task attempt logs. On
+failure, the runner sends the repair step a bounded receipt containing the
+command, exit status, timeout state, log paths, and output tails. A successful
+repair restarts every shell gate from the first one, so delivery is possible
+only after a complete green pass made after the final agent edit. Exhausting
+`maxRounds`, failing the repair step, or omitting `repair` leaves the task
+failed with the preserved evidence.
+
+Pipeline tasks are runner-owned and cannot be claimed through interactive
+execution, because that would bypass their mandatory gates. Shell commands run
+with the same local permissions and environment as the runner; pipeline files
+are trusted executable repository policy and should be reviewed like CI
+configuration. The bundled parser supports the documented YAML subset:
+two-space mappings and sequences, comments, plain or quoted scalars, JSON-style
+inline collections, and `|`/`>` block strings. YAML tags, anchors, aliases, and
+merge keys are rejected.
+
+See [`examples/pipelines/quality.yaml`](examples/pipelines/quality.yaml) for a
+copyable build, test, coverage, and lint pipeline.
 
 ## Dashboard and records
 

@@ -75,6 +75,7 @@ try {
     "git-worktree.mjs",
     "lib.mjs",
     "mcp-server.mjs",
+    "pipeline.mjs",
     "ponytail-policy.mjs",
     "preflight.mjs",
     "routing-policy.mjs",
@@ -86,6 +87,10 @@ try {
   }
   writeFileSync(
     path.join(fixturePlugin, "scripts", "result.schema.json"),
+    '{"type":"object"}\n',
+  );
+  writeFileSync(
+    path.join(fixturePlugin, "scripts", "pipeline-result.schema.json"),
     '{"type":"object"}\n',
   );
   const ignoredTest = path.join(
