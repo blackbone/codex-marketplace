@@ -1,3 +1,5 @@
+import { DEFAULT_MODEL_PROFILES, readModelCatalog, profileDiagnostic, profileUsable, assertProfilesAvailable } from "./model-profiles.mjs";
+import { runShellCommand } from "./shell-step.mjs";
 import {
   appendFileSync,
   closeSync,
@@ -37,6 +39,7 @@ import {
   verifyTaskWorktreeHead,
 } from "./git-worktree.mjs";
 import {
+  loadPipelineSnapshot,
   loadConfiguredPipeline,
   storePipelineSnapshot,
 } from "./pipeline.mjs";
@@ -48,32 +51,7 @@ export const DEFAULT_DASHBOARD_PORT = 0;
 export const DEFAULT_RETRIES = 0;
 export const DAEMON_IMPLEMENTATION = "todo";
 export const DAEMON_PROTOCOL_VERSION = 2;
-export const DEFAULT_MODEL_PROFILES = [
-  {
-    name: "fast",
-    model: "gpt-5.6-luna",
-    reasoningEffort: "medium",
-    description: "Mechanical file operations and exact text insertions.",
-  },
-  {
-    name: "medium",
-    model: "gpt-5.6-terra",
-    reasoningEffort: "medium",
-    description: "Small, bounded edits across a few files.",
-  },
-  {
-    name: "expert",
-    model: "gpt-5.6-sol",
-    reasoningEffort: "xhigh",
-    description: "Most coding tasks and complex implementation work.",
-  },
-  {
-    name: "ultra",
-    model: "gpt-5.6-sol",
-    reasoningEffort: "ultra",
-    description: "Large, high-risk, cross-cutting refactors.",
-  },
-];
+export { DEFAULT_MODEL_PROFILES } from "./model-profiles.mjs";
 export const DEFAULT_MODEL_PROFILE = "expert";
 export const DEFAULT_ROUTING_MODE = "all-mutations";
 export const DEFAULT_EXECUTION_BACKEND = "app-server";
@@ -87,7 +65,6 @@ export const DEFAULT_CONFIG = {
   retries: DEFAULT_RETRIES,
   executionBackend: DEFAULT_EXECUTION_BACKEND,
   gitExclude: [".todo/"],
-  models: DEFAULT_MODEL_PROFILES,
   defaultModelProfile: DEFAULT_MODEL_PROFILE,
   routingMode: DEFAULT_ROUTING_MODE,
   git: {
@@ -273,6 +250,7 @@ export function acquireTaskBatchGate(repoRoot, details) {
   if (taskBatchPublicationActive(repoRoot)) {
     const error = new Error("task batch publication is active");
     error.code = "EEXIST";
+    error.kind = "task_batch_active";
     throw error;
   }
   const token = randomUUID();
@@ -351,15 +329,16 @@ function integerInRange(value, min, max, fallback) {
 }
 
 function normalizeModelProfiles(value) {
+  if (value === undefined) return { profiles: DEFAULT_MODEL_PROFILES, warning: null };
   if (!Array.isArray(value) || value.length === 0) {
-    return { profiles: DEFAULT_MODEL_PROFILES, warning: null };
+    return { profiles: [], warning: "Custom model profiles are invalid or outdated: models must be a non-empty array. Inspect model_profiles to review an update." };
   }
   const profiles = [];
   const names = new Set();
   for (const item of value) {
     if (!item || typeof item !== "object" || Array.isArray(item)) {
       return {
-        profiles: DEFAULT_MODEL_PROFILES,
+        profiles: [],
         warning: "models must contain profile objects",
       };
     }
@@ -378,7 +357,7 @@ function normalizeModelProfiles(value) {
       !REASONING_EFFORTS.has(reasoningEffort)
     ) {
       return {
-        profiles: DEFAULT_MODEL_PROFILES,
+        profiles: [],
         warning:
           "models require unique kebab-case names, a model, and a valid reasoningEffort",
       };
@@ -461,9 +440,8 @@ export function loadConfig(repoRoot) {
   }
   const normalizedProfiles = normalizeModelProfiles(raw.models);
   if (normalizedProfiles.warning) {
-    warning = warning
-      ? `${warning}; ${normalizedProfiles.warning}`
-      : normalizedProfiles.warning;
+    warning = warning ? `${warning}; ${normalizedProfiles.warning}` : normalizedProfiles.warning;
+    readError = `Invalid custom model profiles: ${normalizedProfiles.warning}. Use model_profiles to inspect and update; no fallback model was selected.`;
   }
   const configuredDefault =
     typeof raw.defaultModelProfile === "string"
@@ -473,8 +451,9 @@ export function loadConfig(repoRoot) {
     (profile) => profile.name === configuredDefault,
   )
     ? configuredDefault
-    : normalizedProfiles.profiles[0].name;
+    : normalizedProfiles.profiles[0]?.name || null;
   if (configuredDefault && configuredDefault !== defaultModelProfile) {
+    readError = `Custom default profile ${configuredDefault} is missing or outdated. Inspect model_profiles to review an update; no fallback was selected.`
     warning = warning
       ? `${warning}; defaultModelProfile is not present in models`
       : "defaultModelProfile is not present in models";
@@ -575,6 +554,9 @@ export function loadConfig(repoRoot) {
     codexSandbox: sandboxes.has(raw.codexSandbox)
       ? raw.codexSandbox
       : "workspace-write",
+    modelCatalog: readModelCatalog(repoRoot, typeof raw.codexCommand === "string" && raw.codexCommand.trim() ? raw.codexCommand.trim() : "codex"),
+    modelDiagnostics: normalizedProfiles.profiles.map(profile => profileDiagnostic(profile,
+      readModelCatalog(repoRoot, typeof raw.codexCommand === "string" && raw.codexCommand.trim() ? raw.codexCommand.trim() : "codex"))),
     modelProfiles: normalizedProfiles.profiles,
     defaultModelProfile,
     routingMode,
@@ -864,6 +846,7 @@ export function resolveTaskExecution(
   config,
   { backend, modelProfile, ephemeral, runMode } = {},
 ) {
+  if (config.readError) throw new Error(config.readError);
   const requestedProfile =
     typeof modelProfile === "string" && modelProfile.trim()
       ? modelProfile.trim()
@@ -878,6 +861,7 @@ export function resolveTaskExecution(
         .join(", ")}`,
     );
   }
+  assertProfilesAvailable([profile], config.modelCatalog);
   if (ephemeral !== undefined && typeof ephemeral !== "boolean") {
     throw new Error("ephemeral must be a boolean");
   }
@@ -897,7 +881,32 @@ export function resolveTaskExecution(
   };
 }
 
+// Saved models are execution history; the stable profile name selects the model
+// for each new attempt. Preserve the task's backend and interaction mode.
+export function resolveSavedExecution(config, saved = {}) {
+  return resolveTaskExecution(config, {
+    backend: saved.backend,
+    modelProfile: saved.modelProfile,
+    ephemeral: saved.ephemeral,
+    runMode: saved.mode,
+  });
+}
+
+export function resolvePipelineProfiles(config, pipeline, baseExecution) {
+  const resolveStep = step => {
+    if (!step || step.type === "shell") return step;
+    const execution = resolveSavedExecution(config, {
+      ...baseExecution,
+      modelProfile: step.modelProfile || baseExecution.modelProfile,
+    });
+    return { ...step, modelProfile: execution.modelProfile,
+      model: execution.model, reasoningEffort: execution.reasoningEffort };
+  };
+  return { ...pipeline, steps: pipeline.steps.map(resolveStep), repair: resolveStep(pipeline.repair) };
+}
+
 function escalatedExecution(config, current) {
+  current = resolveSavedExecution({ ...config, modelCatalog: null }, current);
   const currentIndex = config.modelProfiles.findIndex(
     (candidate) => candidate.name === current.modelProfile,
   );
@@ -908,7 +917,12 @@ function escalatedExecution(config, current) {
     config.modelProfiles.length - 1,
     (currentIndex >= 0 ? currentIndex : Math.max(0, fallbackIndex)) + 1,
   );
-  const nextProfile = config.modelProfiles[nextIndex];
+  const retryTargets = { mini: "fast", standard: "medium", proven: "advanced", fast: "medium", medium: "advanced", advanced: "expert", expert: "ultra", ultra: "ultra" };
+  const builtin = DEFAULT_MODEL_PROFILES.find(p => p.name === current.modelProfile && p.model === current.model);
+  const preferredIndex = builtin ? config.modelProfiles.findIndex(p => p.name === retryTargets[builtin.name]) : -1;
+  const nextProfile = config.modelProfiles.slice(preferredIndex >= 0 ? preferredIndex : nextIndex).find(profile =>
+    profileUsable(profileDiagnostic(profile, config.modelCatalog)));
+  if (!nextProfile) throw new Error("No supported higher model profile; inspect model_profiles to update configuration.");
   return resolveTaskExecution(config, {
     backend:
       current.backend || config.executionBackend || DEFAULT_EXECUTION_BACKEND,
@@ -1083,7 +1097,7 @@ export function readJson(file) {
   return JSON.parse(readFileSync(file, "utf8"));
 }
 
-export function readClaim(lockPath) {
+export function readClaim(lockPath, { includeToken = false } = {}) {
   if (!existsSync(lockPath)) return null;
   const text = readFileSync(lockPath, "utf8").trim();
   if (!text) return null;
@@ -1108,6 +1122,10 @@ export function readClaim(lockPath) {
   const task = raw.task ? path.basename(String(raw.task)) : null;
 
   return {
+    ...(includeToken && typeof raw.token === "string" ? { token: raw.token } : {}),
+    ...(typeof raw.owner?.threadId === "string" ? { owner: {
+      threadId: raw.owner.threadId, turnId: typeof raw.owner.turnId === "string" ? raw.owner.turnId : null,
+    } } : {}),
     source: raw.token ? "node" : "legacy",
     pid: Number.isInteger(pidValue) ? pidValue : null,
     workerId,
@@ -2164,11 +2182,6 @@ export function createTask(
     ephemeral,
     runMode,
   });
-  if (config.pipeline && execution.mode === "interactive") {
-    throw new Error(
-      "interactive tasks cannot bypass a configured repository pipeline",
-    );
-  }
   const metadata = {
     version: 1,
     blockers: blockerFiles,
@@ -2531,32 +2544,35 @@ export function writeHistory(repoRoot, id, value) {
   });
 }
 
+function closedTaskStatus(repoRoot, id) {
+  try {
+    return readJson(existingHistoryPath(repoRoot, id));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    return { id: String(id), status: "unknown" };
+  }
+}
+
 export function getTaskStatus(repoRoot, id) {
   let filename;
   try {
     filename = existingTaskFilename(repoRoot, id);
   } catch {
-    const closedPath = existingHistoryPath(repoRoot, id);
-    return existsSync(closedPath)
-      ? readJson(closedPath)
-      : { id: String(id), status: "unknown" };
+    return closedTaskStatus(repoRoot, id);
   }
 
   const taskPath = path.join(todoDir(repoRoot), filename);
   if (!existsSync(taskPath)) {
-    const closedPath = existingHistoryPath(
-      repoRoot,
-      taskIdFromFilename(filename),
-    );
-    return existsSync(closedPath)
-      ? readJson(closedPath)
-      : { id: taskIdFromFilename(filename), status: "unknown" };
+    return closedTaskStatus(repoRoot, taskIdFromFilename(filename));
   }
 
   let task;
   try {
     task = readTask(taskPath);
   } catch (error) {
+    if (error.code === "ENOENT") {
+      return closedTaskStatus(repoRoot, taskIdFromFilename(filename));
+    }
     return {
       id: taskIdFromFilename(filename),
       status: "failed",
@@ -2570,7 +2586,8 @@ export function getTaskStatus(repoRoot, id) {
     existsSync(path.join(todoDir(repoRoot), blocker)),
   );
   let status = "queued";
-  if (existsSync(lockPath)) status = "running";
+  if (task.metadata.interaction?.state === "waiting-input") status = "waiting-input";
+  else if (existsSync(lockPath)) status = "running";
   else if (task.metadata.batchReady === false) status = "staging";
   else if (task.metadata.error !== null) status = "failed";
   else if (existingBlockers.length > 0) status = "blocked";
@@ -2589,6 +2606,15 @@ export function getTaskStatus(repoRoot, id) {
   }
 
   const attemptLedger = storedAttemptLedger(task);
+  let updatedAt;
+  try {
+    updatedAt = statSync(taskPath).mtime.toISOString();
+  } catch (error) {
+    // Completion publishes history before removing the active file. It can
+    // happen in another process after any of the reads above.
+    if (error.code !== "ENOENT") throw error;
+    return closedTaskStatus(repoRoot, task.id);
+  }
   return {
     id: task.id,
     title: titleFromBody(task.body, task.id),
@@ -2608,12 +2634,14 @@ export function getTaskStatus(repoRoot, id) {
     pipeline: task.metadata.pipeline || null,
     execution: storedTaskExecution(repoRoot, task),
     codexThread: task.metadata.codexThread || null,
+    interaction: task.metadata.interaction || null,
+    pipelineContinuation: task.metadata.pipelineContinuation || null,
     allowWorkerTaskCreation:
       task.metadata.allowWorkerTaskCreation === true,
     parentTaskId: task.metadata.parentTaskId || null,
     artifacts,
     artifactError,
-    updatedAt: statSync(taskPath).mtime.toISOString(),
+    updatedAt,
   };
 }
 
@@ -2690,7 +2718,14 @@ export function taskStatusSummary(tasks = []) {
 
 export function formatSupervisorThreadTitle(counts = {}) {
   const { running, queued, failed } = groupedTaskStatusCounts(counts);
-  return `-> ToDo (${running}r / ${queued}q / ${failed}f)`;
+  const waiting = Number(counts["waiting-input"] || 0);
+  return `-> ToDo (${running}r / ${queued}q / ${failed}f${waiting ? ` / ${waiting}w` : ""})`;
+}
+
+export function formatTaskThreadTitle(repoRoot, task) {
+  const number = String(task.id).split("-")[0];
+  const title = task.title || titleFromBody(task.body || "", task.id);
+  return `${path.basename(repoRoot)} [${number}]: ${title}`.replace(/[\r\n]+/g, " ").slice(0, 240);
 }
 
 function supervisorDefinition(value) {
@@ -3131,7 +3166,7 @@ export async function finalizeTaskGit(repoRoot, taskPath, usagePath = null) {
   }
 }
 
-export async function processTaskMergeQueue(repoRoot, taskPath, usagePath = null) {
+export async function processTaskMergeQueue(repoRoot, taskPath, usagePath = null, { onChild, signal } = {}) {
   const startedAt = Date.now();
   let deliveryAttemptId = null;
   try {
@@ -3145,6 +3180,30 @@ export async function processTaskMergeQueue(repoRoot, taskPath, usagePath = null
     const result = await mergeQueuedTaskWorktree(
       plan,
       task.metadata.git.headCommit,
+      { validate: task.metadata.pipeline ? async ({ headCommit, worktreePath }) => {
+        const pipeline = loadPipelineSnapshot(repoRoot, task.metadata.pipeline);
+        const directory = path.join(todoDir(repoRoot), "logs", task.id, `merge-validation-${deliveryAttemptId}`);
+        mkdirSync(directory, { recursive: true });
+        const receipts = [];
+        for (const step of pipeline.steps.filter(step => step.type === "shell")) {
+          const stdoutPath = path.join(directory, `${step.id}.stdout.log`);
+          const stderrPath = path.join(directory, `${step.id}.stderr.log`);
+          const receipt = await runShellCommand({ command: step.command,
+            cwd: path.resolve(worktreePath, step.cwd), timeoutSeconds: step.timeoutSeconds,
+            env: { ...process.env, TODO_RUNNER_WORKER: "1", TODO_RUNNER_REPO_ROOT: repoRoot, TODO_RUNNER_TASK_FILE: taskPath },
+            stdoutPath, stderrPath, onChild, signal });
+          receipts.push({ stepId: step.id, headCommit, ...receipt,
+            stdoutPath: path.relative(repoRoot, stdoutPath), stderrPath: path.relative(repoRoot, stderrPath) });
+          atomicWriteJson(path.join(directory, "validation.json"), { headCommit, pipelineDigest: pipeline.digest, receipts });
+          if (receipt.status !== "completed") {
+            const error = new Error(`Merge gate ${step.id} failed: ${receipt.error || receipt.stderrTail || receipt.stdoutTail || (receipt.timedOut ? "timeout" : receipt.exitCode)}`);
+            error.kind = "pipeline_validation";
+            throw error;
+          }
+        }
+        return { headCommit, pipelineDigest: pipeline.digest, gates: receipts.length,
+          receiptPath: path.relative(repoRoot, path.join(directory, "validation.json")) };
+      } : null },
     );
     if (result.status === "conflict") {
       task = readTask(taskPath);
@@ -3346,6 +3405,10 @@ export function retryTask(
   if (!existsSync(taskPath)) throw new Error(`Task does not exist: ${id}`);
   if (existsSync(`${taskPath}.lock`)) throw new Error(`Task is running: ${id}`);
   const task = readTask(taskPath);
+  const modelWasUnavailable = task.metadata.error?.kind === "model_unavailable";
+  if (task.metadata.interaction?.state === "waiting-input") {
+    throw new Error("Task is waiting for user input. Answer in the dashboard or continue with $todo:run.");
+  }
   task.metadata.error = null;
   const wasMergeFailed = task.metadata.git?.phase === "merge-failed";
   const modelRetry =
@@ -3361,7 +3424,9 @@ export function retryTask(
     const config = loadConfig(repoRoot);
     const current =
       task.metadata.execution || resolveTaskExecution(config, {});
-    task.metadata.execution = escalatedExecution(config, current);
+    task.metadata.execution = modelWasUnavailable
+      ? resolveSavedExecution({ ...config, modelCatalog: null }, current)
+      : escalatedExecution(config, current);
     task.metadata.nextAttemptTrigger = trigger;
   }
   writeTask(task);
@@ -3471,20 +3536,28 @@ export function reopenTask(repoRoot, id) {
   return getTaskStatus(repoRoot, receipt.id);
 }
 
-export async function startInteractiveTask(repoRoot, id) {
+export async function startInteractiveTask(repoRoot, id, { owner = null } = {}) {
   const filename = existingTaskFilename(repoRoot, id);
   const taskPath = path.join(todoDir(repoRoot), filename);
   if (!existsSync(taskPath)) throw new Error(`Task does not exist: ${id}`);
   const status = getTaskStatus(repoRoot, id);
-  if (status.status === "running") throw new Error(`Task is running: ${id}`);
-  if (status.status === "blocked") {
+  if (status.status === "running") {
+    const saved = readClaim(`${taskPath}.lock`, { includeToken: true });
+    if (owner?.threadId && owner.turnId && saved?.workerId === "interactive" &&
+        saved.owner?.threadId === owner.threadId && saved.owner?.turnId === owner.turnId &&
+        status.git?.worktreePath && existsSync(status.git.worktreePath)) {
+      return {
+        claimToken: saved.token, worktreePath: status.git.worktreePath,
+        expectedHead: status.git.baseCommit, deliveryOnly: TASK_GIT_FINALIZER_PHASES.has(status.git.phase),
+        pipelineStage: status.pipelineContinuation?.stage || null,
+        requiresPipelineValidation: Boolean(status.pipeline), task: getTaskDetails(repoRoot, id),
+      };
+    }
+    throw new Error(`Task is running: ${id}`);
+  }
+  if (status.existingBlockers?.length) {
     throw new Error(
       `Task is blocked by: ${status.existingBlockers.join(", ")}`,
-    );
-  }
-  if (status.pipeline) {
-    throw new Error(
-      `Task ${id} has a runner-owned repository pipeline and cannot be claimed interactively`,
     );
   }
   if (status.git?.phase?.startsWith("merge-")) {
@@ -3495,15 +3568,33 @@ export async function startInteractiveTask(repoRoot, id) {
 
   let claim;
   const deliveryOnly = TASK_GIT_FINALIZER_PHASES.has(status.git?.phase);
+  let continuation = status.pipelineContinuation;
+  if (status.pipeline && !deliveryOnly && !continuation) {
+    const pipeline = loadPipelineSnapshot(repoRoot, status.pipeline);
+    const first = pipeline.steps[0];
+    continuation = { digest: pipeline.digest, stage: first.type === "shell" ? null : first,
+      nextIndex: first.type === "shell" ? 0 : 1, repairRound: 0, executions: [] };
+  }
   try {
     claim = claimTask(taskPath, "interactive", {
       modelAttempt: !deliveryOnly,
+      owner,
     });
   } catch (error) {
     if (error.code === "EEXIST") throw new Error(`Task is running: ${id}`);
     throw error;
   }
   try {
+    if (!deliveryOnly) {
+      const task = readTask(taskPath);
+      task.metadata.execution = resolveSavedExecution(loadConfig(repoRoot), task.metadata.execution);
+      task.metadata.interaction = {
+        ...task.metadata.interaction, state: "running", owner, dispatching: false,
+        question: null, updatedAt: new Date().toISOString(),
+      };
+      if (continuation) task.metadata.pipelineContinuation = continuation;
+      writeTask(task);
+    }
     const prepared = deliveryOnly
       ? {
           worktreePath: status.git.worktreePath,
@@ -3515,6 +3606,8 @@ export async function startInteractiveTask(repoRoot, id) {
       worktreePath: prepared.worktreePath,
       expectedHead: prepared.expectedHead,
       deliveryOnly,
+      pipelineStage: continuation?.stage || null,
+      requiresPipelineValidation: Boolean(status.pipeline),
       task: getTaskDetails(repoRoot, id),
     };
   } catch (error) {
@@ -3564,6 +3657,7 @@ export async function finishInteractiveTask(
     summary,
     validation = [],
     error = null,
+    owner = null,
   },
 ) {
   const filename = existingTaskFilename(repoRoot, id);
@@ -3582,6 +3676,7 @@ export async function finishInteractiveTask(
   ) {
     throw new Error(`Interactive task claim does not match: ${id}`);
   }
+  assertInteractiveOwner(currentClaim, owner);
   if (status !== "completed" && status !== "failed") {
     throw new Error("status must be completed or failed");
   }
@@ -3624,6 +3719,25 @@ export async function finishInteractiveTask(
   }
   try {
     if (status === "completed") {
+      if (task.metadata.pipeline && !deliveryOnly) {
+        // The app supplies a stage result; only the runner can pass pipeline
+        // gates and authorize delivery. An app completion never bypasses them.
+        const current = readTask(taskPath);
+        current.metadata.metrics = metrics;
+        current.metadata.attemptLedger = appendClaimedAttempt(current, claim, "completed", null, metrics, null);
+        current.metadata.pipelineContinuation = {
+          ...current.metadata.pipelineContinuation,
+          result: { status: "completed", summary: summary.trim(), validation, error: null,
+            requiresInteractive: false, interactiveReason: null },
+          ready: true,
+        };
+        current.metadata.interaction = { ...current.metadata.interaction, state: "resolved" };
+        current.metadata.execution = { ...current.metadata.execution, mode: "background" };
+        current.metadata.error = null;
+        writeTask(current);
+        releaseClaim(claim);
+        return getTaskStatus(repoRoot, id);
+      }
       if (!deliveryOnly) {
         markTaskModelCompleted(
           taskPath,
@@ -3684,6 +3798,66 @@ export async function finishInteractiveTask(
     releaseClaim(claim);
   }
   return getTaskStatus(repoRoot, id);
+}
+
+function assertInteractiveOwner(claim, owner) {
+  if (!claim.owner) return;
+  if (!owner || owner.threadId !== claim.owner.threadId ||
+      (claim.owner.turnId && owner.turnId !== claim.owner.turnId)) {
+    throw new Error("Interactive claim belongs to another Codex app turn");
+  }
+}
+
+function recordInteractivePause(task, claim) {
+  if (!claim.attemptId) return;
+  const now = Date.now();
+  const startedAt = Date.parse(claim.claimedAt);
+  task.metadata.metrics = cumulativeTaskMetrics(task.metadata.metrics || null,
+    taskMetrics(Number.isFinite(startedAt) ? startedAt : now, now, emptyTokenUsage()));
+  task.metadata.attemptLedger = appendClaimedAttempt(task, claim, "blocked_interactive", "interactive_required", task.metadata.metrics, null);
+}
+
+export function waitForTaskInput(repoRoot, id, { claimToken, question, owner = null }) {
+  if (typeof question !== "string" || !question.trim() || question.length > 8000) {
+    throw new Error("question must contain 1-8000 characters");
+  }
+  const file = path.join(todoDir(repoRoot), existingTaskFilename(repoRoot, id));
+  const claim = readClaim(`${file}.lock`, { includeToken: true });
+  if (!claim || claim.token !== claimToken || claim.workerId !== "interactive") {
+    throw new Error("Interactive claim does not match");
+  }
+  assertInteractiveOwner(claim, owner);
+  const task = readTask(file);
+  recordInteractivePause(task, claim);
+  task.metadata.interaction = { state: "waiting-input", question: question.trim(),
+    nativeThreadId: task.metadata.interaction?.nativeThreadId || null,
+    owner: claim.owner || null, updatedAt: new Date().toISOString() };
+  task.metadata.execution = { ...storedTaskExecution(repoRoot, task), mode: "interactive" };
+  writeTask(task);
+  releaseClaim({ lockPath: `${file}.lock`, token: claim.token });
+  return getTaskStatus(repoRoot, id);
+}
+
+export function reconcileInteractiveClaim(repoRoot, id, observed, expectedToken) {
+  const file = path.join(todoDir(repoRoot), existingTaskFilename(repoRoot, id));
+  const claim = readClaim(`${file}.lock`, { includeToken: true });
+  if (!claim?.owner || claim.token !== expectedToken) return false;
+  if (observed.thread?.id !== claim.owner.threadId) return false;
+  const state = typeof observed.thread.status === "string" ? observed.thread.status : observed.thread.status?.type;
+  // Never expire a live/unknown app run, even if its MCP process disappeared.
+  if (!["idle", "notLoaded", "systemError"].includes(state)) return false;
+  const turn = observed.turns?.find(item => item.id === claim.owner.turnId);
+  if (!turn || !["completed", "failed", "interrupted"].includes(turn.status)) return false;
+  const task = readTask(file);
+  recordInteractivePause(task, claim);
+  task.metadata.interaction = { state: "waiting-input", owner: claim.owner,
+    nativeThreadId: task.metadata.interaction?.nativeThreadId || null,
+    question: "The Codex app turn ended without finishing this task. Continue in its chat or provide a new instruction.",
+    updatedAt: new Date().toISOString() };
+  task.metadata.execution = { ...storedTaskExecution(repoRoot, task), mode: "interactive" };
+  writeTask(task);
+  releaseClaim({ lockPath: `${file}.lock`, token: claim.token });
+  return true;
 }
 
 export async function cancelTask(repoRoot, id) {
@@ -3748,7 +3922,7 @@ export async function cancelTask(repoRoot, id) {
 export function claimTask(
   taskPath,
   workerId,
-  { modelAttempt = false } = {},
+  { modelAttempt = false, owner = null } = {},
 ) {
   const repoRoot = path.dirname(path.dirname(path.resolve(taskPath)));
   const batchGate = acquireTaskBatchGate(repoRoot, {
@@ -3764,6 +3938,7 @@ export function claimTask(
     if (existsSync(path.join(todoDir(repoRoot), ".daemon-restart.json"))) {
       const error = new Error("ToDo runtime update is pending");
       error.code = "EEXIST";
+      error.kind = "runtime_update_pending";
       throw error;
     }
     if (modelAttempt) {
@@ -3786,6 +3961,7 @@ export function claimTask(
         workerId,
         task: path.basename(taskPath),
         claimedAt,
+        ...(owner ? { owner } : {}),
         ...attemptFields,
       })}\n`,
       "utf8",
@@ -3846,6 +4022,9 @@ export function cleanupStaleClaims(repoRoot) {
     if (!existsSync(lockPath)) continue;
     try {
       const claim = readClaim(lockPath);
+      // Native app ownership outlives an MCP process. The app's turn state,
+      // checked by the daemon, is authoritative for these claims.
+      if (claim?.owner?.threadId) continue;
       if (claim?.pid && !processIsAlive(claim.pid)) {
         if (claim.attemptId) {
           const task = readTask(taskPath);
@@ -3938,6 +4117,7 @@ export function completeTask(repoRoot, taskPath, result, metrics = null) {
     closedAt: metrics?.completedAt || new Date().toISOString(),
     execution: storedTaskExecution(repoRoot, task),
     codexThread: task.metadata.codexThread || null,
+    interaction: task.metadata.interaction || null,
     taskBody: task.body,
     metrics,
     outcome: task.metadata.outcome || "completed",

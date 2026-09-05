@@ -1,3 +1,6 @@
+import { refreshModelCatalog, modelProfilePlan, applyModelProfilePlan } from "./model-profiles.mjs";
+import { executionOwner } from "./desktop-client.mjs";
+import { TODO_ROUTING_POLICY, TOOLING_OPERATION_POLICY, WORKER_TOOLING_BOUNDARY } from "./routing-policy.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -38,6 +41,7 @@ import {
   reopenTask,
   finishInteractiveTask,
   startInteractiveTask,
+  waitForTaskInput,
   updateTask,
   todoDir,
 } from "./lib.mjs";
@@ -189,6 +193,14 @@ const taskInputProperties = {
 };
 
 const tools = [
+  {
+    name: "model_profiles",
+    description: "Inspect all executor models, stale/unsupported custom profiles and a proposed cleanup/update. Apply only after showing the exact preview and receiving user authorization; pass its planId. Keeps a config backup and task profile names; saved task models refresh from those profiles at the next attempt. Omitted models inherit the plugin profiles.",
+    inputSchema: { type: "object", properties: {
+      repoPath: { type: "string" }, action: { type: "string", enum: ["inspect", "apply"], default: "inspect" },
+      planId: { type: "string", description: "Exact planId from the approved inspect preview." },
+    }, required: ["repoPath"], additionalProperties: false },
+  },
   {
     name: "task_preflight",
     description:
@@ -702,6 +714,17 @@ const tools = [
     },
   },
   {
+    name: "task_run_wait",
+    description: "Pause the current interactive task while waiting for user input. Releases this turn's claim; resume with task_run_start after the user replies.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      properties: { repoPath: { type: "string" }, id: { type: "string" },
+        claimToken: { type: "string" }, question: { type: "string", minLength: 1, maxLength: 8000 } },
+      required: ["repoPath", "id", "claimToken", "question"],
+    },
+    annotations: { title: "Wait for user input", readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  },
+  {
     name: "task_cancel",
     description: "Cancel an unclaimed queued, blocked, or failed task.",
     inputSchema: {
@@ -1062,6 +1085,7 @@ function runnerStatus(repoRoot) {
             updatedAt: null,
             error: null,
           },
+    modelDiagnostics: config.modelDiagnostics || [],
     modelProfiles: appliedConfig?.modelProfiles ?? config.modelProfiles,
     defaultModelProfile:
       appliedConfig?.defaultModelProfile ?? config.defaultModelProfile,
@@ -1131,6 +1155,7 @@ function todoStatus(repoRoot, args = {}) {
       supervisorThreadTitle: runner.supervisorThreadTitle,
       conflictingDaemon: runner.conflictingDaemon,
       modelProfiles: runner.modelProfiles,
+      modelDiagnostics: runner.modelDiagnostics,
       defaultModelProfile: runner.defaultModelProfile,
       configWarning: runner.configWarning,
       configReload: runner.configReload,
@@ -1198,7 +1223,9 @@ function requiredLocalChecks(deliveries) {
 }
 
 async function taskPreflight(repoRoot, args) {
-  const config = loadConfig(repoRoot);
+  let config = loadConfig(repoRoot);
+  if (!config.readError) await refreshModelCatalog(repoRoot, config.codexCommand);
+  config = loadConfig(repoRoot);
   const deliveries = [
     ...new Set(
       (Array.isArray(args.gitDeliveries) && args.gitDeliveries.length > 0
@@ -1390,6 +1417,9 @@ async function taskPreflight(repoRoot, args) {
     expiresAt: new Date(receipt.expiresAt).toISOString(),
     capabilities: receipt.capabilities,
     localChecks: receipt.localChecks,
+    modelProfiles: config.modelProfiles,
+    modelDiagnostics: config.modelDiagnostics,
+    modelUpdate: "Use model_profiles inspect to review all available models and a config cleanup/update preview. No config or existing task was changed.",
     deliveries,
     targetBranch,
   };
@@ -1435,8 +1465,19 @@ function ensureTaskCreationRuntime(repoRoot) {
   return daemon;
 }
 
-async function callTool(name, args = {}) {
+async function callTool(name, args = {}, metadata = {}) {
   switch (name) {
+    case "model_profiles": {
+      const root = activatedRepo(args);
+      const config = loadConfig(root);
+      const catalog = await refreshModelCatalog(root, config.codexCommand, { force: true });
+      if (args.action === "apply") {
+        if (process.env.TODO_RUNNER_WORKER === "1") throw new Error("Background workers cannot update model profiles");
+        return applyModelProfilePlan(root, catalog, args.planId);
+      }
+      const { next, ...preview } = modelProfilePlan(root, catalog);
+      return preview;
+    }
     case "task_preflight":
       return taskPreflight(activatedRepo(args), args);
     case "task_batch_create": {
@@ -1548,13 +1589,20 @@ async function callTool(name, args = {}) {
       if (task.execution?.mode !== "interactive") ensureDaemon(repoRoot);
       return task;
     }
-    case "task_run_start":
-      return startInteractiveTask(activatedRepo(args), args.id);
+    case "task_run_start": {
+      // A shared MCP process's environment identifies its initial session,
+      // not necessarily this caller. Require executor-provided ownership.
+      const owner = executionOwner(metadata, {});
+      if (!owner?.threadId || !owner.turnId) throw new Error("Interactive execution requires thread and turn metadata from the Codex app executor. No task was claimed.");
+      return startInteractiveTask(activatedRepo(args), args.id, { owner });
+    }
+    case "task_run_wait":
+      return waitForTaskInput(activatedRepo(args), args.id, { ...args, owner: executionOwner(metadata, {}) });
     case "task_run_finish": {
       const repoRoot = activatedRepo(args);
       try {
-        const receipt = await finishInteractiveTask(repoRoot, args.id, args);
-        if (receipt.codexThread?.state === "archive-pending") {
+        const receipt = await finishInteractiveTask(repoRoot, args.id, { ...args, owner: executionOwner(metadata, {}) });
+        if (receipt.codexThread?.state === "archive-pending" || receipt.pipelineContinuation?.ready) {
           ensureDaemon(repoRoot);
         }
         return receipt;
@@ -1607,19 +1655,22 @@ async function handle(message) {
       protocolVersion: message.params?.protocolVersion || "2025-06-18",
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: "todo", version: pluginVersion },
-      instructions:
-        "In repositories containing .todo/config.json, route every mutation through $todo:route even when the user does not mention ToDo. Decompose lists and broad changes into independently implementable and verifiable tasks, batching only edits to the same files in one logical scope, select the lowest adequate configured model tier, and publish the complete dependency DAG with one task_batch_create before changing repository state. Model retries advance one configured tier. merge delivery preserves completed branches for the singleton local rebase queue and returns textual conflicts to the original persistent task thread. Interactive execution is allowed only when the user explicitly requests it, or after a background attempt reports that it cannot proceed without a current-thread-only capability. A claimed background worker must implement directly and cannot create follow-up tasks unless its parent records explicit user authorization. Read-only work stays inline. Use repo_init to activate durable routing. Never edit .todo task files directly.",
+      instructions: `${TODO_ROUTING_POLICY}\n\nModel retries advance one configured tier. merge delivery preserves completed branches for the singleton local rebase queue and returns textual conflicts to the original persistent task thread. Use repo_init to activate durable routing. Never edit .todo task files directly.`,
     });
   }
   if (message.method === "ping") return success(message.id, {});
   if (message.method === "tools/list") {
-    return success(message.id, { tools });
+    return success(message.id, { tools: tools.map((tool) => ({
+      ...tool,
+      description: `${tool.description}\n\nRouting in repositories containing .todo/config.json:\n${TOOLING_OPERATION_POLICY}\n${WORKER_TOOLING_BOUNDARY}`,
+    })) });
   }
   if (message.method === "tools/call") {
     try {
       const value = await callTool(
         message.params?.name,
         message.params?.arguments || {},
+        message.params?._meta || {},
       );
       return success(message.id, {
         content: [

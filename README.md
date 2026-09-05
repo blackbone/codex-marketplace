@@ -9,6 +9,7 @@ A Git-backed Codex marketplace for plugins maintained by [blackbone](https://git
 | Plugin | What it does | Package |
 | --- | --- | --- |
 | ToDo | Atomic repository task routing with optional YAML execution pipelines, persistent threads, deterministic gates, and telemetry. | [Documentation](plugins/todo/README.md) |
+| Semantic Search | Search local documentation with a shared watcher daemon, batched embeddings, and project-local SQLite indexes. | [Documentation](plugins/semantic-search/README.md) |
 
 ![ToDo plugin details](plugins/todo/assets/screenshots/plugin-details.png)
 

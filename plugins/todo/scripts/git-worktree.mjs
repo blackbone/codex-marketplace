@@ -792,7 +792,7 @@ export function queueTaskWorktreeForMerge(plan, headCommit) {
   });
 }
 
-export function mergeQueuedTaskWorktree(plan, expectedHead) {
+export function mergeQueuedTaskWorktree(plan, expectedHead, { validate } = {}) {
   return withGitLock(plan.repoRoot, async () => {
     const targetHead = await assertPlanRefs(plan);
     await ensureQueuedWorktreeUnlocked(plan, expectedHead);
@@ -824,6 +824,21 @@ export function mergeQueuedTaskWorktree(plan, expectedHead) {
     }
 
     const headCommit = await output(plan.worktreePath, ["rev-parse", "HEAD"]);
+    let pipelineValidation = null;
+    if (validate) {
+      try {
+        pipelineValidation = await validate({ headCommit, worktreePath: plan.worktreePath });
+        const currentHead = await output(plan.worktreePath, ["rev-parse", "HEAD"]);
+        const trackedChanges = await output(plan.worktreePath, ["status", "--porcelain", "--untracked-files=no"]);
+        if (currentHead !== headCommit || trackedChanges) {
+          throw new Error("Merge validation changed tracked files or HEAD; rerun implementation before delivery");
+        }
+      } catch (error) {
+        error.kind = error.kind || "pipeline_validation";
+        error.details = { ...error.details, headCommit };
+        throw error;
+      }
+    }
     const target = await targetCheckout(plan);
     try {
       const dirty = await status(target.path);
@@ -871,6 +886,7 @@ export function mergeQueuedTaskWorktree(plan, expectedHead) {
       status: "merged",
       delivery: "merge",
       strategy: "rebase-fast-forward",
+      ...(pipelineValidation ? { pipelineValidation } : {}),
       branch: plan.branch,
       previousHead: expectedHead,
       headCommit,

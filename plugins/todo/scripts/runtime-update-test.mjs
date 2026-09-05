@@ -1,3 +1,5 @@
+// Fixture runners must never contact the user's native Codex app.
+delete process.env.CODEX_APP_TOOLS_PIPE_PATH;
 import assert from "node:assert/strict";
 import {
   cpSync,
@@ -19,7 +21,10 @@ import {
   DAEMON_IMPLEMENTATION,
   DAEMON_PROTOCOL_VERSION,
   atomicWriteJson,
+  acquireTaskBatchGate,
+  releaseTaskBatchGate,
   claimTask,
+  releaseClaim,
   daemonStatePath,
   daemonStopRequestPath,
   processIsAlive,
@@ -68,6 +73,14 @@ try {
   writeFileSync(path.join(fixturePlugin, "hooks", "hooks.json"), "{}\n");
   const runtimeModules = [
     "attempt-ledger.mjs",
+    "bounded-log.mjs",
+    "shell-step.mjs",
+    "model-profiles.mjs",
+    "app-server-client.mjs",
+    "desktop-client.mjs",
+    "task-interaction.mjs",
+    "interactive-stop.mjs",
+
     "daemon.mjs",
     "dashboard.mjs",
     "ensure-daemon.mjs",
@@ -239,6 +252,31 @@ try {
     ).pending,
     true,
   );
+
+  // A successor can skip an intermediate runtime. The predecessor's request
+  // must not gate claims forever, but only the published owner can retire it.
+  const successor = { pid: process.pid, token: "successor-token" };
+  atomicWriteJson(statePath, { ...JSON.parse(readFileSync(statePath, "utf8")), ...successor });
+  const reconcileGate = acquireTaskBatchGate(repoRoot, { purpose: "test-concurrent-publication" });
+  assert.equal(daemonRestartDecision(repoRoot, successor, oldRuntime).pending, false);
+  assert.equal(existsSync(restartPath), true, "reconciliation crossed the publication gate");
+  releaseTaskBatchGate(reconcileGate);
+  const retired = daemonRestartDecision(repoRoot, successor, oldRuntime);
+  assert.equal(retired.retiredRequest.requestId, firstRequest.requestId);
+  assert.equal(existsSync(restartPath), false);
+  writeFileSync(gatedTask, "gated\n");
+  releaseClaim(claimTask(gatedTask, "merge-queue"));
+  remove(gatedTask);
+  atomicWriteJson(restartPath, { status: "pending" });
+  assert.equal(daemonRestartDecision(repoRoot, successor, oldRuntime).pending, false);
+  assert.equal(existsSync(restartPath), true, "unrecognized update request was discarded");
+  // Preserve a new update addressed to the successor, including its claim gate.
+  atomicWriteJson(restartPath, { ...firstRequest, daemon: successor });
+  assert.equal(daemonRestartDecision(repoRoot, successor, oldRuntime).pending, true);
+  assert.equal(existsSync(restartPath), true);
+  writeFileSync(gatedTask, "gated\n");
+  assert.throws(() => claimTask(gatedTask, "merge-queue"), error => error.kind === "runtime_update_pending");
+  remove(gatedTask);
 
   const target = runtimeDescriptor(pluginRoot);
   remove(statePath);

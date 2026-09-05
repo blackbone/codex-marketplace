@@ -1,3 +1,5 @@
+// Fixture runners must never contact the user's native Codex app.
+delete process.env.CODEX_APP_TOOLS_PIPE_PATH;
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import {
@@ -46,6 +48,7 @@ git("commit", "-m", "fixture");
 writeFileSync(
   fake,
 	`#!/usr/bin/env node
+import { fakeModelList } from ${JSON.stringify(new URL("./model-catalog-test.mjs", import.meta.url).href)};
 import { appendFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -60,6 +63,7 @@ for await (const line of createInterface({ input: process.stdin })) {
   const message = JSON.parse(line);
   appendFileSync(trace, JSON.stringify(message) + "\\n");
   if (message.method === "initialize") send({ id: message.id, result: {} });
+  else if (message.method === "model/list") send({ id: message.id, result: fakeModelList() });
   else if (message.method === "thread/start") { threadNumber += 1; send({ id: message.id, result: { thread: { id: "persistent-task-thread-" + threadNumber } } }); }
   else if (message.method === "thread/resume") send({ id: message.id, result: { thread: { id: message.params.threadId } } });
   else if (message.method === "thread/archive") {
@@ -427,8 +431,12 @@ assert.equal(requests.filter((item) => item.method === "thread/archive").length,
 assert.equal(requests.filter((item) => item.method === "thread/unarchive").length, 4);
 assert.equal(requests.filter((item) => item.method === "turn/interrupt").length, 1);
 const titleRequests = requests.filter(
-  (item) => item.method === "thread/name/set",
+  (item) => item.method === "thread/name/set" && item.params.threadId === "persistent-monitoring-thread",
 );
+const workerTitles = requests.filter(item => item.method === "thread/name/set" && item.params.threadId.startsWith("persistent-task-thread-"));
+assert(workerTitles.length >= 6);
+assert(workerTitles.every(item => item.params.name.startsWith(path.basename(root) + " [")));
+assert(workerTitles.every(item => /\[\d+\]: .+/.test(item.params.name)));
 assert(titleRequests.length >= 3);
 assert(
   titleRequests.every(

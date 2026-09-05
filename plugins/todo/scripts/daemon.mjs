@@ -1,3 +1,4 @@
+import { refreshModelCatalog, assertProfilesAvailable } from "./model-profiles.mjs";
 import {
   closeSync,
   appendFileSync,
@@ -7,12 +8,15 @@ import {
   readFileSync,
   unlinkSync,
   writeFileSync,
+  watch,
 } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
+import { readLogTail } from "./bounded-log.mjs";
+import { runShellCommand } from "./shell-step.mjs";
 import { startDashboard } from "./dashboard.mjs";
 import {
   applyGitExcludes,
@@ -31,6 +35,9 @@ import {
   ensureLayout,
   getSupervisorStatus,
   getTaskStatus,
+  listTaskStatuses,
+  reconcileInteractiveClaim,
+  formatTaskThreadTitle,
   isActivated,
   isCurrentDaemonState,
   listTaskFiles,
@@ -46,8 +53,11 @@ import {
   readDaemonState,
   readDashboardThreadRequest,
   readTask,
+  readClaim,
   releaseClaim,
   resolveTaskExecution,
+  resolveSavedExecution,
+  resolvePipelineProfiles,
   retryTask,
   setTaskError,
   finishTaskMergeConflictRepair,
@@ -65,8 +75,11 @@ import {
   parseOtlpRequestStats,
 } from "./execution-stats.mjs";
 import { AppServerClient } from "./app-server-client.mjs";
+import { createTaskInteraction } from "./task-interaction.mjs";
+import { DesktopClient } from "./desktop-client.mjs";
 import { classifyFailure } from "./attempt-ledger.mjs";
 import { loadPipelineSnapshot, runPipeline } from "./pipeline.mjs";
+import { WORKER_TOOLING_BOUNDARY } from "./routing-policy.mjs";
 import { TODO_PONYTAIL_FULL_CONTOUR } from "./ponytail-policy.mjs";
 import {
   daemonRestartDecision,
@@ -90,6 +103,13 @@ const daemonToken = randomUUID();
 const daemonStartedAt = new Date().toISOString();
 const pluginVersion = ownRuntime.pluginVersion;
 const active = new Map();
+let desktopClient = null;
+let desktopMaintenance = null;
+let nextDesktopAttemptAt = 0;
+const desktopThreadStates = new Map();
+const desktopThreadRetryAt = new Map();
+const desktopDispatches = new Set();
+let nextDesktopDispatchAt = 0;
 let dashboard = null;
 let stopping = false;
 let lastWarning = null;
@@ -323,6 +343,7 @@ async function reloadDashboard(previousConfig, nextConfig) {
       repoRoot,
       nextConfig.dashboardPort,
       dashboard?.threadId || null,
+      desktopTaskAction,
     );
   } catch (error) {
     log("dashboard_config_reload_error", {
@@ -357,7 +378,7 @@ async function syncDashboardThread() {
 
   let replacement;
   try {
-    replacement = await startDashboard(repoRoot, 0, threadId);
+    replacement = await startDashboard(repoRoot, 0, threadId, desktopTaskAction);
   } catch (error) {
     log("dashboard_thread_reload_error", {
       threadId,
@@ -524,6 +545,7 @@ function buildPrompt(task, worktreePath) {
   return [
     `You are a ToDo worker in the task worktree ${worktreePath}.`,
     "Implement the claimed task directly. Do not enqueue the claimed task again.",
+    WORKER_TOOLING_BOUNDARY,
     ...taskCreationInstructions,
     "Read AGENTS.md and all applicable nested AGENTS.md files before acting.",
     "Preserve unrelated and concurrent changes.",
@@ -532,7 +554,7 @@ function buildPrompt(task, worktreePath) {
     "Do not edit or delete .todo task, claim, history, daemon, log, or config files.",
     "Complete only this task, run the smallest relevant tests or verification, and report at least one concrete validation result. A completed result with no validation evidence is invalid.",
     "Reuse tool results within this attempt. Prefer narrow field filters, limits, and targeted log ranges; do not repeatedly fetch unchanged resources.",
-    "Do not ask for user input. If blocked, return status failed with one concrete actionable error.",
+    "If a user decision is required, use the runtime's user-input tool when available. Otherwise return status failed with requiresInteractive=true and the exact question as interactiveReason so the dashboard can request an answer.",
     "Set requiresInteractive=true only when the task cannot be completed without current-thread Browser, Chrome, Computer Use, user approval, or user interaction. Include one concrete interactiveReason. For every other result set requiresInteractive=false and interactiveReason=null.",
     "Return only the JSON object required by the output schema.",
     "",
@@ -601,6 +623,7 @@ function buildPipelineStepPrompt(
       ? `The deterministic pipeline step failed. Repair the worktree so the step passes. Do not lower quality thresholds, disable checks, or remove meaningful tests unless the task explicitly requires it.\n\nFailure receipt:\n${failurePayload}`
       : null,
     "The runner executes the configured shell gates authoritatively after agent steps. Do not proactively rerun those full commands inside this Codex step; use only a narrower diagnostic command when it is necessary to implement or repair the change.",
+    WORKER_TOOLING_BOUNDARY,
     "Do not run Git mutation or delivery commands; the ToDo runner owns Git finalization.",
     "Return only the JSON object required by the pipeline step output schema. Validation may be empty because the runner executes authoritative shell gates.",
   ]
@@ -624,7 +647,7 @@ function buildPipelineStepPrompt(
     taskCreationInstructions,
     "Read AGENTS.md and applicable nested AGENTS.md files before editing.",
     "Do not edit or delete .todo runtime files.",
-    "Do not ask for user input. If current-thread-only interaction is required, return a failed result with requiresInteractive=true and one concrete interactiveReason.",
+    "When a user decision or current-thread capability is required, use the runtime's user-input tool when available, or return a failed result with requiresInteractive=true and the exact question or capability needed as interactiveReason.",
     "For all other results set requiresInteractive=false and interactiveReason=null.",
     "",
     TODO_PONYTAIL_FULL_CONTOUR,
@@ -672,14 +695,12 @@ function markInteractiveRequired(
   );
   const task = readTask(taskPath);
   task.metadata.execution = { ...execution, mode: "interactive" };
+  task.metadata.interaction = { state: "waiting-input", question: message,
+    nativeThreadId: task.metadata.interaction?.nativeThreadId || null,
+    updatedAt: new Date().toISOString() };
   writeTask(task);
 }
 
-function readLogTail(file, maxBytes = 12000) {
-  if (!existsSync(file)) return "";
-  const text = readFileSync(file, "utf8");
-  return text.slice(Math.max(0, text.length - maxBytes)).trim();
-}
 
 function attemptFailure(
   claim,
@@ -791,6 +812,7 @@ async function ensureAppServer(config) {
         TODO_RUNNER_REPO_ROOT: repoRoot,
       },
       onStderr: (chunk) => appendFileSync(stderrPath, chunk, "utf8"),
+      onServerRequest: handleAgentInputRequest,
     });
     try {
       await client.start();
@@ -807,6 +829,96 @@ async function ensureAppServer(config) {
     return await appServerStartPromise;
   } finally {
     appServerStartPromise = null;
+  }
+}
+
+function appTools(config) {
+  desktopClient ||= new DesktopClient({ command: config.codexCommand });
+  return desktopClient;
+}
+
+const interaction = createTaskInteraction({
+  repoRoot, active, getAppServer: () => appServer,
+  getClient: () => appTools(runtimeConfig),
+  getOwnerThreadId: () => getSupervisorStatus(repoRoot).automation?.targetThreadId,
+  onChange: () => scheduleSupervisorThreadTitleSync(runtimeConfig),
+});
+const desktopTaskAction = interaction.action;
+const handleAgentInputRequest = interaction.onServerRequest;
+
+function scheduleDesktopMaintenance(config) {
+  if (desktopMaintenance || Date.now() < nextDesktopAttemptAt || !process.env.CODEX_APP_TOOLS_PIPE_PATH) return;
+  const ownerThreadId = getSupervisorStatus(repoRoot).automation?.targetThreadId;
+  if (!ownerThreadId) return;
+  const tasks = listTaskStatuses(repoRoot, { includeClosed: true, limit: null });
+  const claimed = tasks.filter(task => task.claim?.owner?.threadId && task.claim.owner.turnId);
+  desktopMaintenance = (async () => {
+    const client = appTools(config);
+    const title = getSupervisorStatus(repoRoot).threadTitle;
+    if (desktopThreadStates.get(ownerThreadId) !== title) {
+      await client.call("set_thread_title", { threadId: ownerThreadId, title }, ownerThreadId);
+      desktopThreadStates.set(ownerThreadId, title);
+    }
+    for (const task of claimed) {
+      try {
+        const claim = readClaim(`${task.path}.lock`, { includeToken: true });
+        if (!claim?.owner) continue;
+        const observed = await client.call("read_thread", {
+          threadId: claim.owner.threadId, turnLimit: 10, includeOutputs: false,
+        }, ownerThreadId);
+        reconcileInteractiveClaim(repoRoot, task.id, observed, claim.token);
+      } catch (error) { log("desktop_claim_reconcile_error", { task: task.id, error: error.message }); }
+    }
+    let synced = 0;
+    for (const task of tasks) {
+      const threadId = task.interaction?.nativeThreadId || task.codexThread?.id;
+      if (!threadId || task.claim || active.has(task.id)) continue;
+      if (Date.now() < (desktopThreadRetryAt.get(threadId) || 0)) continue;
+      const name = formatTaskThreadTitle(repoRoot, task);
+      const shouldArchive = task.status !== "waiting-input" &&
+        (task.codexThread?.state === "archived" || ["completed", "failed", "canceled", "rejected"].includes(task.status));
+      const key = `${name}:${shouldArchive}`;
+      if (desktopThreadStates.get(threadId) === key) continue;
+      try {
+      const observed = await client.call("read_thread", { threadId, turnLimit: 1, includeOutputs: false }, ownerThreadId);
+      if (observed.thread?.status?.type === "active") continue;
+      // The app cannot rename an archived rollout. Reopen it without starting
+      // a turn, then restore archival even if renaming fails.
+      if (shouldArchive) await client.call("set_thread_archived", { threadId, archived: false }, ownerThreadId);
+      try {
+        await client.call("set_thread_title", { threadId, title: name }, ownerThreadId);
+      } finally {
+        if (shouldArchive) await client.call("set_thread_archived", { threadId, archived: true }, ownerThreadId);
+      }
+      desktopThreadStates.set(threadId, key);
+      } catch (error) {
+        desktopThreadRetryAt.set(threadId, Date.now() + 60000);
+        log("desktop_thread_reconcile_error", { task: task.id, error: error.message });
+      }
+      if (++synced >= 4) break;
+    }
+  })().catch(error => {
+    nextDesktopAttemptAt = Date.now() + 30000;
+    log("desktop_reconcile_error", { error: error.message });
+  })
+    .finally(() => { desktopMaintenance = null; });
+}
+
+function scheduleNativeTasks(config) {
+  if (Date.now() < nextDesktopDispatchAt || !process.env.CODEX_APP_TOOLS_PIPE_PATH ||
+      !getSupervisorStatus(repoRoot).automation?.targetThreadId || taskBatchPublicationActive(repoRoot)) return;
+  const tasks = listTaskStatuses(repoRoot);
+  let occupied = implementationActiveCount() + desktopDispatches.size +
+    tasks.filter(task => task.claim?.owner?.threadId || task.interaction?.dispatching).length;
+  for (const task of tasks) {
+    if (occupied >= config.workers) break;
+    if (task.execution?.mode !== "interactive" || task.status !== "queued" || task.claim ||
+        task.existingBlockers?.length || desktopDispatches.has(task.id) || task.interaction?.dispatching) continue;
+    desktopDispatches.add(task.id); occupied++;
+    desktopTaskAction({ taskId: task.id, action: "native" }).catch(error => {
+      nextDesktopDispatchAt = Date.now() + 30000;
+      log("desktop_dispatch_error", { task: task.id, error: error.message });
+    }).finally(() => desktopDispatches.delete(task.id));
   }
 }
 
@@ -917,6 +1029,7 @@ async function loadTaskThread(taskPath, execution, worktreePath, config) {
       createdAt: new Date().toISOString(),
     });
     log("task_thread_created", { task: task.id, threadId: thread.id });
+    await nameTaskThread(client, taskPath, task);
     return thread;
   }
   if (
@@ -932,7 +1045,20 @@ async function loadTaskThread(taskPath, execution, worktreePath, config) {
     log("task_thread_unarchived", { task: task.id, threadId: thread.id });
   }
   await client.resumeThread(thread.id, common);
+  await nameTaskThread(client, taskPath, task);
   return thread;
+}
+
+async function nameTaskThread(client, taskPath, task = readTask(taskPath)) {
+  const saved = readTask(taskPath).metadata.codexThread;
+  const name = formatTaskThreadTitle(repoRoot, task);
+  if (!saved?.id || saved.name === name) return;
+  try {
+    await client.setThreadName(saved.id, name);
+    updateTaskCodexThread(taskPath, { name });
+  } catch (error) {
+    log("task_thread_name_error", { task: task.id, error: error.message });
+  }
 }
 
 async function archiveTaskThread(taskPath, config) {
@@ -1083,7 +1209,7 @@ async function executeDeliveryOnly(taskPath, claim, workerId, config) {
       }
     }
     releaseClaim(claim);
-    active.delete(task.id);
+    interaction.abandon(task.id); active.delete(task.id);
     const status = getTaskStatus(repoRoot, task.id).status;
     log("delivery_end", { task: task.id, status });
     writeState();
@@ -1121,7 +1247,7 @@ async function executeTaskWithExec(taskPath, claim, workerId, config) {
       previousMetrics,
     );
     releaseClaim(claim);
-    active.delete(task.id);
+    interaction.abandon(task.id); active.delete(task.id);
     log("task_pre_model_failure", {
       task: task.id,
       kind: error.kind || "git_prepare",
@@ -1500,7 +1626,7 @@ async function executeTaskWithExec(taskPath, claim, workerId, config) {
     );
   } finally {
     releaseClaim(claim);
-    active.delete(task.id);
+    interaction.abandon(task.id); active.delete(task.id);
     const finalStatus = getTaskStatus(repoRoot, task.id);
     const status = finalStatus.status;
     const modelAttemptStatus =
@@ -1576,7 +1702,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
       previousMetrics,
     );
     releaseClaim(claim);
-    active.delete(task.id);
+    interaction.abandon(task.id); active.delete(task.id);
     log("task_pre_model_failure", {
       task: task.id,
       kind: error.kind || "git_prepare",
@@ -1879,7 +2005,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
       });
     }
     releaseClaim(claim);
-    active.delete(task.id);
+    interaction.abandon(task.id); active.delete(task.id);
     const finalStatus = getTaskStatus(repoRoot, task.id);
     const modelAttemptStatus =
       finalStatus.attemptLedger?.attempts?.find(
@@ -1937,7 +2063,9 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
   let pipeline;
   let preparedGit;
   try {
-    pipeline = loadPipelineSnapshot(repoRoot, task.metadata.pipeline);
+    pipeline = resolvePipelineProfiles(config,
+      loadPipelineSnapshot(repoRoot, task.metadata.pipeline),
+      task.metadata.execution || resolveTaskExecution(config, {}));
     preparedGit = await prepareTaskGit(repoRoot, taskPath);
   } catch (error) {
     setTaskError(
@@ -1948,7 +2076,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
       previousMetrics,
     );
     releaseClaim(claim);
-    active.delete(task.id);
+    interaction.abandon(task.id); active.delete(task.id);
     log("task_pre_model_failure", {
       task: task.id,
       kind: error.message.includes("pipeline")
@@ -2155,7 +2283,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     threadId = thread.id;
     const client = await ensureAppServer(config);
     const entry = active.get(task.id);
-    if (entry) entry.threadId = threadId;
+    if (entry) { entry.threadId = threadId; entry.turnId = null; }
     let finalMessage = null;
     log("pipeline_step_start", {
       task: task.id,
@@ -2254,79 +2382,19 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     const stderrPath = path.join(directory, "stderr.log");
     const receiptPath = path.join(directory, "receipt.json");
     const cwd = path.resolve(preparedGit.worktreePath, step.cwd);
-    const stdoutFd = openSync(stdoutPath, "a");
-    const stderrFd = openSync(stderrPath, "a");
-    const shellStartedAt = Date.now();
-    let child;
-    let spawnError = null;
-    let exitCode = null;
-    let signal = null;
-    let timedOut = false;
-    log("pipeline_step_start", {
-      task: task.id,
-      step: step.id,
-      type: step.type,
-      repairRound: context.repairRound,
-      command: step.command,
-      cwd: step.cwd,
+    log("pipeline_step_start", { task: task.id, step: step.id, type: step.type,
+      repairRound: context.repairRound, command: step.command, cwd: step.cwd });
+    const receipt = await runShellCommand({
+      command: step.command, cwd, timeoutSeconds: step.timeoutSeconds,
+      stdoutPath, stderrPath,
+      env: { ...process.env, TODO_RUNNER_WORKER: "1", TODO_RUNNER_REPO_ROOT: repoRoot, TODO_RUNNER_TASK_FILE: taskPath },
+      onChild: child => { const entry = active.get(task.id); if (entry) entry.child = child; },
     });
-    try {
-      child = spawn(step.command, {
-        cwd,
-        env: {
-          ...process.env,
-          TODO_RUNNER_WORKER: "1",
-          TODO_RUNNER_REPO_ROOT: repoRoot,
-          TODO_RUNNER_TASK_FILE: taskPath,
-        },
-        shell: true,
-        stdio: ["ignore", stdoutFd, stderrFd],
-      });
-      const entry = active.get(task.id);
-      if (entry) entry.child = child;
-      let forceKill = null;
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        if (child.exitCode === null && child.signalCode === null) {
-          child.kill("SIGTERM");
-          forceKill = setTimeout(() => {
-            if (child.exitCode === null && child.signalCode === null) {
-              child.kill("SIGKILL");
-            }
-          }, 2000);
-        }
-      }, step.timeoutSeconds * 1000);
-      ({ exitCode, signal } = await new Promise((resolve) => {
-        child.once("error", (error) => {
-          spawnError = error;
-          resolve({ exitCode: null, signal: null });
-        });
-        child.once("close", (code, closedSignal) =>
-          resolve({ exitCode: code, signal: closedSignal }),
-        );
-      }));
-      clearTimeout(timeout);
-      if (forceKill) clearTimeout(forceKill);
-    } finally {
-      closeSync(stdoutFd);
-      closeSync(stderrFd);
-      const entry = active.get(task.id);
-      if (entry?.child === child) entry.child = null;
-    }
-    const passed = !spawnError && !timedOut && exitCode === 0;
-    const receipt = {
-      status: passed ? "completed" : "failed",
-      command: step.command,
-      cwd: step.cwd,
-      exitCode,
-      signal,
-      timedOut,
-      durationMs: Date.now() - shellStartedAt,
-      stdoutPath: path.relative(repoRoot, stdoutPath),
-      stderrPath: path.relative(repoRoot, stderrPath),
-      stdoutTail: readLogTail(stdoutPath, 6000),
-      stderrTail: readLogTail(stderrPath, 6000),
-    };
+    receipt.cwd = step.cwd;
+    receipt.stdoutPath = path.relative(repoRoot, stdoutPath);
+    receipt.stderrPath = path.relative(repoRoot, stderrPath);
+    const { exitCode, signal, timedOut } = receipt;
+    const passed = receipt.status === "completed";
     atomicWriteJson(receiptPath, receipt);
     log("pipeline_step_end", {
       task: task.id,
@@ -2340,7 +2408,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     });
     const error = passed
       ? null
-      : spawnError?.message ||
+      : receipt.error ||
         (timedOut
           ? `timed out after ${step.timeoutSeconds}s`
           : receipt.stderrTail || receipt.stdoutTail || `exit code ${exitCode}`);
@@ -2394,11 +2462,14 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
 
   try {
     pipelineResult = await runPipeline(pipeline, {
-      runCodex: (step, context) =>
-        step.type === "codex-exec"
-          ? runExecStep(step, context)
-          : runThreadStep(step, context),
-      runShell: runShellStep,
+      runCodex: (step, context) => {
+        if (stopping) throw new Error("Pipeline interrupted by runner shutdown");
+        return step.type === "codex-exec" ? runExecStep(step, context) : runThreadStep(step, context);
+      },
+      runShell: (step, context) => {
+        if (stopping) throw new Error("Pipeline interrupted by runner shutdown");
+        return runShellStep(step, context);
+      },
       onState: async (state) => {
         atomicWriteJson(pipelineRunPath, {
           schemaVersion: 1,
@@ -2413,7 +2484,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
           ...state,
         });
       },
-    });
+    }, task.metadata.pipelineContinuation?.ready ? task.metadata.pipelineContinuation : null);
   } catch (error) {
     runError = error;
   }
@@ -2482,6 +2553,13 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
             true,
           ),
         );
+        const waiting = readTask(taskPath);
+        waiting.metadata.pipelineContinuation = pipelineResult.continuation;
+        waiting.metadata.interaction = { state: "waiting-input", question: failure.interactiveReason,
+          nativeThreadId: waiting.metadata.interaction?.nativeThreadId || null,
+          updatedAt: new Date().toISOString() };
+        waiting.metadata.execution = { ...waiting.metadata.execution, mode: "interactive" };
+        writeTask(waiting);
       } else {
         const message =
           failure.error || failure.summary || `pipeline step ${pipelineResult.failedStep.id} failed`;
@@ -2576,7 +2654,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
       }
     }
     releaseClaim(claim);
-    active.delete(task.id);
+    interaction.abandon(task.id); active.delete(task.id);
     const finalStatus = getTaskStatus(repoRoot, task.id);
     const attemptStatus =
       finalStatus.attemptLedger?.attempts?.find(
@@ -2624,6 +2702,34 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
 
 async function executeTask(taskPath, claim, workerId, config) {
   const task = readTask(taskPath);
+  // Resolve once per attempt, so a config reload cannot change an active turn.
+  if (!["model-completed", "committing", "committed", "delivered"].includes(task.metadata.git?.phase)) {
+    try {
+      const profileConfig = { ...config, modelCatalog: null };
+      const previous = task.metadata.execution;
+      const execution = resolveSavedExecution(profileConfig, previous);
+      const profiles = [{ ...execution, name: execution.modelProfile }];
+      if (task.metadata.pipeline && task.metadata.git?.phase !== "merge-conflict") {
+        const pipeline = resolvePipelineProfiles(profileConfig,
+          loadPipelineSnapshot(repoRoot, task.metadata.pipeline), execution);
+        profiles.push(...[...pipeline.steps, pipeline.repair].filter(step => step?.model).map(step => ({ ...step, name: step.modelProfile })));
+      }
+      task.metadata.execution = execution;
+      writeTask(task);
+      if (previous && (previous.model !== execution.model || previous.reasoningEffort !== execution.reasoningEffort)) {
+        log("task_model_refreshed", { task: task.id, profile: execution.modelProfile,
+          previousModel: previous.model, model: execution.model, reasoningEffort: execution.reasoningEffort });
+      }
+      let catalog = await refreshModelCatalog(repoRoot, config.codexCommand);
+      try { assertProfilesAvailable(profiles, catalog); }
+      catch { catalog = await refreshModelCatalog(repoRoot, config.codexCommand, { force: true }); }
+      assertProfilesAvailable(profiles, catalog);
+      config = { ...config, modelCatalog: catalog };
+    } catch (error) {
+      setTaskError(taskPath, "model_unavailable", null, `Current model profile check failed: ${error.message}`, task.metadata.metrics || null);
+      releaseClaim(claim); interaction.abandon(task.id); active.delete(task.id); writeState(); return;
+    }
+  }
   if (
     task.metadata.pipeline &&
     task.metadata.git?.phase !== "merge-conflict"
@@ -2673,7 +2779,7 @@ function mergeQueueBlockedByEarlierBatchSibling(candidate, entries) {
   if (candidateSequence === null || !candidateBatch || !targetBranch) {
     return false;
   }
-  return entries.some((entry) => {
+  return entries.find((entry) => {
     if (entry.taskPath === candidate.taskPath) return false;
     if (entry.batchId !== candidateBatch) return false;
     if (entry.status.git?.delivery !== "merge") return false;
@@ -2684,8 +2790,7 @@ function mergeQueueBlockedByEarlierBatchSibling(candidate, entries) {
   });
 }
 
-function queuedMergeCandidates() {
-  const entries = listTaskFiles(repoRoot).map(mergeQueueEntry);
+function queuedMergeCandidates(entries) {
   return entries
     .filter(({ status }) => status.status === "merge-queued")
     .filter((candidate) => !mergeQueueBlockedByEarlierBatchSibling(candidate, entries))
@@ -2701,26 +2806,63 @@ function queuedMergeCandidates() {
     });
 }
 
+let lastMergeQueueWaitKey = null;
+
+function reportMergeQueueWait(entries, override = null) {
+  const waiting = entries.filter(({ status }) => status.git?.phase === "merge-queued")
+    .map((entry) => {
+      const { status } = entry;
+      const sibling = mergeQueueBlockedByEarlierBatchSibling(entry, entries);
+      return { task: status.id, ...(override || (
+        active.has(status.id) ? { reason: "task_active" } :
+        status.claim || existsSync(`${entry.taskPath}.lock`) ? { reason: "task_claimed" } :
+        status.existingBlockers?.length ? { reason: "task_blockers", blockers: status.existingBlockers } :
+        status.status !== "merge-queued" ? { reason: "task_status", status: status.status } :
+        sibling ? { reason: "earlier_batch_sibling", blocker: sibling.status.id, status: sibling.status.status } :
+        { reason: "no_candidate" }
+      )) };
+    });
+  const key = waiting.length ? JSON.stringify(waiting) : null;
+  if (key && key !== lastMergeQueueWaitKey) log("merge_queue_waiting", { waiting });
+  lastMergeQueueWaitKey = key;
+}
+
 function startMergeQueueWorker(config) {
-  if (taskBatchPublicationActive(repoRoot) || hasSpecialWorker("merge-queue")) {
+  const entries = listTaskFiles(repoRoot).map(mergeQueueEntry);
+  if (taskBatchPublicationActive(repoRoot)) {
+    reportMergeQueueWait(entries, { reason: "task_batch_active" });
     return;
   }
-  const candidate = queuedMergeCandidates().find(
+  if (hasSpecialWorker("merge-queue")) {
+    reportMergeQueueWait(entries, { reason: "merge_worker_busy" });
+    return;
+  }
+  const candidate = queuedMergeCandidates(entries).find(
     ({ status }) => !active.has(status.id),
   );
-  if (!candidate) return;
+  if (!candidate) {
+    reportMergeQueueWait(entries);
+    return;
+  }
   const { taskPath, status } = candidate;
   let claim;
   try {
     claim = claimTask(taskPath, "merge-queue");
   } catch (error) {
+    reportMergeQueueWait(entries, {
+      reason: error.kind || (error.code === "EEXIST" ? "claim_contended" : "claim_error"),
+      candidate: status.id,
+      error: error.message,
+    });
     if (error.code !== "EEXIST") {
       log("merge_queue_claim_error", { task: status.id, error: error.message });
     }
     return;
   }
+  lastMergeQueueWaitKey = null;
   const entry = {
     claim,
+    abortController: new AbortController(),
     child: null,
     taskPath,
     workerId: "merge-queue",
@@ -2745,6 +2887,7 @@ function startMergeQueueWorker(config) {
         repoRoot,
         taskPath,
         path.relative(repoRoot, deliveryPath),
+        { onChild: child => { entry.child = child; }, signal: entry.abortController.signal },
       );
       atomicWriteJson(deliveryPath, merged);
       if (merged.status === "merged") {
@@ -2771,7 +2914,7 @@ function startMergeQueueWorker(config) {
       log("merge_queue_error", { task: status.id, error: error.message });
     } finally {
       releaseClaim(claim);
-      active.delete(status.id);
+      interaction.abandon(status.id); active.delete(status.id);
       writeState();
     }
   })();
@@ -2839,7 +2982,7 @@ function startMergeConflictRepair(config) {
   ).catch((error) => {
     log("merge_repair_error", { task: status.id, error: error.message });
     if (existsSync(`${taskPath}.lock`)) releaseClaim(claim);
-    active.delete(status.id);
+    interaction.abandon(status.id); active.delete(status.id);
     writeState();
   });
   entry.promise = promise;
@@ -2951,7 +3094,7 @@ function startReadyTasks(config) {
             ),
       );
       releaseClaim(claim);
-      active.delete(id);
+      interaction.abandon(id); active.delete(id);
       log("task_unhandled_error", { task: id, error: error.message });
     });
     const entry = active.get(id);
@@ -2990,6 +3133,7 @@ async function shutdown(signal) {
   }
   const interrupted = [...active.values()];
   for (const entry of interrupted) {
+    entry.abortController?.abort();
     if (appServer && entry.threadId && entry.turnId) {
       appServer.interruptTurn(entry.threadId, entry.turnId).catch((error) => {
         log("turn_interrupt_error", {
@@ -3003,7 +3147,8 @@ async function shutdown(signal) {
       entry.child.exitCode === null &&
       entry.child.signalCode === null
     ) {
-      entry.child.kill();
+      if (entry.child.terminateTree) entry.child.terminateTree();
+      else entry.child.kill();
     }
   }
   const pending = Promise.allSettled(
@@ -3020,7 +3165,8 @@ async function shutdown(signal) {
         entry.child.exitCode === null &&
         entry.child.signalCode === null
       ) {
-        entry.child.kill("SIGKILL");
+        if (entry.child.terminateTree) entry.child.terminateTree();
+        else entry.child.kill("SIGKILL");
       }
     }
     await Promise.race([
@@ -3054,6 +3200,7 @@ async function shutdown(signal) {
   if (current?.token === daemonToken && existsSync(daemonStatePath(repoRoot))) {
     unlinkSync(daemonStatePath(repoRoot));
   }
+  desktopClient?.close();
   process.exit(0);
 }
 
@@ -3079,6 +3226,7 @@ async function shutdownForRuntimeUpdate() {
   if (current?.token === daemonToken && existsSync(daemonStatePath(repoRoot))) {
     unlinkSync(daemonStatePath(repoRoot));
   }
+  desktopClient?.close();
   process.exit(0);
 }
 
@@ -3106,6 +3254,7 @@ try {
     repoRoot,
     runtimeConfig.dashboardPort,
     initialDashboardThreadId,
+    desktopTaskAction,
   );
 } catch (error) {
   if (runtimeConfig.dashboardPort === 0) throw error;
@@ -3113,7 +3262,7 @@ try {
     requestedPort: runtimeConfig.dashboardPort,
     error: error.message,
   });
-  dashboard = await startDashboard(repoRoot, 0, initialDashboardThreadId);
+  dashboard = await startDashboard(repoRoot, 0, initialDashboardThreadId, desktopTaskAction);
 }
 watchDashboardErrors(dashboard);
 log("daemon_start", {
@@ -3122,6 +3271,23 @@ log("daemon_start", {
   dashboardUrl: dashboard.url,
 });
 cleanupStaleClaims(repoRoot);
+// File events include mutations made by MCP and interactive app sessions. Keep
+// polling as recovery for lost fs events; no scheduled model run is involved.
+let titleChangeTimer = null;
+const taskChanges = watch(todoDir(repoRoot), (_event, filename) => {
+  const name = String(filename || "");
+  if (name && !/^[0-9].*\.md(?:\.lock)?$/.test(name) && name !== "supervisor.json") return;
+  clearTimeout(titleChangeTimer);
+  titleChangeTimer = setTimeout(() => {
+    if (!stopping) {
+      scheduleSupervisorThreadTitleSync(runtimeConfig);
+      scheduleDesktopMaintenance(runtimeConfig);
+    scheduleNativeTasks(runtimeConfig);
+    }
+  }, 25);
+});
+taskChanges.on("error", error => log("task_watch_error", { error: error.message }));
+process.once("exit", () => { clearTimeout(titleChangeTimer); taskChanges.close(); });
 process.on("SIGUSR2", () => {
   scheduleDashboardThreadSync().catch((error) => {
     log("dashboard_thread_reload_error", { error: error.message });
@@ -3138,6 +3304,13 @@ while (!stopping) {
     { pid: process.pid, token: daemonToken },
     ownRuntime,
   );
+  if (restartDecision.retiredRequest) {
+    log("runtime_update_request_retired", {
+      requestId: restartDecision.retiredRequest.requestId,
+      reason: "predecessor_daemon",
+      previousDaemon: restartDecision.retiredRequest.daemon,
+    });
+  }
   if (restartDecision.pending) {
     runtimeUpdateRequest = restartDecision.request;
     if (active.size === 0) {
@@ -3184,6 +3357,8 @@ while (!stopping) {
     await processPendingThreadArchives(runtimeConfig);
     scheduleSupervisorThreadTitleSync(runtimeConfig);
     startReadyTasks(runtimeConfig);
+    scheduleDesktopMaintenance(runtimeConfig);
+    scheduleNativeTasks(runtimeConfig);
     startMergeQueueWorker(runtimeConfig);
     startMergeConflictRepair(runtimeConfig);
     scheduleSupervisorThreadTitleSync(runtimeConfig);

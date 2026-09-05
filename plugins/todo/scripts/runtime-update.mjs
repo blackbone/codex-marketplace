@@ -13,6 +13,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   acquireTaskBatchGate,
   atomicWriteJson,
+  readDaemonState,
   releaseTaskBatchGate,
   todoDir,
 } from "./lib.mjs";
@@ -29,6 +30,14 @@ const REQUIRED_RUNTIME_FILES = [
   ".mcp.json",
   "hooks/hooks.json",
   "scripts/attempt-ledger.mjs",
+    "scripts/bounded-log.mjs",
+    "scripts/shell-step.mjs",
+    "scripts/model-profiles.mjs",
+    "scripts/app-server-client.mjs",
+    "scripts/desktop-client.mjs",
+    "scripts/task-interaction.mjs",
+    "scripts/interactive-stop.mjs",
+
   "scripts/daemon.mjs",
   "scripts/dashboard.mjs",
   "scripts/ensure-daemon.mjs",
@@ -395,12 +404,34 @@ export function clearDaemonRestartRequest(repoRoot, requestId = null) {
 }
 
 export function daemonRestartDecision(repoRoot, daemon, ownRuntime) {
-  const request = readDaemonRestartRequest(repoRoot);
+  let request = readDaemonRestartRequest(repoRoot);
+  if (!request) return { pending: false, request: null };
+  const hasOwner = value => typeof value?.requestId === "string" && value.requestId &&
+    Number.isInteger(value.daemon?.pid) && value.daemon.pid > 0 &&
+    (value.daemon.token === null || typeof value.daemon.token === "string");
   if (
-    !request ||
     request.daemon?.pid !== daemon.pid ||
     request.daemon?.token !== daemon.token
   ) {
+    // Only the published owner may retire a predecessor's request. Serialize
+    // with requestDaemonRestart/claimTask and reread so a fresh update survives.
+    let gate;
+    try {
+      gate = acquireTaskBatchGate(repoRoot, { purpose: "runtime-update-reconcile" });
+      const owner = readDaemonState(repoRoot);
+      request = readDaemonRestartRequest(repoRoot);
+      if (
+        hasOwner(request) && owner?.pid === daemon.pid && owner?.token === daemon.token &&
+        (request.daemon?.pid !== daemon.pid || request.daemon?.token !== daemon.token)
+      ) {
+        clearDaemonRestartRequest(repoRoot, request.requestId);
+        return { pending: false, request: null, retiredRequest: request };
+      }
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    } finally {
+      releaseTaskBatchGate(gate);
+    }
     return { pending: false, request: null };
   }
   if (request.target?.fingerprint === ownRuntime.fingerprint) {

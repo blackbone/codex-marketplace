@@ -1,13 +1,27 @@
 ---
 name: route
-description: Route every repository mutation through ToDo in repositories containing .todo/config.json, even when the user does not mention ToDo. Use for any request to create, edit, delete, rename, generate, format, commit, deploy, run an implementation, or change repository state. Do not use for read-only analysis, explanation, audit, planning, status, listing, or inspection.
+description: Route product code, project documentation, application dependencies, build, CI/CD, deployment, and other project mutations through ToDo in repositories containing .todo/config.json. Classify by purpose and effects, not path or plugin invocation. Codex plugin and auxiliary tool installation, configuration, updates, diagnostics, tool connections, service configs, indexes, and caches run directly even inside repositories. Split mixed requests. Read-only work stays inline; preserve permissions, hook trust, and claimed worker scope.
 ---
 
 # ToDo Route
 
 Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
 
-1. Confirm the active Git repository contains `.todo/config.json`.
+<!-- TODO TOOLING EXCEPTION START -->
+Classify each operation by its purpose and effects, not just its file path or the fact that a plugin/tool is invoked.
+- Perform Codex plugin and auxiliary tool installation, configuration, updates, diagnostics, tool connections, and creation or refresh of their service configurations, indexes, and caches directly, without creating a ToDo task. This includes service files inside the repository.
+- Product code, project documentation, application dependencies, build, CI/CD, and deployment changes still require ToDo, even when performed through a plugin or described as "tooling setup". Developing a plugin as the repository's product is also a project change.
+- Split mixed requests: perform tool setup directly and route project changes through ToDo. Complete prerequisite setup before publishing dependent project tasks; a setup failure must not publish tasks that depend on it.
+- A user's request to configure a tool already authorizes that setup; do not ask for a separate routing confirmation. Preserve existing permission, access, authentication, and hook-trust requirements; never approve hook trust on the user's behalf.
+- Examples: semantic-search:init writing .semantic-search.json and indexing docs/ is direct; configuring another Codex plugin or MCP connection is direct; editing source code or docs/ through a plugin requires ToDo; changing a build pipeline or deployment under the label "tooling setup" requires ToDo; connecting a documentation search tool and then rewriting project documentation splits into direct setup and a ToDo documentation task.
+
+The tooling exception does not expand a claimed worker's assigned task scope, repository access, permissions, or authority to create follow-up tasks. Perform tool setup only when required for the assigned task and already allowed by its restrictions; never use it to alter unrelated repositories, managed routing instructions, or .todo runtime state.
+<!-- TODO TOOLING EXCEPTION END -->
+
+Use `modelDiagnostics` and `modelProfiles` returned by preflight when selecting a model. Report outdated, retired, unsupported, or unverified profiles explicitly; never silently fall back. Use `model_profiles` with `action: inspect` to show all executor models, task roles, and the proposed cleanup/update. Show the exact removals/replacements before applying the returned `planId`; apply only within the user's authorization. The `models` config block is optional; omission inherits the plugin profiles. Preserve valid custom profiles, task profile names, and pipeline commands. Resolve saved tasks and pipeline steps through their current named profiles at each new attempt; an old model ID must not pin the task to a retired model. If the profile itself is missing or its current model is unavailable, report it instead of changing profiles. Prefer `fast`/`medium`/`advanced` for routine work and Astra `expert`/`ultra` for complex/very complex work. Spark is excluded from ToDo and must not be selected or added back. Legacy profiles remain selectable only when the executor still supports them.
+
+
+1. Apply the purpose-based exception above before preflight or task creation. For setup-only requests, perform the requested setup directly and stop this routing workflow. For mixed requests, route only the project portion; record completed setup and any required dependency in its implementation context. Confirm the project portion targets a Git repository containing `.todo/config.json`. Route project mutations even when the user does not mention ToDo.
 2. Apply the injected Ponytail full execution contour. Inspect only enough context to make the requested change self-contained and resolve the real owner, flow, affected callers, existing reusable contract, smallest correct implementation, unnecessary alternatives, and exact minimal validation.
    - Always prefer multiple atomic tasks over one broad implementation task. One task owns one independently implementable and independently verifiable outcome.
    - A user list is a decomposition signal, not one mutation merely because it arrived in one prompt. Split independent bullets, owners, runtime layers, migrations, and validation surfaces into separate tasks.

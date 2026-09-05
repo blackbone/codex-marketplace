@@ -14,11 +14,12 @@ function turnKey(threadId, turnId) {
 }
 
 export class AppServerClient {
-  constructor({ command = "codex", cwd, env = process.env, onStderr } = {}) {
+  constructor({ command = "codex", cwd, env = process.env, onStderr, onServerRequest } = {}) {
     this.command = command;
     this.cwd = cwd;
     this.env = env;
     this.onStderr = onStderr;
+    this.onServerRequest = onServerRequest;
     this.child = null;
     this.nextId = 1;
     this.pending = new Map();
@@ -88,6 +89,13 @@ export class AppServerClient {
       return;
     }
     if (Object.hasOwn(message, "id") && message.method) {
+      if (this.onServerRequest) {
+        Promise.resolve().then(() => this.onServerRequest(message)).then(
+          result => this.write({ id: message.id, result }),
+          error => this.write({ id: message.id, error: { code: -32601, message: error.message } }),
+        ).catch(error => this.onStderr?.(`${error.message}\n`));
+        return;
+      }
       this.write({
         id: message.id,
         error: {
@@ -210,6 +218,12 @@ export class AppServerClient {
 
   interruptTurn(threadId, turnId) {
     return this.request("turn/interrupt", { threadId, turnId });
+  }
+
+  steerTurn(threadId, turnId, text) {
+    return this.request("turn/steer", {
+      threadId, expectedTurnId: turnId, input: [{ type: "text", text }],
+    });
   }
 
   failAll(error) {

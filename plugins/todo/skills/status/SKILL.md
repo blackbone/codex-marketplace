@@ -15,3 +15,5 @@ Pass the target repository's absolute root as `repoPath` to every ToDo MCP call.
 6. Include runner state, merge worker state, and the dashboard URL when returned.
 7. Include the supervisor's configured status, desired status, required action, persisted `targetThreadId`, computed `threadTitle`, active-task count, and the runner's `supervisorThreadTitle` synchronization state when returned.
 8. Preserve status values exactly as returned.
+
+9. Inspect `runner.modelDiagnostics`. For stale, unsupported, retired, or unverified profiles, call `model_profiles` with `action: inspect`, show the exact affected profile/model and proposed replacements/removals, and offer the update. Do not apply it without authorization for the displayed plan. Distinguish executor-unavailable models from globally retired models.

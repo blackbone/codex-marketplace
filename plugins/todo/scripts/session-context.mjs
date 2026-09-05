@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   TODO_ROUTING_POLICY,
+  refreshRepoRoutingPolicy,
 } from "./routing-policy.mjs";
 import { TODO_PONYTAIL_FULL_CONTOUR } from "./ponytail-policy.mjs";
 import {
@@ -60,6 +61,16 @@ process.stdin.on("end", () => {
   }
 
   let runtimeNotice = "";
+  let routingNotice = "";
+  // Subagents and claimed workers only receive policy; maintenance belongs to
+  // the interactive session, never to an assigned background task.
+  if (process.env.TODO_RUNNER_WORKER !== "1" && hookEventName !== "SubagentStart") {
+    const refreshed = refreshRepoRoutingPolicy(repoRoot);
+    const errors = refreshed.files.filter((file) => file.error);
+    if (errors.length) {
+      routingNotice = `ToDo managed routing refresh failed; existing instructions were preserved: ${errors.map((file) => file.error).join("; ")}`;
+    }
+  }
   if (process.env.TODO_RUNNER_WORKER !== "1") {
     try {
       const daemon = readDaemonState(repoRoot);
@@ -90,6 +101,7 @@ process.stdin.on("end", () => {
   }
 
   const contextBlocks = [TODO_ROUTING_POLICY, TODO_PONYTAIL_FULL_CONTOUR];
+  if (routingNotice) contextBlocks.push(routingNotice);
   if (process.env.TODO_RUNNER_WORKER === "1") {
     contextBlocks.push(
       "This session is an already claimed ToDo background worker. Implement the supplied task directly and do not modify .todo runtime files. Create follow-up ToDo tasks only when the claimed task records explicit user authorization; otherwise do not call ToDo MCP tools.",

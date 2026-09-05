@@ -34,7 +34,37 @@ its current local URL.
 
 In an activated repository, `$todo:route` applies to repository mutations even
 when ToDo is not mentioned explicitly. Read-only analysis, planning, status, and
-inspection stay in the current thread.
+inspection stay in the current thread. The legacy config value `all-mutations`
+means project mutations subject to the following purpose-based exception.
+
+<!-- TODO TOOLING EXCEPTION START -->
+Classify each operation by its purpose and effects, not just its file path or the fact that a plugin/tool is invoked.
+- Perform Codex plugin and auxiliary tool installation, configuration, updates, diagnostics, tool connections, and creation or refresh of their service configurations, indexes, and caches directly, without creating a ToDo task. This includes service files inside the repository.
+- Product code, project documentation, application dependencies, build, CI/CD, and deployment changes still require ToDo, even when performed through a plugin or described as "tooling setup". Developing a plugin as the repository's product is also a project change.
+- Split mixed requests: perform tool setup directly and route project changes through ToDo. Complete prerequisite setup before publishing dependent project tasks; a setup failure must not publish tasks that depend on it.
+- A user's request to configure a tool already authorizes that setup; do not ask for a separate routing confirmation. Preserve existing permission, access, authentication, and hook-trust requirements; never approve hook trust on the user's behalf.
+- Examples: semantic-search:init writing .semantic-search.json and indexing docs/ is direct; configuring another Codex plugin or MCP connection is direct; editing source code or docs/ through a plugin requires ToDo; changing a build pipeline or deployment under the label "tooling setup" requires ToDo; connecting a documentation search tool and then rewriting project documentation splits into direct setup and a ToDo documentation task.
+
+The tooling exception does not expand a claimed worker's assigned task scope, repository access, permissions, or authority to create follow-up tasks. Perform tool setup only when required for the assigned task and already allowed by its restrictions; never use it to alter unrelated repositories, managed routing instructions, or .todo runtime state.
+<!-- TODO TOOLING EXCEPTION END -->
+
+After a plugin update, trusted `SessionStart` and `UserPromptSubmit` hooks refresh
+existing ToDo-managed blocks in root `AGENTS.md` and `AGENTS.override.md`.
+Content outside the markers, configuration, and task state are preserved.
+Missing blocks are not silently installed; use `$todo:init` to restore one.
+Malformed or duplicate markers and symlinked instruction files are left intact
+and reported. Background workers and subagent hooks do not refresh blocks.
+Without trusted hooks, run the bundled maintenance command directly for explicit
+repository roots (or invoke `$todo:init`); no ToDo task or additional routing
+confirmation is needed:
+
+```bash
+node "$PLUGIN_ROOT/scripts/refresh-routing-policy.mjs" /path/to/repository
+```
+
+Reinstallation does not scan all repositories or grant hook trust. Open a new
+Codex task to load updated skills and MCP descriptions; repository blocks update
+on their next trusted hook or the explicit maintenance command.
 
 Routing always prefers independently implementable and independently verifiable
 tasks over one broad change. Lists, separate owners, runtime layers, migrations,
@@ -58,8 +88,7 @@ expired or mismatched receipt, missing required capability, or failed publicatio
 creates zero runnable tasks.
 
 Each atomic task uses the lowest configured model tier that can confidently
-implement, test or otherwise verify, and self-review it. Every model retry moves
-to the next configured tier when one exists. Tasks run in background workers by default. Choose interactive execution only
+implement, test or otherwise verify, and self-review it. Built-in retries follow the task-role escalation path described below; custom profiles advance through their configured order. Tasks run in background workers by default. Choose interactive execution only
 when requested or when a worker records a concrete current-thread-only capability
 requirement. A claim token prevents background and interactive execution of the
 same task at the same time.
@@ -123,7 +152,7 @@ the same task body and brief and resumes from the concrete failed fact.
 | Skill | Purpose |
 | --- | --- |
 | `$todo:init` | Activate ToDo in a Git repository. |
-| `$todo:route` | Route a repository mutation into a durable task. |
+| `$todo:route` | Route project changes into tasks; perform tool setup directly. |
 | `$todo:create` | Create an explicit self-contained task. |
 | `$todo:run` | Claim and execute a task in the current thread. |
 | `$todo:start` | Start the runner, bind its supervisor, and open its dashboard in the in-app Browser. |
@@ -134,10 +163,64 @@ the same task body and brief and resumes from the concrete failed fact.
 | `$todo:update`, `$todo:retry`, `$todo:reopen`, `$todo:cancel` | Manage an unclaimed or closed task. |
 | `$todo:artifact-add` | Attach files, images, URLs, code, or text context. |
 
-The plugin exposes 21 corresponding MCP tools for preflight, atomic batch
+The plugin exposes 23 corresponding MCP tools for preflight, atomic batch
 publication, activation, task lifecycle, interactive claims, runner control,
 artifacts, supervisor binding, status, and workers. Skills are the supported
 user-facing entry points; direct tool calls are agent internals.
+
+## Human input and native app execution
+
+The dashboard's **Answer** / **Chat / input** control shows the outstanding
+question, accepts answers, sends instructions, and opens the associated Codex
+chat. **Logs** continues to show per-attempt execution evidence. `waiting-input`
+is a separate status; automatic retries do not consume unanswered questions.
+An app-server `item/tool/requestUserInput` request stays attached to its live
+turn. Dashboard replies must match its request and claim; steer must match the
+active turn. If the run ends before an answer, the task stays waiting and can
+continue in a native chat instead of pretending that the old request is live.
+
+Native execution uses `$todo:run`, `task_run_start`, `task_run_wait`, and
+`task_run_finish`. The executor must supply both thread and turn metadata;
+missing ownership is an error before claiming, not a shared-MCP-PID lease.
+Repeated starts from the same prepared turn return the same claim. A different
+turn cannot finish it. `task_run_wait` persists the question and releases the
+claim. A trusted Stop hook releases only an exact matching turn; otherwise the
+runner needs a host-confirmed ended turn to recover the claim. Unknown or active
+host status never expires it. Use `$todo:run` again after answering.
+
+Native dashboard actions and automatic dispatch of queued `runMode: interactive`
+tasks require the installed official `codex-app-tools` MCP, an inherited
+`CODEX_APP_TOOLS_PIPE_PATH`, and a host-confirmed supervisor owner. This adapter
+is conditional: an app-server process alone does not provide the Codex app's
+Browser or user-interaction capabilities. If the official MCP connection is
+unavailable (including `Codex app tools pipe closed`), dashboard app actions
+report the error and native dispatch remains unavailable. Continue from a Codex
+app chat with `$todo:run`; do not assume native access was established merely
+because a task was queued. The adapter uses the official MCP server and does not
+modify Codex's database or reproduce its private socket protocol.
+
+A connection or project-discovery failure does not reserve a dispatch. If the
+connection fails after a create/send request, its outcome is uncertain: the
+runner preserves that marker and refuses duplicate dispatch. Inspect the chat
+named `projectname [999]: taskname` and continue the original task with
+`$todo:run`; claiming it clears the marker. Native jobs use the saved project to
+start the app session and the existing ToDo worktree for implementation, so Git
+delivery remains owned by ToDo. The host retains its normal tool permissions.
+Dashboard writes require the exact loopback Host/Origin, JSON, and a custom
+request header; stale answers and turns are rejected.
+
+Worker names follow `projectname [999]: taskname`. Task/claim changes trigger
+supervisor title updates in code. When the desktop connection is available,
+the runner also reconciles registered inactive worker chats through the app;
+archived chats are temporarily unarchived for renaming and then archived again
+without starting a turn. A missing chat does not block cleanup of later chats.
+Ordinary user discussions that execute `$todo:run` are not automatically renamed
+or archived; the runner manages only explicitly associated worker chats.
+
+Blockers retain their existing semantics: canceling a blocker makes dependent
+tasks eligible to recheck their preconditions. This is not a tree cancellation.
+For a live preview, configure merge delivery to the working branch (for example
+`main`); Vite, backend watchers, or the Unity editor own rebuild/restart.
 
 ## Supervisor lifecycle
 
@@ -159,8 +242,9 @@ without creating a helper ToDo task.
 While the runner is active, its shared Codex app-server connection keeps the
 bound supervisor thread named `-> ToDo (Nr / Mq / Sf)`. `r` counts running
 tasks, `q` combines queued, blocked, staging, merge-queued, and merge-conflict
-tasks, and `f` counts failed tasks. The daemon synchronizes before and after
-each scheduling pass, sends `thread/name/set` only when the target or title
+tasks, and `f` counts failed tasks. A nonzero `w` counts tasks waiting for input.
+Title changes do not wait for the 15-minute supervisor heartbeat. The daemon reacts to task and claim file changes as well as scheduling passes,
+sends `thread/name/set` only when the target or title
 changes, and needs no model turn or worker slot. Rename failures are non-fatal,
 visible in runner state and logs, and retried with a short backoff. Without a
 persisted `targetThreadId`, title synchronization stays unbound until
@@ -225,13 +309,27 @@ not created. When multiple same-target `merge` tasks were published in one batch
 later siblings wait until every earlier sibling leaves the runnable merge
 lifecycle, so faster model completion cannot invert the intended Git order.
 
+Startup and every ordinary poll resume eligible persisted `merge-queued` tasks,
+reusing their delivery attempt and completed result without reopening archived
+task threads. The published daemon owner retires restart requests addressed to
+its predecessor, including requests for a superseded intermediate runtime.
+`runtime_update_request_retired` records that recovery. `merge_queue_waiting`
+records why queued work cannot start (batch publication, an existing claim,
+blockers, earlier batch sibling, busy merge worker, or claim failure), only when
+the waiting state changes. A request addressed to the current daemon still
+blocks new claims while active work drains.
+
 A textual rebase conflict moves the task to `merge-conflict` without blocking
 other queued branches. ToDo unarchives the task's original persistent Codex
 thread, raises it by one configured model tier, and starts one out-of-quota
 merge-repair turn in the paused rebase worktree. The repair must preserve both
 the task functionality and newer target contracts, run focused verification,
 and leave Git continuation to the runner. A successful repair re-enters the
-queue and must pass a fresh rebase before fast-forward. A reported logical
+queue and must pass a fresh rebase before fast-forward. For pipeline tasks, every
+snapshotted shell gate runs again against that final rebased commit under the
+merge lock. Failure or tracked-file changes block delivery, retain the worktree,
+and save receipts under `.todo/logs/<task>/merge-validation-*`. Retrying a failed
+merge reruns these gates; previous validation cannot authorize a new commit. A reported logical
 conflict becomes `merge_logical_conflict`, leaves the queue, and retains its
 recoverable branch and error evidence.
 
@@ -247,32 +345,8 @@ The default `.todo/config.json` is:
   "dashboardPort": 0,
   "retries": 0,
   "executionBackend": "app-server",
-  "gitExclude": [".todo/"],
-  "models": [
-    {
-      "name": "fast",
-      "model": "gpt-5.6-luna",
-      "reasoningEffort": "medium",
-      "description": "Mechanical file operations and exact text insertions."
-    },
-    {
-      "name": "medium",
-      "model": "gpt-5.6-terra",
-      "reasoningEffort": "medium",
-      "description": "Small, bounded edits across a few files."
-    },
-    {
-      "name": "expert",
-      "model": "gpt-5.6-sol",
-      "reasoningEffort": "xhigh",
-      "description": "Most coding tasks and complex implementation work."
-    },
-    {
-      "name": "ultra",
-      "model": "gpt-5.6-sol",
-      "reasoningEffort": "ultra",
-      "description": "Large, high-risk, cross-cutting refactors."
-    }
+  "gitExclude": [
+    ".todo/"
   ],
   "defaultModelProfile": "expert",
   "routingMode": "all-mutations",
@@ -285,9 +359,25 @@ The default `.todo/config.json` is:
 ```
 
 `workers` accepts 1–32. Poll and reload intervals accept 250–60000 ms. The
-`models` array is ordered from the lowest to the highest tier; task formation
-selects the lowest adequate entry and each model retry advances by one entry,
-staying on the final entry after the highest tier is reached.
+optional `models` array overrides the plugin task-role profiles. When omitted,
+the current built-in profiles are used without copying them into the config. Task formation selects the lowest adequate
+available profile. Built-in retries follow Mini → fast, standard → medium,
+proven → advanced, and fast → medium → advanced → expert → ultra, staying at
+ultra after the highest tier is reached. Custom profiles retain array-order
+escalation. Retired or unsupported profiles are skipped; if no usable higher
+profile exists, retry stops with an update message.
+The default `expert` profile uses GPT-6 Astra with `xhigh` reasoning for complex
+work; `ultra` uses Astra with `max` reasoning for very complex work. Astra is
+OpenAI's most capable model ([model documentation](https://developers.openai.com/api/docs/models/gpt-6-astra)).
+New repositories omit `models` and inherit the plugin profiles, so a plugin
+update changes the effective models automatically. Existing explicit `models`
+arrays remain repository overrides; remove that array to inherit the plugin.
+Saved tasks retain their profile names. Before each new attempt, the task and
+its pipeline steps resolve the current model and reasoning level from those
+profiles. Old model IDs in saved tasks do not pin execution to retired models.
+An unavailable-model retry keeps the same profile; ordinary model retries retain
+the escalation policy above. Active attempts keep the model selected at start.
+
 `dashboardPort: 0` selects a free local port and keeps the successful port for
 each host-confirmed Codex thread. An occupied reservation is atomically replaced
 after a new listener succeeds. `retries` is a non-negative integer or `-1` for
@@ -299,10 +389,45 @@ branch active at preflight, and `git.remote` defaults to `origin`. The daemon
 hot-reloads valid worker, profile, polling, retry, dashboard, execution, and Git
 configuration without interrupting active tasks.
 
+### Model availability and config updates
+
+Seven Codex models are represented by eight task profiles (Astra has
+separate complex and very complex roles). The executor's paginated `model/list`
+catalog determines availability for the actual account/CLI: the desktop picker
+can expose models that a background executor cannot yet use. Legacy model names
+remain in the template so their status and replacement are visible; listing
+is not a claim of availability. Spark is excluded from profiles, execution, and automatic model discovery.
+
+`task_preflight` returns model diagnostics. Before starting an agent, the runner
+resolves each saved profile against the current config (or built-in profiles),
+then checks the resulting model and reasoning level. An unsupported
+model produces `model_unavailable` without a model turn or silent substitution.
+Invalid profile configuration fails closed. Catalogs are cached locally for five
+minutes and invalidated when the configured models or executor change.
+
+Use the `model_profiles` MCP tool with `action: inspect` to refresh availability
+and preview the complete update: available/deprecated/retired/unsupported models,
+unsupported reasoning levels, replacements, removals, and newly discovered
+models. Newly discovered models use their executor description and default
+reasoning level; review their suitability before assigning work. The preview
+preserves supported custom profiles, replaces retired models when the executor
+supplies a supported successor, and removes unsupported entries.
+
+After approving the exact preview, call `action: apply` with its `planId`.
+A changed config or catalog invalidates the preview. Applying creates a private
+backup beside `.todo/config.json` and atomically updates only the profile/default
+fields. With `models` omitted, inspect/apply preserves inheritance and does not
+materialize a custom model list. Other config fields, task profile names, past
+attempt logs, and snapshotted pipeline commands/prompts are preserved. Saved model
+IDs are refreshed from the same profiles on the next attempt. If a profile was
+removed or its current model is still unsupported, the task reports that exact
+problem instead of selecting a different profile. Runtime model catalogs and config
+backups are local data and must not be committed.
+
 Advanced local execution fields `codexCommand` and `codexSandbox` are also
 supported. The default sandbox is `workspace-write`. A change to the backend or
 Codex command takes effect for newly claimed tasks; existing tasks retain their
-snapshotted backend and model profile.
+snapshotted backend and profile name; the model is resolved at the next attempt.
 
 ## Repository execution pipelines
 
@@ -332,7 +457,9 @@ The v1 format is deliberately linear. `codex-exec` and `codex-thread` agent
 steps must come before all `shell` gates. `codex-exec` starts an independent
 structured Codex execution; `codex-thread` creates or continues the task's
 persistent app-server thread. Both accept an optional `modelProfile` and a
-required `prompt`. Omitting `modelProfile` uses the task's snapshotted profile.
+required `prompt`. Omitting `modelProfile` uses the task's profile. Model IDs and
+reasoning levels are resolved from current profiles at attempt start, including
+for old pipeline snapshots; pipeline commands and prompts remain immutable.
 
 ```yaml
 version: 1
@@ -378,8 +505,12 @@ only after a complete green pass made after the final agent edit. Exhausting
 `maxRounds`, failing the repair step, or omitting `repair` leaves the task
 failed with the preserved evidence.
 
-Pipeline tasks are runner-owned and cannot be claimed through interactive
-execution, because that would bypass their mandatory gates. Shell commands run
+Pipeline tasks can pause a Codex stage for interactive execution. The saved
+checkpoint includes the stage, completed executions, repair round, and pipeline
+digest. `task_run_finish` returns a successful stage to the runner: remaining
+Codex stages and shell gates still run before delivery. An interactive repair
+restarts all shell gates. An initially interactive task executes the first Codex
+stage in the app; subsequent stages remain runner-owned. Shell commands run
 with the same local permissions and environment as the runner; pipeline files
 are trusted executable repository policy and should be reviewed like CI
 configuration. The bundled parser supports the documented YAML subset:
@@ -491,3 +622,9 @@ suite. See [CHANGELOG.md](CHANGELOG.md) and the repository
 ## License
 
 [MIT](../../LICENSE)
+
+Shell-step timeouts and runner shutdown terminate the whole process group, wait
+for a two-second grace period, then kill remaining descendants before another
+step or repair can start. Windows uses `taskkill /T /F`. Log tails use bounded
+byte reads; dashboard log previews show the last 256 KiB with a truncation notice,
+while full logs remain on disk.

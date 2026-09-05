@@ -9,6 +9,8 @@ import {
   loadConfig,
   readTask,
   startInteractiveTask,
+  finishInteractiveTask,
+  getTaskStatus,
 } from "./lib.mjs";
 import {
   loadPipelineSnapshot,
@@ -77,19 +79,19 @@ writeFileSync(pipelineFile, pipelineText.replace("npm test", "npm run test:chang
 const snapshot = loadPipelineSnapshot(root, taskRecord.metadata.pipeline);
 assert.equal(snapshot.steps[2].command, "npm test");
 assert.notEqual(loadConfig(root).pipeline.digest, snapshot.digest);
-await assert.rejects(
-  () => startInteractiveTask(root, task.id),
-  /runner-owned repository pipeline/,
-);
-assert.throws(
-  () =>
-    createTask(root, {
-      title: "Interactive pipeline bypass",
-      description: "This task must stay runner-owned.",
-      runMode: "interactive",
-    }),
-  /cannot bypass a configured repository pipeline/,
-);
+const interactiveClaim = await startInteractiveTask(root, task.id);
+assert.equal(interactiveClaim.requiresPipelineValidation, true);
+const queuedForValidation = await finishInteractiveTask(root, task.id, {
+  claimToken: interactiveClaim.claimToken, status: "completed", summary: "Interactive work complete",
+  validation: ["Interactive stage inspected"],
+});
+assert.equal(queuedForValidation.status, "queued");
+assert.equal(queuedForValidation.pipelineContinuation.ready, true);
+assert.notEqual(getTaskStatus(root, task.id).git.phase, "delivered");
+const interactivePipeline = createTask(root, {
+  title: "Interactive pipeline", description: "Return to mandatory gates after app execution.", runMode: "interactive",
+});
+assert.ok(interactivePipeline.pipeline);
 
 writeFileSync(
   configFile,

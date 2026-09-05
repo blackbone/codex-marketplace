@@ -1,3 +1,5 @@
+// Fixture runners must never contact the user's native Codex app.
+delete process.env.CODEX_APP_TOOLS_PIPE_PATH;
 import {
   chmodSync,
   existsSync,
@@ -22,6 +24,7 @@ import {
   cancelTask,
   claimTask,
   clearSupervisor,
+  DEFAULT_MODEL_PROFILES,
   createTask,
   finishInteractiveTask,
   formatSupervisorThreadTitle,
@@ -115,7 +118,12 @@ async function waitFor(check, message, timeoutMs = 10000) {
     if (result) return result;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  throw new Error(message);
+  const state = readDaemonState(repoRoot);
+  const tasks = listTaskStatuses(repoRoot).map(task => ({ id: task.id, status: task.status,
+    error: task.error?.message, phase: task.git?.phase }));
+  const logPath = path.join(repoRoot, ".todo", "runner.log");
+  const tail = existsSync(logPath) ? readFileSync(logPath, "utf8").split("\n").slice(-15).join("\n") : "";
+  throw new Error(message + "\n" + JSON.stringify({ daemon: state?.status, runtimeUpdate: state?.runtimeUpdate, tasks }) + "\n" + tail);
 }
 
 async function stopDaemon(pid) {
@@ -222,6 +230,7 @@ async function callMcp() {
   const statusResponse = responses.find((item) => item.id === 3);
   const workersResponse = responses.find((item) => item.id === 4);
   const expectedToolNames = [
+    "model_profiles",
     "repo_init",
     "runner_start",
     "runner_status",
@@ -240,6 +249,7 @@ async function callMcp() {
     "task_retry",
     "task_run_finish",
     "task_run_start",
+    "task_run_wait",
     "task_update",
     "todo_status",
     "worker_list",
@@ -471,32 +481,7 @@ try {
   assert(
     initialized.created === true &&
       JSON.stringify(initialized.config.modelProfiles) ===
-        JSON.stringify([
-          {
-            name: "fast",
-            model: "gpt-5.6-luna",
-            reasoningEffort: "medium",
-            description: "Mechanical file operations and exact text insertions.",
-          },
-          {
-            name: "medium",
-            model: "gpt-5.6-terra",
-            reasoningEffort: "medium",
-            description: "Small, bounded edits across a few files.",
-          },
-          {
-            name: "expert",
-            model: "gpt-5.6-sol",
-            reasoningEffort: "xhigh",
-            description: "Most coding tasks and complex implementation work.",
-          },
-          {
-            name: "ultra",
-            model: "gpt-5.6-sol",
-            reasoningEffort: "ultra",
-            description: "Large, high-risk, cross-cutting refactors.",
-          },
-        ]) &&
+        JSON.stringify(DEFAULT_MODEL_PROFILES) &&
       initialized.config.defaultModelProfile === "expert" &&
       initialized.config.retries === 0 &&
       initialized.config.configReloadIntervalMs === 5000 &&
@@ -655,6 +640,8 @@ try {
   writeFileSync(
     fakeCodex,
     `#!/usr/bin/env node
+import { fakeModelList } from ${JSON.stringify(new URL("./model-catalog-test.mjs", import.meta.url).href)};
+import { createInterface } from "node:readline";
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
@@ -667,6 +654,13 @@ if (args[0] === "app-server" && args.includes("--help")) {
 }
 if (args.includes("--version")) {
   process.stdout.write("fake-codex 1.0\\n");
+  process.exit(0);
+}
+if (args[0] === "app-server") {
+  for await (const line of createInterface({ input: process.stdin })) {
+    const message = JSON.parse(line);
+    if (message.id) process.stdout.write(JSON.stringify({ id: message.id, result: message.method === "model/list" ? fakeModelList() : {} }) + "\\n");
+  }
   process.exit(0);
 }
 const outputIndex = args.indexOf("--output-last-message");
@@ -1145,6 +1139,10 @@ process.stdin.on("end", async () => {
     explicitInteractive.execution.mode === "interactive",
     "explicit interactive execution was not preserved",
   );
+  createTask(repoRoot, {
+    title: "Stable dashboard blocker fixture", description: "Keep an existing blocker link for the live UI assertion.",
+    runMode: "interactive", blockers: [explicitInteractive.id],
+  });
   const interactiveFallback = createTask(repoRoot, {
     title: "Background task requiring interactive fallback",
     description:
@@ -1573,7 +1571,7 @@ process.stdin.on("end", async () => {
     ["profile-filter", dashboardHtml.includes('data-filter-field="profile"')],
     [
       "blocker-link",
-      dashboardHtml.includes(`data-blocker-task="${first.id}"`),
+      dashboardHtml.includes(`data-blocker-task="${explicitInteractive.id}"`),
     ],
     ["rejected-status", dashboardHtml.includes(">rejected</button>")],
     ["rejected-color", dashboardHtml.includes(".status-rejected { color: #84cc16; }")],
@@ -1590,7 +1588,7 @@ process.stdin.on("end", async () => {
     ["last-unbounded", dashboardHtml.includes("704-dashboard-unbounded-fixture")],
     [
       "task-status-summary",
-      /tasks · \d+ running · \d+ queued\/blocked · \d+ failed · merge/.test(
+      /tasks · \d+ running · \d+ queued\/blocked · \d+ failed · \d+ waiting · merge/.test(
         dashboardHtml,
       ) && !/tasks · \d+ busy · \d+ idle/.test(dashboardHtml),
     ],
@@ -1662,6 +1660,7 @@ process.stdin.on("end", async () => {
   ].map((match) => match[1]);
   const renderedStatusRanks = renderedStatuses.map((status) => {
     const rank = [
+      "waiting-input",
       "running",
       "queued",
       "merge-queued",
@@ -1671,7 +1670,7 @@ process.stdin.on("end", async () => {
       "completed",
       "rejected",
     ].indexOf(status);
-    return rank < 0 ? 8 : rank;
+    return rank < 0 ? 9 : rank;
   });
   assert(
     defaultDashboardResponse.status === 200 &&
@@ -1694,7 +1693,7 @@ process.stdin.on("end", async () => {
       [first, blocked, parallel, backgroundExec].every(
         (task) => getTaskStatus(repoRoot, task.id).status === "completed",
       ) &&
-      getTaskStatus(repoRoot, interactiveFallback.id).status === "failed" &&
+      getTaskStatus(repoRoot, interactiveFallback.id).status === "waiting-input" &&
       getTaskStatus(repoRoot, preModelFailure.id).status === "failed",
     "tasks did not complete",
   );
@@ -1743,7 +1742,7 @@ process.stdin.on("end", async () => {
     interactiveFallback.id,
   );
   assert(
-    interactiveFallbackReceipt.status === "failed" &&
+    interactiveFallbackReceipt.status === "waiting-input" &&
       interactiveFallbackReceipt.execution?.mode === "interactive" &&
       interactiveFallbackReceipt.error?.kind === "interactive_required" &&
       interactiveFallbackReceipt.metrics?.attempts === 1,
@@ -2638,7 +2637,7 @@ process.stdin.on("end", async () => {
       dependencyUnlocked: true,
       completionReceipts: 5,
       invalidWorkersFallback: fallback.workers,
-      mcpTools: 21,
+      mcpTools: 23,
       repoInit: true,
       modelProfiles: true,
       taskEphemeralOverride: true,

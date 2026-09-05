@@ -1,3 +1,4 @@
+import { readLogPreview } from "./bounded-log.mjs";
 import { createServer } from "node:http";
 import {
   existsSync,
@@ -50,6 +51,7 @@ const SORT_FIELDS = new Set([
   "retries",
 ]);
 const STATUS_ORDER = new Map([
+  ["waiting-input", -1],
   ["running", 0],
   ["queued", 1],
   ["merge-queued", 2],
@@ -239,13 +241,13 @@ function readableExecutionTranscript(attemptRoot) {
   const promptPath = path.join(attemptRoot, "prompt.txt");
   if (regularFile(promptPath)) {
     sections.push(
-      `=== EXECUTION PROMPT ===\n\n${readFileSync(promptPath, "utf8").trimEnd()}`,
+      `=== EXECUTION PROMPT ===\n\n${readLogPreview(promptPath).trimEnd()}`,
     );
   }
 
   const stdoutPath = path.join(attemptRoot, "stdout.log");
   if (regularFile(stdoutPath)) {
-    const events = readFileSync(stdoutPath, "utf8")
+    const events = readLogPreview(stdoutPath)
       .split(/\r?\n/)
       .filter((line) => line.trim())
       .map((line) => {
@@ -268,13 +270,13 @@ function readableExecutionTranscript(attemptRoot) {
 
   const stderrPath = path.join(attemptRoot, "stderr.log");
   if (regularFile(stderrPath)) {
-    const stderr = readFileSync(stderrPath, "utf8").trimEnd();
+    const stderr = readLogPreview(stderrPath).trimEnd();
     if (stderr) sections.push(`=== STDERR ===\n\n${stderr}`);
   }
   const resultPath = path.join(attemptRoot, "result.json");
   if (regularFile(resultPath)) {
     sections.push(
-      `=== STRUCTURED RESULT ===\n\n${readFileSync(resultPath, "utf8").trimEnd()}`,
+      `=== STRUCTURED RESULT ===\n\n${readLogPreview(resultPath).trimEnd()}`,
     );
   }
   return `${sections.join("\n\n")}\n`;
@@ -288,7 +290,7 @@ function readDashboardLog(repoRoot, query) {
     const realTodoRoot = realpathSync(todoDir(repoRoot));
     const realRunnerPath = realpathSync(runnerPath);
     if (!realRunnerPath.startsWith(`${realTodoRoot}${path.sep}`)) return null;
-    return readFileSync(runnerPath, "utf8");
+    return readLogPreview(runnerPath);
   }
   if (scope !== "task") return null;
   const taskId = query.get("task") || "";
@@ -305,7 +307,7 @@ function readDashboardLog(repoRoot, query) {
   const realAttemptRoot = realpathSync(attemptRoot);
   const realFilePath = realpathSync(filePath);
   if (!realFilePath.startsWith(`${realAttemptRoot}${path.sep}`)) return null;
-  return readFileSync(filePath, "utf8");
+  return readLogPreview(filePath);
 }
 
 function taskNumber(value) {
@@ -556,6 +558,7 @@ function dashboardTaskMarkdown(repoRoot, taskId) {
 
 const DASHBOARD_SCRIPT = `(() => {
   const statusOrder = new Map([
+    ["waiting-input", -1],
     ["running", 0],
     ["queued", 1],
     ["merge-queued", 2],
@@ -1122,6 +1125,11 @@ const DASHBOARD_SCRIPT = `(() => {
     logsButton.dataset.logTask = task.id;
     logsButton.textContent = "Logs";
     logsCell.append(logsButton);
+    const control = document.createElement("button");
+    control.type = "button";
+    control.dataset.controlTask = task.id;
+    control.textContent = task.status === "waiting-input" ? "Answer" : "Chat / input";
+    logsCell.append(control);
     row.append(logsCell);
     return row;
   }
@@ -1234,6 +1242,7 @@ const DASHBOARD_SCRIPT = `(() => {
       (taskCounts.running || 0) + " running · " +
       (taskCounts.queued || 0) + " queued/blocked · " +
       (taskCounts.failed || 0) + " failed · " +
+      (payload.tasks.filter(task => task.status === "waiting-input").length) + " waiting · " +
       "merge " + mergeState + " · " +
       runnerName + " " + runnerVersion + " · runtime " + runtimeState +
       " · config " +
@@ -1259,7 +1268,61 @@ const DASHBOARD_SCRIPT = `(() => {
     }
   }
 
+  const inputDialog = document.querySelector("#input-dialog");
+  const inputFields = document.querySelector("#input-fields");
+  const inputStatus = document.querySelector("#input-status");
+  let inputTask = null;
+  let inputSending = false;
+  function openTaskInput(taskId) {
+    inputTask = latestPayload?.tasks.find(task => task.id === taskId);
+    if (!inputTask) return;
+    document.querySelector("#input-title").textContent = inputTask.title;
+    document.querySelector("#input-question").textContent = inputTask.interaction?.question || "Send an instruction or open this task in Codex.";
+    document.querySelector("#input-question").hidden = inputTask.status === "waiting-input" && Boolean(inputTask.interaction?.questions?.length);
+    inputFields.replaceChildren();
+    const questions = (inputTask.status === "waiting-input" && inputTask.interaction?.questions) || [{ id: "prompt", question: "Your instruction" }];
+    for (const question of questions) {
+      const label = document.createElement("label");
+      label.textContent = question.question;
+      const field = document.createElement("textarea");
+      field.dataset.questionId = question.id;
+      field.rows = 3;
+      field.maxLength = 8000;
+      if (question.options?.length) field.placeholder = question.options.map(option => option.label).join(" / ");
+      label.append(field);
+      inputFields.append(label);
+    }
+    inputStatus.textContent = "";
+    const send = document.querySelector("#input-send");
+    send.textContent = inputTask.status === "waiting-input" ? "Send answer" : inputTask.status === "running" ? "Steer" : "Continue in Codex";
+    inputDialog.showModal();
+  }
+  async function sendTaskAction(action) {
+    if (!inputTask || inputSending) return;
+    inputSending = true;
+    const buttons = [...inputDialog.querySelectorAll("#input-send, #input-open")];
+    buttons.forEach(button => { button.disabled = true; });
+    const answers = Object.fromEntries([...inputFields.querySelectorAll("textarea")].map(field => [field.dataset.questionId, field.value]));
+    inputStatus.textContent = "Sending…";
+    try {
+      const response = await fetch("/api/task-action", {
+        method: "POST", headers: { "Content-Type": "application/json", "X-ToDo-Action": "1" },
+        body: JSON.stringify({ taskId: inputTask.id, action, text: answers.prompt || "",
+          answers, requestId: inputTask.interaction?.requestId,
+          expectedTurnId: inputTask.claim?.owner?.turnId || inputTask.codexThread?.lastTurnId }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Action failed");
+      inputStatus.textContent = result.opened ? "Opened in Codex" : "Accepted";
+    } catch (error) { inputStatus.textContent = error.message; }
+    finally { inputSending = false; buttons.forEach(button => { button.disabled = false; }); }
+  }
+  document.querySelector("#input-open").addEventListener("click", () => sendTaskAction("open"));
+  document.querySelector("#input-send").addEventListener("click", () => sendTaskAction(
+    inputTask?.status === "waiting-input" ? "reply" : inputTask?.status === "running" ? "steer" : "native"));
   document.addEventListener("click", (event) => {
+    const control = event.target.closest("button[data-control-task]");
+    if (control) { openTaskInput(control.dataset.controlTask); return; }
     const filterToken = event.target.closest("button[data-filter-field]");
     if (filterToken) {
       addFilter(filterToken.dataset.filterField, filterToken.dataset.filterValue);
@@ -1588,7 +1651,7 @@ function renderDashboard(repoRoot, requestUrl) {
   <td title="${escapeHtml(tokens.title)}">${escapeHtml(tokens.text)}</td>
   <td title="${escapeHtml(retries.title)}">${escapeHtml(retries.text)}</td>
   <td class="error">${escapeHtml(task.error?.message ?? "")}</td>
-  <td><button type="button" data-log-task="${escapeHtml(task.id)}">Logs</button></td>
+  <td><button type="button" data-log-task="${escapeHtml(task.id)}">Logs</button><button type="button" data-control-task="${escapeHtml(task.id)}">${task.status === "waiting-input" ? "Answer" : "Chat / input"}</button></td>
 </tr>`;
     })
     .join("\n");
@@ -1606,11 +1669,12 @@ function renderDashboard(repoRoot, requestUrl) {
     button { font: inherit; cursor: pointer; }
     .heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 6px; }
     .summary { margin: 0 0 12px; opacity: .75; }
-    .filters { display: flex; align-items: center; gap: 8px; margin: 0 0 14px; }
+    .filters { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; }
     .filters label { font-weight: 700; }
     #task-filter { box-sizing: border-box; width: min(720px, 70vw); padding: 7px 9px; border: 1px solid #8888; border-radius: 4px; background: Canvas; color: CanvasText; font: inherit; }
     .filter-help { opacity: .65; white-space: nowrap; }
     table { width: 100%; border-collapse: collapse; }
+    .table-scroll { max-width: 100%; overflow-x: auto; }
     th, td { padding: 7px 9px; border: 1px solid #8885; text-align: left; vertical-align: top; }
     th { position: sticky; top: 0; background: Canvas; white-space: nowrap; }
     th a { color: inherit; text-decoration: none; }
@@ -1619,6 +1683,15 @@ function renderDashboard(repoRoot, requestUrl) {
     .status { font-weight: 700; }
     .filter-token { padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
     .status-running { color: #d97706; }
+    .status-waiting-input { color: #d97706; }
+    #input-dialog { box-sizing: border-box; width: min(640px, calc(100vw - 32px)); height: fit-content; max-height: calc(100vh - 32px); padding: 18px; border-radius: 6px; }
+    #input-dialog h2 { margin: 0 0 18px; font-size: 18px; }
+    #input-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    #input-actions button { padding: 6px 10px; }
+    #input-actions form { margin-left: auto; }
+    #input-fields label { display: block; margin-bottom: 12px; }
+    #input-fields textarea { box-sizing: border-box; display: block; width: 100%; margin-top: 6px; font: inherit; }
+    #input-status { white-space: pre-wrap; overflow-wrap: anywhere; }
     .status-merge-queued { color: #0284c7; }
     .status-merge-conflict { color: #ea580c; }
     .status-completed { color: #16a34a; }
@@ -1655,14 +1728,14 @@ function renderDashboard(repoRoot, requestUrl) {
     <h1>ToDo — ${escapeHtml(path.basename(repoRoot))}</h1>
     <button type="button" data-log-all>All logs</button>
   </div>
-  <p class="summary">${tasks.length}${tasks.length === payload.tasks.length ? "" : ` of ${payload.tasks.length}`} tasks · ${taskCounts.running || 0} running · ${taskCounts.queued || 0} queued/blocked · ${taskCounts.failed || 0} failed · merge ${escapeHtml(payload.runner?.mergeWorker?.status || "offline")} · ${escapeHtml(payload.runner?.implementation || "unknown runner")} ${escapeHtml(payload.runner?.pluginVersion || "")} · runtime ${escapeHtml(payload.runner?.runtimeState || "offline")} · config ${escapeHtml(Math.round((payload.config.configReloadIntervalMs || 5000) / 1000))}s · live 1s</p>
+  <p class="summary">${tasks.length}${tasks.length === payload.tasks.length ? "" : ` of ${payload.tasks.length}`} tasks · ${taskCounts.running || 0} running · ${taskCounts.queued || 0} queued/blocked · ${taskCounts.failed || 0} failed · ${payload.tasks.filter(task => task.status === "waiting-input").length} waiting · merge ${escapeHtml(payload.runner?.mergeWorker?.status || "offline")} · ${escapeHtml(payload.runner?.implementation || "unknown runner")} ${escapeHtml(payload.runner?.pluginVersion || "")} · runtime ${escapeHtml(payload.runner?.runtimeState || "offline")} · config ${escapeHtml(Math.round((payload.config.configReloadIntervalMs || 5000) / 1000))}s · live 1s</p>
   <div class="filters" role="search">
     <label for="task-filter">Filter</label>
     <input id="task-filter" type="search" value="${escapeHtml(filterQuery)}" placeholder="status:completed|rejected" autocomplete="off" spellcheck="false">
     <button id="filter-clear" type="button" data-filter-clear>Clear</button>
     <span class="filter-help">Fields: id, task, status, worker, profile, blockers, updated, error · OR: value|value</span>
   </div>
-  <table>
+  <div class="table-scroll"><table>
     <thead>
       <tr>
         <th>${sortLink("id", "ID", sort, direction, filterQuery)}</th>
@@ -1683,7 +1756,18 @@ function renderDashboard(repoRoot, requestUrl) {
       </tr>
     </thead>
     <tbody>${rows || '<tr data-empty-state><td colspan="15">No tasks</td></tr>'}</tbody>
-  </table>
+  </table></div>
+  <dialog id="input-dialog" aria-labelledby="input-title">
+    <h2 id="input-title">Task input</h2>
+    <p id="input-question"></p>
+    <div id="input-fields"></div>
+    <p id="input-status" role="status"></p>
+    <div id="input-actions">
+      <button type="button" id="input-open">Open chat in Codex</button>
+      <button type="button" id="input-send">Send</button>
+      <form method="dialog"><button type="submit">Close</button></form>
+    </div>
+  </dialog>
   <dialog id="log-dialog" aria-labelledby="log-title">
     <div class="log-header">
       <h2 id="log-title">Logs</h2>
@@ -1744,9 +1828,34 @@ function persistDashboardPort(repoRoot, threadId, port) {
   });
 }
 
-function createDashboardServer(repoRoot, port) {
-  const server = createServer((request, response) => {
+function createDashboardServer(repoRoot, port, onTaskAction) {
+  const server = createServer(async (request, response) => {
     try {
+      if (request.method === "POST" && request.url === "/api/task-action") {
+        const origin = `http://${DASHBOARD_HOST}:${server.address().port}`;
+        if (request.headers.host !== `${DASHBOARD_HOST}:${server.address().port}` ||
+            request.headers.origin !== origin || request.headers["x-todo-action"] !== "1" ||
+            !request.headers["content-type"]?.startsWith("application/json")) {
+          response.writeHead(403); response.end("Same-origin dashboard action required"); return;
+        }
+        if (!onTaskAction) { response.writeHead(503); response.end("Runner actions unavailable"); return; }
+        let body = "";
+        for await (const chunk of request) {
+          body += chunk;
+          if (Buffer.byteLength(body) > 32768) { response.writeHead(413); response.end("Input too large"); return; }
+        }
+        try {
+          const action = JSON.parse(body);
+          if (!TASK_LOG_ID_PATTERN.test(action.taskId || "")) throw new Error("Invalid task ID");
+          const result = await onTaskAction(action);
+          response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          response.end(JSON.stringify(result));
+        } catch (error) {
+          response.writeHead(409, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          response.end(JSON.stringify({ error: error.message }));
+        }
+        return;
+      }
       if (request.method !== "GET") {
         response.writeHead(405, { Allow: "GET" });
         response.end("Method not allowed");
@@ -1869,17 +1978,17 @@ function createDashboardServer(repoRoot, port) {
   });
 }
 
-export async function startDashboard(repoRoot, port = 0, threadId = null) {
+export async function startDashboard(repoRoot, port = 0, threadId = null, onTaskAction = null) {
   const owner = normalizeDashboardThreadId(threadId);
   const reservedPort = port === 0 && owner
     ? reservedDashboardPort(repoRoot, owner)
     : 0;
   let dashboard;
   try {
-    dashboard = await createDashboardServer(repoRoot, reservedPort || port);
+    dashboard = await createDashboardServer(repoRoot, reservedPort || port, onTaskAction);
   } catch (error) {
     if (!reservedPort || error.code !== "EADDRINUSE") throw error;
-    dashboard = await createDashboardServer(repoRoot, 0);
+    dashboard = await createDashboardServer(repoRoot, 0, onTaskAction);
   }
   if (port === 0 && owner) {
     persistDashboardPort(repoRoot, owner, dashboard.port);

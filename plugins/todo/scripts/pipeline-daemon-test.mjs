@@ -1,3 +1,5 @@
+// Fixture runners must never contact the user's native Codex app.
+delete process.env.CODEX_APP_TOOLS_PIPE_PATH;
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import {
@@ -12,6 +14,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   createTask,
+  loadConfig,
   getTaskStatus,
   initializeRepo,
 } from "./lib.mjs";
@@ -81,6 +84,7 @@ repair:
 writeFileSync(
   fake,
   `#!/usr/bin/env node
+import { fakeModelList } from ${JSON.stringify(new URL("./model-catalog-test.mjs", import.meta.url).href)};
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 const trace = process.env.FAKE_TRACE;
@@ -89,7 +93,7 @@ const writeTrace = (value) => appendFileSync(trace, JSON.stringify(value) + "\\n
 if (process.argv[2] === "exec") {
   const prompt = readFileSync(0, "utf8");
   const outputIndex = process.argv.indexOf("--output-last-message");
-  writeTrace({ mode: "exec", prompt });
+  writeTrace({ mode: "exec", prompt, model: process.argv[process.argv.indexOf("--model") + 1] });
   writeFileSync(process.argv[outputIndex + 1], JSON.stringify(result));
   process.stdout.write(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 1 } }) + "\\n");
   process.exit(0);
@@ -101,12 +105,13 @@ for await (const line of createInterface({ input: process.stdin })) {
   const message = JSON.parse(line);
   writeTrace({ mode: "app-server", message });
   if (message.method === "initialize") send({ id: message.id, result: {} });
+  else if (message.method === "model/list") send({ id: message.id, result: fakeModelList() });
   else if (message.method === "thread/start") {
     threadNumber += 1;
     send({ id: message.id, result: { thread: { id: "pipeline-thread-" + threadNumber } } });
   } else if (message.method === "thread/resume") {
     send({ id: message.id, result: { thread: { id: message.params.threadId } } });
-  } else if (message.method === "thread/archive" || message.method === "thread/unarchive" || message.method === "turn/interrupt") {
+  } else if (message.method === "thread/archive" || message.method === "thread/unarchive" || message.method === "thread/name/set" || message.method === "turn/interrupt") {
     send({ id: message.id, result: {} });
   } else if (message.method === "turn/start") {
     turnNumber += 1;
@@ -159,6 +164,11 @@ const task = createTask(root, {
   title: "Run repository pipeline",
   description: "Exercise exec, thread, shell, repair, and shell restart.",
 });
+// The saved task and immutable pipeline still name the previous models.
+const currentConfig = JSON.parse(readFileSync(configPath, "utf8"));
+writeFileSync(configPath, JSON.stringify({ ...currentConfig,
+  models: loadConfig(root).modelProfiles.map(profile => ({ ...profile, model: `current-${profile.name}` })),
+}));
 const daemon = spawn(
   process.execPath,
   [path.join(scriptDir, "daemon.mjs"), "--repo", root],
@@ -183,6 +193,8 @@ daemon.kill("SIGINT");
 await new Promise((resolve) => daemon.once("close", resolve));
 
 assert.equal(receipt?.status, "completed", stderr || JSON.stringify(receipt));
+assert.equal(receipt.execution.modelProfile, "expert");
+assert.equal(receipt.execution.model, "current-expert");
 assert.equal(receipt.pipeline.source, "todo-pipeline.yaml");
 assert.equal(receipt.codexThread.id, "pipeline-thread-1");
 assert.equal(receipt.codexThread.state, "archived");
@@ -224,4 +236,8 @@ assert.match(traceText, /PIPELINE_IMPLEMENT/);
 assert.match(traceText, /PIPELINE_REPAIR/);
 assert.match(JSON.stringify(pipelineRun), /BUILD_FIXTURE_FAILURE/);
 
+const calls = traceText.trim().split("\n").map(line => JSON.parse(line));
+assert.equal(calls.find(call => call.mode === "exec").model, "current-fast");
+assert.deepEqual(calls.filter(call => call.message?.method === "turn/start").map(call => call.message.params.model),
+  ["current-medium", "current-expert"]);
 console.log("todo pipeline daemon test passed");

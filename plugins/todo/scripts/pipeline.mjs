@@ -524,11 +524,20 @@ export function loadPipelineSnapshot(repoRoot, reference) {
   return pipeline;
 }
 
-export async function runPipeline(pipeline, handlers) {
-  const executions = [];
+export async function runPipeline(pipeline, handlers, continuation = null) {
+  const executions = [...(continuation?.executions || [])];
   const shellStart = pipeline.steps.findIndex((step) => step.type === "shell");
-  let repairRound = 0;
-  let index = 0;
+  let repairRound = continuation?.repairRound || 0;
+  let index = continuation ? continuation.nextIndex ?? 0 : 0;
+  if (continuation) {
+    if (!continuation.ready || continuation.result?.status !== "completed" ||
+        (continuation.digest && continuation.digest !== pipeline.digest) ||
+        !Number.isInteger(index) || index < 0 || index > pipeline.steps.length) {
+      throw new Error("Invalid interactive pipeline continuation");
+    }
+    executions.push({ stepId: continuation.stage?.id || "interactive", type: "interactive",
+      repairRound, ...continuation.result });
+  }
   const publish = async (status, currentStep = null) => {
     await handlers.onState?.({
       status,
@@ -555,7 +564,10 @@ export async function runPipeline(pipeline, handlers) {
       continue;
     }
     if (step.type !== "shell" || !pipeline.repair || repairRound >= pipeline.repair.maxRounds) {
-      return { status: "failed", failedStep: step, failure: result, repairRound, executions };
+      return { status: "failed", failedStep: step, failure: result, repairRound, executions,
+        continuation: result.requiresInteractive ? {
+          digest: pipeline.digest, stage: step, nextIndex: index + 1, repairRound, executions: executions.slice(0, -1),
+        } : null };
     }
     repairRound += 1;
     const repairResult = await handlers.runCodex(pipeline.repair, {
@@ -582,6 +594,10 @@ export async function runPipeline(pipeline, handlers) {
         failure: repairResult,
         repairRound,
         executions,
+        continuation: repairResult.requiresInteractive ? {
+          digest: pipeline.digest, stage: pipeline.repair, nextIndex: shellStart, repairRound, executions: executions.slice(0, -1),
+          failure: { step, result },
+        } : null,
       };
     }
     index = shellStart;

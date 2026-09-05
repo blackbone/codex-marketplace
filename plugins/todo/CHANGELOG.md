@@ -1,5 +1,63 @@
 # Changelog
 
+## Unreleased - 2026-09-05
+
+- Add waiting-input state, dashboard answers/open-chat/steer controls, exact
+  request/turn fencing, and explicit recovery when a pending execution ends.
+- Bind interactive claims to executor thread/turn metadata; add task_run_wait,
+  same-turn start recovery, confirmed-end reconciliation, and a fenced Stop hook.
+- Resume interactive pipeline stages and repairs without bypassing remaining
+  stages or mandatory shell gates. Preserve existing blocker semantics.
+- Name workers as projectname [999]: taskname and react to task/claim file events
+  for supervisor titles. Add conditional official-desktop-MCP dispatch and
+  registered-chat reconciliation; report unavailable connections without false
+  dispatch success or duplicate retries. Native bridge live support remains
+  dependent on the host connection.
+- Cover lifecycle, pipeline checkpoints, dashboard request boundaries, and MCP
+  ownership; refresh the dashboard screenshot with the input dialog.
+
+- Exempt requested Codex plugin/tool maintenance, service configurations, indexes,
+  and caches from task routing by purpose, including inside repositories. Keep
+  product/docs/dependencies/build/CI/CD/deployment changes routed; split mixed
+  requests and preserve permissions, hook trust, and claimed worker scope.
+- Share the rule across skills, MCP descriptions, hooks, and worker prompts.
+  Refresh existing managed AGENTS blocks on trusted interactive hooks or via
+  explicit maintenance; preserve user content and reject malformed markers.
+
+- Recover persisted merge queues after daemon/runtime restart by retiring the
+  predecessor's restart request under the publication gate. Preserve current
+  update requests and reuse delivery attempts and archived task threads.
+- Log changed merge-queue wait reasons; cover runtime-update handoff, ordinary
+  restart/poll recovery, claim/batch gates, and same-batch Git ancestry.
+- Return the completed history receipt when an active task disappears during
+  status reads or timestamp lookup. Preserve metadata and non-ENOENT errors.
+- Add deterministic completion-race coverage for full and numeric task IDs.
+
+## Unreleased - 2026-09-04
+
+- Remove Spark from task profiles, retries, and model discovery; reject stale
+  custom Spark profiles and offer their removal during config cleanup.
+
+- Make `models` optional and omit it in new repository configs, inheriting current
+  plugin profiles instead of copying model IDs into every repository.
+- Resolve saved tasks and pipeline steps by their current profile on each new
+  attempt, preserving active attempts, profile names, pipeline commands and past
+  logs. Unavailable-model retries refresh the same profile without escalation.
+
+- Added task-role profiles for seven Codex models, live paginated
+  executor discovery, unsupported/retired profile diagnostics, and explicit
+  preview/apply config updates with backups and stale-preview protection.
+- Rejected invalid profiles instead of selecting fallback models; validate saved
+  task/pipeline profiles before any agent turn while preserving pipeline commands.
+- Rerun snapshotted shell gates on the final rebased commit before merging,
+  including conflict repairs and delivery retries; block stale validation.
+- Terminate shell process trees on timeout/shutdown before continuing execution.
+- Read log tails by bounded bytes and cap dashboard previews at 256 KiB.
+
+- Set GPT-6 Astra as the default most capable model for complex (`expert`,
+  `xhigh`) and very complex (`ultra`, `max`) tasks, preserving lighter profiles,
+  explicit repository configurations, and existing task/pipeline profile names.
+
 ## Unreleased - 2026-08-12
 
 - Added optional repository-defined YAML task pipelines with snapshotted

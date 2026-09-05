@@ -1,6 +1,6 @@
 interface:
   display_name: "ToDo Route"
-  short_description: "Route repository mutations through ToDo"
-  default_prompt: "Use $todo:route to route this repository change through ToDo."
+  short_description: "Route project changes; configure tools directly"
+  default_prompt: "Use $todo:route for project changes. Perform requested Codex plugin and tool setup directly, and split mixed requests by purpose."
 policy:
   allow_implicit_invocation: true
