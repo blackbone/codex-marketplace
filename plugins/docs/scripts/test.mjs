@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { initialize, readConfig, inspect, readDocument, withLock, scan } from './common.mjs';
+import { initialize, readConfig, inspect, readDocument, withLock, scan, isLinkedWorktree } from './common.mjs';
 import { chunkDocument, refresh, search, status, databasePath, indexedFiles, indexSummary } from './index.mjs';
 
 import { IndexQueue } from './queue.mjs';
@@ -137,6 +137,87 @@ test('hooks inject for configured cwd/descendants, and do nothing elsewhere', ()
     assert.ok(result.hookSpecificOutput.additionalContext.includes(root));
   }
   assert.equal(hook(root, 'PostToolUse'), '');
+});
+
+function gitAt(root, ...args) {
+  const result = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+}
+
+function worktreeFixture(name) {
+  const root = fixture(name);
+  initialize(root, ['docs']);
+  fs.writeFileSync(path.join(root, 'docs', 'a.md'), 'main checkout documentation');
+  gitAt(root, 'init', '-q');
+  gitAt(root, 'add', '.');
+  gitAt(root, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-qm', 'fixture');
+  const worktrees = [path.join(root, '.todo', 'worktrees', 'task'), path.join(base, name + '-external')];
+  for (const worktree of worktrees) gitAt(root, 'worktree', 'add', '--detach', worktree, 'HEAD');
+  return { root, worktrees };
+}
+
+test('hooks skip linked worktrees and ToDo workers without starting a daemon', () => {
+  const { root, worktrees } = worktreeFixture('worktree-hooks');
+  assert.equal(isLinkedWorktree(root), false);
+  assert.equal(isLinkedWorktree(path.join(root, 'docs')), false);
+  assert.equal(isLinkedWorktree(fixture('no-git')), false);
+  const separate = fixture('separate-git-dir');
+  gitAt(separate, 'init', '-q', '--separate-git-dir', path.join(base, 'separate-metadata'));
+  assert.equal(isLinkedWorktree(separate), false, 'a .git file alone does not imply a linked worktree');
+  const cache = path.join(base, 'hook-must-not-start');
+  for (const worktree of worktrees) {
+    const nested = path.join(worktree, 'docs');
+    initialize(nested, ['.']);
+    for (const cwd of [worktree, nested]) {
+      assert.equal(isLinkedWorktree(cwd), true);
+      for (const hook_event_name of ['SessionStart', 'UserPromptSubmit', 'SubagentStart']) {
+        const result = spawnSync(process.execPath, [path.join(scripts, 'session-context.mjs')], {
+          input: JSON.stringify({ cwd, hook_event_name, session_id: 'worktree-hook' }), encoding: 'utf8', timeout: 3000,
+          env: { ...process.env, TODO_RUNNER_WORKER: '0', SEMANTIC_SEARCH_TMP_ROOT: cache },
+        });
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.stdout, '');
+        assert.equal(result.stderr, '');
+      }
+    }
+  }
+  const worker = spawnSync(process.execPath, [path.join(scripts, 'session-context.mjs')], {
+    input: JSON.stringify({ cwd: root, hook_event_name: 'SessionStart', session_id: 'claimed-worker' }), encoding: 'utf8', timeout: 3000,
+    env: { ...process.env, TODO_RUNNER_WORKER: '1', TODO_RUNNER_REPO_ROOT: root, SEMANTIC_SEARCH_TMP_ROOT: cache },
+  });
+  assert.equal(worker.status, 0, worker.stderr);
+  assert.equal(worker.stdout, '');
+  assert.equal(fs.existsSync(cache), false);
+});
+
+test('daemon rejects worktree sessions, preserves explicit requests and drops old registrations on recovery', async () => {
+  const { root, worktrees: [worktree] } = worktreeFixture('worktree-queue');
+  const q = queue('worktree-queue');
+  assert.equal(q.register(worktree, 'session:old-hook'), null);
+  assert.equal(q.projects.size, 0);
+  assert.equal(q.pending.size, 0);
+  assert.equal(fs.existsSync(databasePath(worktree)), false);
+  fs.writeFileSync(path.join(worktree, 'docs', 'a.md'), 'worktree-only documentation');
+  assert.equal(q.register(worktree, 'request:explicit-search'), worktree);
+  await q.flush(worktree);
+  assert.match((await search(worktree, 'documentation', 6, fake, indexSummary(worktree))).results[0].text, /worktree-only/);
+  q.unregister('request:explicit-search');
+  assert.equal(q.projects.size, 0);
+  const before = indexedFiles(worktree).get('docs/a.md').hash;
+  fs.writeFileSync(path.join(worktree, 'docs', 'a.md'), 'must not be indexed by recovery');
+  fs.writeFileSync(q.file, JSON.stringify({ version: 1,
+    projects: [{ root, owners: ['session:main'] }, { root: worktree, owners: ['session:old-hook'] }],
+    active: [{ root: worktree, path: 'docs/a.md' }], pending: [{ root: worktree, path: 'docs/new.md' }],
+  }));
+  q.restore();
+  await q.flush(root);
+  assert.deepEqual([...q.projects.keys()], [root]);
+  assert.equal(indexedFiles(worktree).get('docs/a.md').hash, before, 'existing worktree index is preserved');
+  const saved = JSON.parse(fs.readFileSync(q.file));
+  assert.deepEqual(saved.projects.map(p => p.root), [root]);
+  assert.deepEqual(saved.active, []);
+  assert.deepEqual(saved.pending, []);
+  q.close();
 });
 
 test('cross-process lock excludes competitors and recovers a dead owner', async () => {

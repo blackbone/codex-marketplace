@@ -1,6 +1,6 @@
 {
   "name": "todo",
-  "version": "0.1.0+codex.20260904233337",
+  "version": "0.1.0+codex.20260906184142",
   "description": "Atomic repository task routing with optional YAML execution pipelines, persistent threads, deterministic gates, and telemetry.",
   "author": {
     "name": "blackbone"

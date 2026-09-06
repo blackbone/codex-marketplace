@@ -1,6 +1,6 @@
 ---
-name: search
-description: Search and read current local project documentation through the semantic-search plugin. Use for project questions, architecture, planning or implementation when .semantic-search.json exists, or when the user explicitly requests local documentation search.
+name: find
+description: Search and read current local project documentation through the docs plugin. Use for project questions, architecture, planning or implementation when .semantic-search.json exists, or when the user explicitly requests local documentation search.
 ---
 
 # Use current project documentation
@@ -14,4 +14,4 @@ description: Search and read current local project documentation through the sem
 
 No configured project: do not initialize silently. Use the `init` skill only when setup is requested. No search is needed for unrelated conversation or plugin setup.
 
-CLI fallback: resolve `../../scripts/cli.mjs` against this skill directory, then run `node <absolute-script> search "question"` from the project folder. `read <path> [fromLine] [maxLines]` returns current source text.
+CLI fallback: resolve `../../scripts/cli.mjs` against this skill directory, then run `node <absolute-script> find "question"` from the project folder. `read <path> [fromLine] [maxLines]` returns current source text.

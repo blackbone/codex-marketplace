@@ -379,7 +379,17 @@ export function parseAppServerExecutionStats(jsonl, expectedTurnId = null) {
     throw new TypeError("app-server JSONL must be a string");
   }
   const converted = [];
-  let lastUsage = null;
+  const counters = ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens", "reasoningOutputTokens"];
+  const sum = Object.fromEntries(counters.map((key) => [key, 0]));
+  const previous = new Map();
+  const measuredTurns = new Set();
+  let available = false;
+  let partial = false;
+  const snapshot = (value) => {
+    if (!value || !Number.isSafeInteger(value.inputTokens) || value.inputTokens < 0 ||
+        !Number.isSafeInteger(value.outputTokens) || value.outputTokens < 0) return null;
+    return Object.fromEntries(counters.map((key) => [key, nonNegative(value[key])]));
+  };
   let observedThreadId = null;
   for (const line of jsonl.split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -388,11 +398,62 @@ export function parseAppServerExecutionStats(jsonl, expectedTurnId = null) {
       message = JSON.parse(line);
     } catch {
       converted.push(line);
+      partial = true;
+      continue;
+    }
+    if (!message || typeof message !== "object") {
+      partial = true;
       continue;
     }
     const params = message.params || {};
     const turnId = params.turnId || params.turn?.id;
-    if (expectedTurnId && turnId && turnId !== expectedTurnId) continue;
+    const selected = !expectedTurnId || turnId === expectedTurnId;
+    const threadKey = params.threadId || "unknown";
+    if (selected && params.threadId && !observedThreadId) {
+      observedThreadId = params.threadId;
+      converted.push(JSON.stringify({ type: "thread.started", thread_id: params.threadId }));
+    }
+    // This local marker records the counter before turn/start, including zero
+    // for a fresh thread. It is persisted alongside the protocol notifications.
+    if (message.method === "todo/tokenUsage/baseline") {
+      const baseline = snapshot(params.total);
+      if (baseline) previous.set(threadKey, baseline);
+      continue;
+    }
+    if (message.method === "thread/tokenUsage/updated") {
+      const total = snapshot(params.tokenUsage?.total);
+      const last = snapshot(params.tokenUsage?.last);
+      const before = previous.get(threadKey);
+      if (selected) {
+        let delta = null;
+        if (total && before) {
+          // Resume/model changes can reset the cumulative counter. A reset
+          // begins a new segment; repeated snapshots contribute zero.
+          const reset = total.inputTokens < before.inputTokens || total.outputTokens < before.outputTokens;
+          delta = Object.fromEntries(counters.map((key) => [key,
+            reset ? total[key] : Math.max(0, total[key] - before[key]),
+          ]));
+          if (reset) partial = true;
+        } else if (total && last) {
+          delta = last;
+          // Legacy logs without a baseline establish a complete start only
+          // when the first request is also the entire thread counter.
+          if (counters.some((key) => total[key] !== last[key])) partial = true;
+        } else {
+          // No cumulative counter means updates cannot be deduplicated safely.
+          partial = true;
+        }
+        if (delta) {
+          for (const key of counters) sum[key] += delta[key];
+          available = true;
+          measuredTurns.add(`${threadKey}:${turnId || "unknown"}`);
+        }
+      }
+      // A replay from the previous turn provides a baseline, never new usage.
+      if (total && (selected || !measuredTurns.has(`${threadKey}:${expectedTurnId}`))) previous.set(threadKey, total);
+      continue;
+    }
+    if (expectedTurnId && turnId && !selected) continue;
     if (params.threadId && !observedThreadId) {
       observedThreadId = params.threadId;
       converted.push(
@@ -419,30 +480,16 @@ export function parseAppServerExecutionStats(jsonl, expectedTurnId = null) {
         }),
       );
     }
-    if (message.method === "thread/tokenUsage/updated") {
-      const usage = params.tokenUsage?.last;
-      if (usage) {
-        lastUsage = {
-          input_tokens: usage.inputTokens,
-          cached_input_tokens: usage.cachedInputTokens,
-          cache_write_input_tokens: usage.cacheWriteInputTokens,
-          output_tokens: usage.outputTokens,
-          reasoning_output_tokens: usage.reasoningOutputTokens,
-        };
-      }
-    }
-  }
-  if (lastUsage) {
-    converted.push(JSON.stringify({ type: "turn.completed", usage: lastUsage }));
   }
   const stats = parseExecutionStats(converted.join("\n"));
+  stats.tokenUsage = tokenUsage({ ...sum, coverage: partial ? "partial" : "full" }, measuredTurns.size, available);
   stats.observable.jsonl = {
     ...stats.observable.jsonl,
     bytes: Buffer.byteLength(jsonl),
   };
   stats.requestStats = {
     ...REQUEST_STATS_UNAVAILABLE,
-    reason: "app_server_protocol_has_turn_totals_only",
+    reason: "app_server_protocol_has_no_transport_retry_counts",
   };
   return stats;
 }

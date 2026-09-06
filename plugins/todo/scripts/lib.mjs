@@ -1,5 +1,6 @@
 import { DEFAULT_MODEL_PROFILES, readModelCatalog, profileDiagnostic, profileUsable, assertProfilesAvailable } from "./model-profiles.mjs";
 import { runShellCommand } from "./shell-step.mjs";
+import { recoverUsageRuns, combineUsage } from "./usage-recovery.mjs";
 import {
   appendFileSync,
   closeSync,
@@ -635,6 +636,7 @@ function durationFields(durationMs) {
 
 export function taskMetrics(startedAt, completedAt, tokenUsage) {
   return {
+    tokenAccountingVersion: 2,
     startedAt: new Date(startedAt).toISOString(),
     completedAt: new Date(completedAt).toISOString(),
     ...durationFields(Math.max(0, completedAt - startedAt)),
@@ -656,6 +658,7 @@ function normalizedMetricRun(run) {
     return null;
   }
   return {
+    ...(run.tokenAccountingVersion === 2 ? { tokenAccountingVersion: 2 } : {}),
     startedAt: new Date(resolvedStartedMs).toISOString(),
     completedAt: new Date(completedMs).toISOString(),
     ...durationFields(durationMs),
@@ -755,6 +758,14 @@ export function cumulativeTaskMetrics(previous, attempt) {
   };
 }
 
+export function recoveredTaskMetrics(repoRoot, taskId, metrics) {
+  if (!metrics) return null;
+  const runs = metricRuns(metrics);
+  const recovered = recoverUsageRuns(repoRoot, taskId, runs);
+  if (recovered === runs || recovered.every((run, index) => run.tokenUsage === runs[index]?.tokenUsage)) return metrics;
+  return { ...metrics, runs: recovered, lastRun: recovered.at(-1), tokenUsage: combineUsage(recovered.map((run) => run.tokenUsage)) };
+}
+
 export function canAutoRetry(config, taskStatus) {
   const ledger = taskStatus?.attemptLedger;
   const finalizerOnly = TASK_GIT_FINALIZER_PHASES.has(taskStatus?.git?.phase);
@@ -840,6 +851,30 @@ function appendClaimedAttempt(task, claim, status, errorKind, metrics, usagePath
     tokenUsage: run.tokenUsage,
     usagePath: usagePath || null,
   });
+}
+
+function completedPipelineContinuation(task) {
+  const continuation = task.metadata.pipelineContinuation;
+  const previous = storedAttemptLedger(task).attempts.at(-1);
+  return Boolean(task.metadata.pipeline && continuation?.ready &&
+    continuation.result?.status === "completed" &&
+    continuation.digest === task.metadata.pipeline.digest && previous?.status === "completed" &&
+    (!continuation.attemptId || continuation.attemptId === previous.attemptId));
+}
+
+export function beginPipelineContinuation(taskPath, claim) {
+  const current = claim?.lockPath ? readJson(claim.lockPath) : null;
+  if (!current || !claim.token || current.token !== claim.token) {
+    throw new Error("Task claim is no longer owned by this worker");
+  }
+  const task = readTask(taskPath);
+  if (current.attemptId || !completedPipelineContinuation(task)) {
+    throw new Error("Pipeline continuation requires a completed implementation and a ready checkpoint");
+  }
+  const continuationOf = storedAttemptLedger(task).attempts.at(-1).attemptId;
+  atomicWriteJson(claim.lockPath, { ...current, continuationOf });
+  Object.assign(claim, { continuationOf });
+  return claim;
 }
 
 export function resolveTaskExecution(
@@ -1032,7 +1067,7 @@ export function findLegacyWorkers(
   });
   if (result.status !== 0) return [];
 
-  const taskStatuses = listTaskStatuses(repoRoot);
+  const taskStatuses = listTaskStatuses(repoRoot, { recoverUsage: false });
   const processes = [];
   for (const line of result.stdout.split(/\r?\n/)) {
     if (!line.includes(runnerPath)) continue;
@@ -1135,6 +1170,7 @@ export function readClaim(lockPath, { includeToken = false } = {}) {
     attempt: Number.isInteger(raw.attempt) ? raw.attempt : null,
     trigger: typeof raw.trigger === "string" ? raw.trigger : null,
     retryOf: typeof raw.retryOf === "string" ? raw.retryOf : null,
+    ...(typeof raw.continuationOf === "string" ? { continuationOf: raw.continuationOf } : {}),
   };
 }
 
@@ -2544,26 +2580,27 @@ export function writeHistory(repoRoot, id, value) {
   });
 }
 
-function closedTaskStatus(repoRoot, id) {
+function closedTaskStatus(repoRoot, id, recoverUsage = true) {
   try {
-    return readJson(existingHistoryPath(repoRoot, id));
+    const record = readJson(existingHistoryPath(repoRoot, id));
+    return recoverUsage ? { ...record, metrics: recoveredTaskMetrics(repoRoot, record.id, record.metrics) } : record;
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
     return { id: String(id), status: "unknown" };
   }
 }
 
-export function getTaskStatus(repoRoot, id) {
+export function getTaskStatus(repoRoot, id, { recoverUsage = true } = {}) {
   let filename;
   try {
     filename = existingTaskFilename(repoRoot, id);
   } catch {
-    return closedTaskStatus(repoRoot, id);
+    return closedTaskStatus(repoRoot, id, recoverUsage);
   }
 
   const taskPath = path.join(todoDir(repoRoot), filename);
   if (!existsSync(taskPath)) {
-    return closedTaskStatus(repoRoot, taskIdFromFilename(filename));
+    return closedTaskStatus(repoRoot, taskIdFromFilename(filename), recoverUsage);
   }
 
   let task;
@@ -2571,7 +2608,7 @@ export function getTaskStatus(repoRoot, id) {
     task = readTask(taskPath);
   } catch (error) {
     if (error.code === "ENOENT") {
-      return closedTaskStatus(repoRoot, taskIdFromFilename(filename));
+      return closedTaskStatus(repoRoot, taskIdFromFilename(filename), recoverUsage);
     }
     return {
       id: taskIdFromFilename(filename),
@@ -2613,7 +2650,7 @@ export function getTaskStatus(repoRoot, id) {
     // Completion publishes history before removing the active file. It can
     // happen in another process after any of the reads above.
     if (error.code !== "ENOENT") throw error;
-    return closedTaskStatus(repoRoot, task.id);
+    return closedTaskStatus(repoRoot, task.id, recoverUsage);
   }
   return {
     id: task.id,
@@ -2625,7 +2662,7 @@ export function getTaskStatus(repoRoot, id) {
     workerId: claim?.workerId ?? null,
     claim,
     error: task.metadata.error,
-    metrics: task.metadata.metrics || null,
+    metrics: recoverUsage ? recoveredTaskMetrics(repoRoot, task.id, task.metadata.metrics) : task.metadata.metrics || null,
     outcome: task.metadata.outcome || null,
     git: task.metadata.git || null,
     attemptLedger,
@@ -2657,10 +2694,10 @@ export function getTaskDetails(repoRoot, id) {
 
 export function listTaskStatuses(
   repoRoot,
-  { includeClosed = false, limit = 100 } = {},
+  { includeClosed = false, limit = 100, recoverUsage = true } = {},
 ) {
   const active = listTaskFiles(repoRoot).map((file) =>
-    getTaskStatus(repoRoot, taskIdFromFilename(path.basename(file))),
+    getTaskStatus(repoRoot, taskIdFromFilename(path.basename(file)), { recoverUsage }),
   );
   if (!includeClosed) return active;
 
@@ -2680,7 +2717,8 @@ export function listTaskStatuses(
   const closed = selectedClosedNames
     .map((name) => {
       try {
-        return readJson(path.join(historyDir, name));
+        const record = readJson(path.join(historyDir, name));
+        return recoverUsage ? { ...record, metrics: recoveredTaskMetrics(repoRoot, record.id, record.metrics) } : record;
       } catch {
         return null;
       }
@@ -2787,7 +2825,7 @@ function supervisorDefinition(value) {
 
 export function getSupervisorStatus(repoRoot) {
   const file = supervisorConfigPath(repoRoot);
-  const tasks = listTaskStatuses(repoRoot);
+  const tasks = listTaskStatuses(repoRoot, { recoverUsage: false });
   const counts = supervisorTaskCounts(tasks);
   const desiredStatus = tasks.length > 0 ? "ACTIVE" : "PAUSED";
   let automation = null;
@@ -2858,7 +2896,7 @@ export function listWorkerStatuses(repoRoot) {
       Number.isInteger(daemon.workers) && daemon.workers > 0
         ? daemon.workers
         : config.workers;
-    const taskStatuses = listTaskStatuses(repoRoot);
+    const taskStatuses = listTaskStatuses(repoRoot, { recoverUsage: false });
     const reported = Array.isArray(daemon.workerStates)
       ? daemon.workerStates
       : [];
@@ -2993,6 +3031,15 @@ export function markTaskModelCompleted(
   usagePath,
 ) {
   const task = readTask(taskPath);
+  if (claim?.continuationOf) {
+    const current = readJson(claim.lockPath);
+    if (!current || current.token !== claim.token ||
+        current.continuationOf !== claim.continuationOf ||
+        !completedPipelineContinuation(task) ||
+        storedAttemptLedger(task).attempts.at(-1).attemptId !== claim.continuationOf) {
+      throw new Error("Pipeline continuation claim or completed implementation no longer matches");
+    }
+  }
   task.metadata.metrics = metrics;
   task.metadata.attemptLedger = appendClaimedAttempt(
     task,
@@ -3412,7 +3459,8 @@ export function retryTask(
   task.metadata.error = null;
   const wasMergeFailed = task.metadata.git?.phase === "merge-failed";
   const modelRetry =
-    !wasMergeFailed && !TASK_GIT_FINALIZER_PHASES.has(task.metadata.git?.phase);
+    !wasMergeFailed && !TASK_GIT_FINALIZER_PHASES.has(task.metadata.git?.phase) &&
+    !completedPipelineContinuation(task);
   if (wasMergeFailed) {
     task.metadata.git = {
       ...task.metadata.git,
@@ -3727,6 +3775,7 @@ export async function finishInteractiveTask(
         current.metadata.attemptLedger = appendClaimedAttempt(current, claim, "completed", null, metrics, null);
         current.metadata.pipelineContinuation = {
           ...current.metadata.pipelineContinuation,
+          attemptId: claim.attemptId,
           result: { status: "completed", summary: summary.trim(), validation, error: null,
             requiresInteractive: false, interactiveReason: null },
           ready: true,
@@ -4096,14 +4145,20 @@ export function setTaskError(
     : classifyFailure({ errorKind: kind, code: exitCode, message });
   task.metadata.outcome = failure.status;
   if (attemptContext?.claim?.attemptId) {
-    task.metadata.attemptLedger = appendClaimedAttempt(
-      task,
-      attemptContext.claim,
-      failure.status,
-      failure.errorKind,
-      metrics,
-      attemptContext.usagePath,
-    );
+    try {
+      task.metadata.attemptLedger = appendClaimedAttempt(
+        task,
+        attemptContext.claim,
+        failure.status,
+        failure.errorKind,
+        metrics,
+        attemptContext.usagePath,
+      );
+    } catch (error) {
+      // A rejected ledger transition must not erase the original task failure.
+      // Keep the immutable history and expose the secondary recording failure.
+      task.metadata.error.attemptLedgerError = String(error.message).slice(0, 4000);
+    }
     delete task.metadata.nextAttemptTrigger;
   }
   writeTask(task);

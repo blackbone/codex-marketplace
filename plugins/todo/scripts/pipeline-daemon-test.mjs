@@ -100,6 +100,10 @@ if (process.argv[2] === "exec") {
 }
 let threadNumber = 0;
 let turnNumber = 0;
+let cumulativeInput = 0;
+let cumulativeOutput = 0;
+let cumulativeCached = 0;
+let cumulativeReasoning = 0;
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 for await (const line of createInterface({ input: process.stdin })) {
   const message = JSON.parse(line);
@@ -124,7 +128,17 @@ for await (const line of createInterface({ input: process.stdin })) {
     send({ id: message.id, result: { turn: { id: turnId, status: "inProgress", items: [] } } });
     send({ method: "item/completed", params: { threadId, turnId, item: { id: "pipeline-item-" + turnNumber, type: "agentMessage", text: JSON.stringify(result) } } });
     const last = { inputTokens: 20, cachedInputTokens: turnNumber > 1 ? 10 : 0, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 1 };
-    send({ method: "thread/tokenUsage/updated", params: { threadId, turnId, tokenUsage: { last, total: last, modelContextWindow: 1000 } } });
+    for (let request = 0; request < 2; request++) {
+      cumulativeInput += last.inputTokens; cumulativeOutput += last.outputTokens;
+      cumulativeCached += last.cachedInputTokens; cumulativeReasoning += last.reasoningOutputTokens;
+      const total = { inputTokens: cumulativeInput, outputTokens: cumulativeOutput, cachedInputTokens: cumulativeCached, reasoningOutputTokens: cumulativeReasoning };
+      const notification = { method: "thread/tokenUsage/updated", params: { threadId, turnId, tokenUsage: { last, total, modelContextWindow: 1000 } } };
+      send(notification); send(notification); // Transport repeats must not double count.
+    }
+    if (turnNumber === 1) {
+      send({ method: "turn/completed", params: { threadId, turn: { id: turnId, status: "failed", error: { message: "temporary service unavailable" }, items: [] } } });
+      continue;
+    }
     send({ method: "turn/completed", params: { threadId, turn: { id: turnId, status: "completed", items: [] } } });
   }
 }
@@ -149,7 +163,7 @@ writeFileSync(
       pollIntervalMs: 250,
       configReloadIntervalMs: 250,
       dashboardPort: 0,
-      retries: 0,
+      retries: 1,
       codexCommand: fake,
       executionBackend: "app-server",
       pipeline: { file: "todo-pipeline.yaml" },
@@ -186,20 +200,24 @@ let receipt;
 const deadline = Date.now() + 30000;
 while (Date.now() < deadline) {
   receipt = getTaskStatus(root, task.id);
-  if (receipt.status === "completed" || receipt.status === "failed") break;
+  if (receipt.status === "completed" || (receipt.status === "failed" && receipt.metrics?.attempts >= 2)) break;
   await new Promise((resolve) => setTimeout(resolve, 100));
 }
 daemon.kill("SIGINT");
 await new Promise((resolve) => daemon.once("close", resolve));
 
 assert.equal(receipt?.status, "completed", stderr || JSON.stringify(receipt));
-assert.equal(receipt.execution.modelProfile, "expert");
-assert.equal(receipt.execution.model, "current-expert");
+assert.equal(receipt.execution.modelProfile, "ultra");
+assert.equal(receipt.execution.model, "current-ultra");
 assert.equal(receipt.pipeline.source, "todo-pipeline.yaml");
 assert.equal(receipt.codexThread.id, "pipeline-thread-1");
 assert.equal(receipt.codexThread.state, "archived");
-assert.equal(receipt.attemptLedger.attempts.length, 1);
-assert.equal(receipt.attemptLedger.attempts[0].status, "completed");
+assert.equal(receipt.attemptLedger.attempts.length, 2);
+assert.equal(receipt.metrics.tokenUsage.totalTokens, 180);
+assert.deepEqual(receipt.metrics.runs.map(run => run.tokenUsage.totalTokens), [65, 115]);
+assert.equal(receipt.metrics.tokenUsage.coverage, "full");
+assert.equal(receipt.attemptLedger.attempts[0].status, "failed_transient");
+assert.equal(receipt.attemptLedger.attempts[1].status, "completed");
 assert.deepEqual(receipt.validation, [
   "build: node pipeline-check.mjs",
   "test: node --check implemented.mjs",
@@ -219,7 +237,7 @@ const attemptName = spawnSync("find", [attemptsRoot, "-maxdepth", "1", "-type", 
   .trim()
   .split("\n")
   .map((entry) => path.basename(entry))
-  .find((entry) => entry.startsWith("attempt-"));
+  .find((entry) => entry.startsWith("attempt-002-"));
 assert(attemptName);
 const pipelineRun = JSON.parse(
   readFileSync(path.join(attemptsRoot, attemptName, "pipeline.json"), "utf8"),
@@ -239,5 +257,6 @@ assert.match(JSON.stringify(pipelineRun), /BUILD_FIXTURE_FAILURE/);
 const calls = traceText.trim().split("\n").map(line => JSON.parse(line));
 assert.equal(calls.find(call => call.mode === "exec").model, "current-fast");
 assert.deepEqual(calls.filter(call => call.message?.method === "turn/start").map(call => call.message.params.model),
-  ["current-medium", "current-expert"]);
+  ["current-medium", "current-medium", "current-expert"]);
 console.log("todo pipeline daemon test passed");
+await import("./pipeline-continuation-test.mjs");

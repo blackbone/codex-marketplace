@@ -25,7 +25,7 @@ fs.writeFileSync(path.join(roots[0], 'docs', 'shipping.md'), '# Warehouse shippi
 fs.writeFileSync(path.join(roots[1], 'docs', 'food.md'), '# Pasta\n\nBoil water and cook spaghetti. Mix pasta with tomato sauce and cheese.\n');
 
 async function cli(cwd, question) {
-  const { stdout } = await exec(process.execPath, [path.join(scripts, 'cli.mjs'), 'search', question], { cwd, timeout: 900_000 });
+  const { stdout } = await exec(process.execPath, [path.join(scripts, 'cli.mjs'), 'find', question], { cwd, timeout: 900_000 });
   return JSON.parse(stdout);
 }
 
@@ -76,9 +76,9 @@ try {
     finally { clearTimeout(timer); }
   }
   const handshake = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'integration-test', version: '1' } });
-  assert.equal(handshake.result.serverInfo.name, 'semantic-search');
+  assert.equal(handshake.result.serverInfo.name, 'docs');
   const listed = await rpc('tools/list', {});
-  assert.equal(listed.result.tools.length, 6);
+  assert.equal(listed.result.tools.length, 7);
   const found = await rpc('tools/call', { name: 'docs_search', arguments: { cwd: roots[0], query: 'Как заблокировать все сеансы пользователя?' } });
   assert.equal(found.result.isError, false);
   const answer = JSON.parse(found.result.content[0].text);
@@ -97,7 +97,7 @@ try {
   assert.ok(watcherResult.results.some(result => result.path === 'docs/renamed.md'));
   assert.ok(watcherResult.results.every(result => result.path !== 'docs/watcher.md'));
   if (process.env.SEMANTIC_SEARCH_EXAMPLE_OUTPUT) fs.writeFileSync(process.env.SEMANTIC_SEARCH_EXAMPLE_OUTPUT, JSON.stringify({ config: JSON.parse(fs.readFileSync(path.join(roots[0], '.semantic-search.json'))), status: { indexed: watcherResult.indexed, pending: watcherResult.pending, index: '.semantic-search/index.sqlite' }, query: 'Как отключить доступ у уволенного сотрудника?', result: alpha.results[0] }, null, 2));
-  console.log(JSON.stringify({ passed: true, checks: ['real multilingual semantic retrieval', 'two projects remain isolated', 'parallel CLI and MCP share one model process', 'unchanged files reuse embeddings', 'MCP handshake and six tools', 'current source line reads', 'path boundaries', 'session hooks register/unregister with owner refcounts', 'watcher indexes without a query', 'rename removes old index entries'], servicePid: alpha.servicePid, cacheRoot: tempRoot() }, null, 2));
+  console.log(JSON.stringify({ passed: true, checks: ['real multilingual semantic retrieval', 'two projects remain isolated', 'parallel CLI and MCP share one model process', 'unchanged files reuse embeddings', 'MCP handshake and seven tools', 'current source line reads', 'path boundaries', 'session hooks register/unregister with owner refcounts', 'watcher indexes without a query', 'rename removes old index entries'], servicePid: alpha.servicePid, cacheRoot: tempRoot() }, null, 2));
 } finally {
   mcp?.kill();
   for (const suffix of ['a', 'b', 'c']) await request('unregister', { owner: `session:e2e-${process.pid}-${suffix}` }).catch(() => {});

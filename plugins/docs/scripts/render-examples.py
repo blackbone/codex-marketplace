@@ -28,7 +28,7 @@ def font(size, bold=False):
 def render(filename, title, subtitle, sections):
     im = Image.new('RGB', (1200, 1020), '#f3f5f6')
     draw = ImageDraw.Draw(im)
-    draw.text((64, 44), 'SEMANTIC SEARCH / LOCAL DOCUMENTATION', font=font(18), fill='#556366')
+    draw.text((64, 44), 'DOCS / LOCAL DOCUMENTATION', font=font(18), fill='#556366')
     draw.text((64, 90), title, font=font(38, True), fill='#172123')
     draw.text((64, 148), subtitle, font=font(21), fill='#4c595e')
     y = 211

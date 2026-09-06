@@ -40,7 +40,7 @@ function hook(root, event, env = {}) {
 // These are instruction-contract checks, not a natural-language classifier or
 // an assertion that an independently running model followed the instructions.
 const scenarios = [
-  ["1. semantic-search:init + service config + docs index => direct", /semantic-search:init writing \.semantic-search\.json and indexing docs\/ is direct/],
+  ["1. docs:init + service config + docs index => direct", /docs:init writing \.semantic-search\.json and indexing docs\/ is direct/],
   ["2. another Codex plugin or MCP setup => direct", /configuring another Codex plugin or MCP connection is direct/],
   ["3. plugin edits product code or project docs => ToDo", /editing source code or docs\/ through a plugin requires ToDo/],
   ["4. build/deployment disguised as tooling => ToDo", /changing a build pipeline or deployment under the label "tooling setup" requires ToDo/],

@@ -13,7 +13,7 @@ input.on('line', async line => {
   if (message.id === undefined) return;
   const reply = result => output({ jsonrpc: '2.0', id: message.id, result });
   try {
-    if (message.method === 'initialize') return reply({ protocolVersion: versions.includes(message.params?.protocolVersion) ? message.params.protocolVersion : versions[0], capabilities: { tools: {} }, serverInfo: { name: 'semantic-search', version }, instructions: 'In folders with .semantic-search.json, search and read relevant local documentation before project decisions or implementation. Pass the absolute current folder as cwd. Init asks the user which documentation folders to use.' });
+    if (message.method === 'initialize') return reply({ protocolVersion: versions.includes(message.params?.protocolVersion) ? message.params.protocolVersion : versions[0], capabilities: { tools: {} }, serverInfo: { name: 'docs', version }, instructions: 'In folders with .semantic-search.json, search and read relevant local documentation before project decisions or implementation. Pass the absolute current folder as cwd. Init asks the user which documentation folders to use.' });
     if (message.method === 'ping') return reply({});
     if (message.method === 'tools/list') return reply({ tools });
     if (message.method === 'tools/call') {

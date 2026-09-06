@@ -37,7 +37,7 @@ await withLock(path.join(cacheDir('servers'), 'daemon-v2.owner.lock'), async () 
       if (!args || typeof args !== 'object') throw new Error('Missing arguments');
       if (method === 'register') {
         const root = indexer.register(args.cwd, args.owner);
-        return reply(res, 200, { root, registered: true });
+        return reply(res, 200, { root, registered: root !== null });
       }
       if (method === 'unregister') {
         if (typeof args.owner !== 'string' || !args.owner) throw new Error('A registration owner is required');

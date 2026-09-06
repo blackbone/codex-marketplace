@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "semantic-search": {
+    "docs": {
       "command": "sh",
       "args": ["-c", "exec node \"$PLUGIN_ROOT/scripts/mcp-server.mjs\""],
       "cwd": ".",

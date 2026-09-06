@@ -28,7 +28,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     send({ id: message.id, result: { turn } });
     send({ method: "item/completed", params: { threadId, turnId: "turn-1", completedAtMs: Date.now(), item: { id: "item-1", type: "agentMessage", text: "{\\\"status\\\":\\\"completed\\\"}" } } });
     send({ method: "thread/tokenUsage/updated", params: { threadId, turnId: "turn-1", tokenUsage: { last: { inputTokens: 40, cachedInputTokens: 20, cacheWriteInputTokens: 0, outputTokens: 10, reasoningOutputTokens: 2, totalTokens: 50 }, total: { inputTokens: 40, cachedInputTokens: 20, cacheWriteInputTokens: 0, outputTokens: 10, reasoningOutputTokens: 2, totalTokens: 50 }, modelContextWindow: 1000 } } });
-    send({ method: "thread/tokenUsage/updated", params: { threadId, turnId: "turn-1", tokenUsage: { last: { inputTokens: 100, cachedInputTokens: 80, cacheWriteInputTokens: 0, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 }, total: { inputTokens: 100, cachedInputTokens: 80, cacheWriteInputTokens: 0, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 }, modelContextWindow: 1000 } } });
+    send({ method: "thread/tokenUsage/updated", params: { threadId, turnId: "turn-1", tokenUsage: { last: { inputTokens: 100, cachedInputTokens: 80, cacheWriteInputTokens: 0, outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 }, total: { inputTokens: 140, cachedInputTokens: 100, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 7, totalTokens: 170 }, modelContextWindow: 1000 } } });
     send({ method: "turn/completed", params: { threadId, turn: { id: "turn-1", status: "completed", items: [] } } });
   }
 }
@@ -63,12 +63,12 @@ const turn = await client.waitForTurn(thread.id, turnId);
 assert.equal(turn.status, "completed");
 const stats = parseAppServerExecutionStats(events.join("\n"), turnId);
 assert.equal(stats.threadId, thread.id);
-assert.equal(stats.tokenUsage.inputTokens, 100);
-assert.equal(stats.tokenUsage.cachedInputTokens, 80);
-assert.equal(stats.tokenUsage.totalTokens, 120);
+assert.equal(stats.tokenUsage.inputTokens, 140);
+assert.equal(stats.tokenUsage.cachedInputTokens, 100);
+assert.equal(stats.tokenUsage.totalTokens, 170);
 assert.equal(stats.tokenUsage.turns, 1);
 assert.equal(stats.observable.agentMessages.items, 1);
-assert.equal(stats.requestStats.reason, "app_server_protocol_has_turn_totals_only");
+assert.equal(stats.requestStats.reason, "app_server_protocol_has_no_transport_retry_counts");
 
 await client.archiveThread(thread.id);
 await client.unarchiveThread(thread.id);

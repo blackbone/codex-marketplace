@@ -27,6 +27,7 @@ export class AppServerClient {
     this.threadHandlers = new Map();
     this.turnCompletions = new Map();
     this.loadedThreads = new Set();
+    this.tokenTotals = new Map();
     this.closed = false;
   }
 
@@ -107,6 +108,9 @@ export class AppServerClient {
     const params = message.params || {};
     const threadId = params.threadId;
     const turnId = params.turnId || params.turn?.id;
+    if (message.method === "thread/tokenUsage/updated" && threadId && params.tokenUsage?.total) {
+      this.tokenTotals.set(threadId, params.tokenUsage.total);
+    }
     if (threadId && turnId) {
       const handler =
         this.turnHandlers.get(turnKey(threadId, turnId)) ||
@@ -155,6 +159,7 @@ export class AppServerClient {
       ephemeral: false,
     });
     this.loadedThreads.add(response.thread.id);
+    this.tokenTotals.set(response.thread.id, { inputTokens: 0, outputTokens: 0 });
     return response.thread;
   }
 
@@ -182,6 +187,11 @@ export class AppServerClient {
   }
 
   async startTurn(params, onMessage) {
+    const baseline = this.tokenTotals.get(params.threadId);
+    if (baseline) {
+      const marker = { method: "todo/tokenUsage/baseline", params: { threadId: params.threadId, total: baseline } };
+      onMessage?.(marker, JSON.stringify(marker));
+    }
     this.threadHandlers.set(params.threadId, onMessage);
     let response;
     try {

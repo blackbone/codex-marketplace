@@ -17,10 +17,10 @@
       "category": "Productivity"
     },
     {
-      "name": "semantic-search",
+      "name": "docs",
       "source": {
         "source": "local",
-        "path": "./plugins/semantic-search"
+        "path": "./plugins/docs"
       },
       "policy": {
         "installation": "AVAILABLE",

@@ -22,6 +22,7 @@ import {
   applyGitExcludes,
   atomicWriteJson,
   beginModelAttempt,
+  beginPipelineContinuation,
   canAutoRetry,
   claimTask,
   cleanupStaleClaims,
@@ -53,6 +54,7 @@ import {
   readDaemonState,
   readDashboardThreadRequest,
   readTask,
+  recoveredTaskMetrics,
   readClaim,
   releaseClaim,
   resolveTaskExecution,
@@ -75,6 +77,7 @@ import {
   parseOtlpRequestStats,
 } from "./execution-stats.mjs";
 import { AppServerClient } from "./app-server-client.mjs";
+import { combineUsage } from "./usage-recovery.mjs";
 import { createTaskInteraction } from "./task-interaction.mjs";
 import { DesktopClient } from "./desktop-client.mjs";
 import { classifyFailure } from "./attempt-ledger.mjs";
@@ -502,35 +505,6 @@ function parsePipelineStepResult(resultFile) {
   return result;
 }
 
-function combinedTokenUsage(records) {
-  const available = records.filter((record) => record?.available);
-  if (available.length === 0) return emptyTokenUsage();
-  const keys = [
-    "inputTokens",
-    "cachedInputTokens",
-    "uncachedInputTokens",
-    "cacheWriteInputTokens",
-    "outputTokens",
-    "reasoningOutputTokens",
-    "visibleOutputTokens",
-    "totalTokens",
-  ];
-  const usage = {
-    available: true,
-    coverage: available.every((record) => record.coverage === "full")
-      ? "full"
-      : "partial",
-    turns: available.reduce((total, record) => total + (record.turns || 0), 0),
-  };
-  for (const key of keys) {
-    usage[key] = available.reduce(
-      (total, record) => total + (Number(record[key]) || 0),
-      0,
-    );
-  }
-  return usage;
-}
-
 function buildPrompt(task, worktreePath) {
   const taskCreationInstructions =
     task.metadata.allowWorkerTaskCreation === true
@@ -850,7 +824,7 @@ function scheduleDesktopMaintenance(config) {
   if (desktopMaintenance || Date.now() < nextDesktopAttemptAt || !process.env.CODEX_APP_TOOLS_PIPE_PATH) return;
   const ownerThreadId = getSupervisorStatus(repoRoot).automation?.targetThreadId;
   if (!ownerThreadId) return;
-  const tasks = listTaskStatuses(repoRoot, { includeClosed: true, limit: null });
+  const tasks = listTaskStatuses(repoRoot, { includeClosed: true, limit: null, recoverUsage: false });
   const claimed = tasks.filter(task => task.claim?.owner?.threadId && task.claim.owner.turnId);
   desktopMaintenance = (async () => {
     const client = appTools(config);
@@ -907,7 +881,7 @@ function scheduleDesktopMaintenance(config) {
 function scheduleNativeTasks(config) {
   if (Date.now() < nextDesktopDispatchAt || !process.env.CODEX_APP_TOOLS_PIPE_PATH ||
       !getSupervisorStatus(repoRoot).automation?.targetThreadId || taskBatchPublicationActive(repoRoot)) return;
-  const tasks = listTaskStatuses(repoRoot);
+  const tasks = listTaskStatuses(repoRoot, { recoverUsage: false });
   let occupied = implementationActiveCount() + desktopDispatches.size +
     tasks.filter(task => task.claim?.owner?.threadId || task.interaction?.dispatching).length;
   for (const task of tasks) {
@@ -1227,7 +1201,7 @@ async function executeTaskWithExec(taskPath, claim, workerId, config) {
     await executeDeliveryOnly(taskPath, claim, workerId, config);
     return;
   }
-  const previousMetrics = task.metadata.metrics || null;
+  const previousMetrics = recoveredTaskMetrics(repoRoot, task.id, task.metadata.metrics);
   const execution =
     task.metadata.execution || resolveTaskExecution(config, {});
   let preparedGit;
@@ -1684,7 +1658,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
   }
   const execution =
     task.metadata.execution || resolveTaskExecution(config, {});
-  const previousMetrics = task.metadata.metrics || null;
+  const previousMetrics = recoveredTaskMetrics(repoRoot, task.id, task.metadata.metrics);
   let preparedGit;
   try {
     preparedGit = isMergeRepair
@@ -1804,7 +1778,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
         outputSchema,
       },
       (message, line) => {
-        appendFileSync(stdoutPath, `${line}\n`, "utf8");
+        appendFileSync(stdoutPath, `${JSON.stringify({ ...message, todoTimestamp: new Date().toISOString() })}\n`, "utf8");
         const item = message.params?.item;
         if (
           message.method === "item/completed" &&
@@ -2059,7 +2033,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     await executeDeliveryOnly(taskPath, claim, workerId, config);
     return;
   }
-  const previousMetrics = task.metadata.metrics || null;
+  const previousMetrics = recoveredTaskMetrics(repoRoot, task.id, task.metadata.metrics);
   let pipeline;
   let preparedGit;
   try {
@@ -2088,12 +2062,17 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     return;
   }
 
-  beginModelAttempt(taskPath, claim);
+  if (task.metadata.pipelineContinuation?.ready) {
+    beginPipelineContinuation(taskPath, claim);
+  } else {
+    beginModelAttempt(taskPath, claim);
+  }
   const attemptDir = path.join(
     todoDir(repoRoot),
     "logs",
     task.id,
-    `attempt-${String(claim.attempt || 1).padStart(3, "0")}-${claim.attemptId}`,
+    claim.continuationOf ? `continuation-${randomUUID()}` :
+      `attempt-${String(claim.attempt || 1).padStart(3, "0")}-${claim.attemptId}`,
   );
   mkdirSync(attemptDir, { recursive: true });
   const usagePath = path.join(attemptDir, "usage.json");
@@ -2305,7 +2284,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
           outputSchema,
         },
         (message, line) => {
-          appendFileSync(stdoutPath, `${line}\n`, "utf8");
+          appendFileSync(stdoutPath, `${JSON.stringify({ ...message, todoTimestamp: new Date().toISOString() })}\n`, "utf8");
           const item = message.params?.item;
           if (
             message.method === "item/completed" &&
@@ -2339,13 +2318,13 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
       throw error;
     } finally {
       threadTurns += 1;
+      const stats = parseAppServerExecutionStats(
+        existsSync(stdoutPath) ? readFileSync(stdoutPath, "utf8") : "",
+        turnId,
+      );
+      stats.threadId = threadId;
+      stepStats.push({ stepId: step.id, type: step.type, execution, stats });
     }
-    const stats = parseAppServerExecutionStats(
-      existsSync(stdoutPath) ? readFileSync(stdoutPath, "utf8") : "",
-      turnId,
-    );
-    stats.threadId = threadId;
-    stepStats.push({ stepId: step.id, type: step.type, execution, stats });
     let result;
     try {
       result = parsePipelineStepResult(resultPath);
@@ -2431,6 +2410,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     backend: "pipeline",
     pipeline: pipeline.source,
     pipelineDigest: pipeline.digest,
+    continuationOf: claim.continuationOf || null,
     attempt: claim.attempt,
     attemptId: claim.attemptId,
     worktreePath: preparedGit.worktreePath,
@@ -2475,6 +2455,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
           schemaVersion: 1,
           taskId: task.id,
           attemptId: claim.attemptId,
+          continuationOf: claim.continuationOf || null,
           pipeline: {
             source: pipeline.source,
             digest: pipeline.digest,
@@ -2491,7 +2472,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
 
   const executionStats = {
     threadId,
-    tokenUsage: combinedTokenUsage(stepStats.map((entry) => entry.stats.tokenUsage)),
+    tokenUsage: combineUsage(stepStats.map((entry) => entry.stats.tokenUsage)),
     observable: {
       pipeline: {
         source: pipeline.source,
@@ -2511,10 +2492,10 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
       reason: "pipeline_aggregates_step_usage",
     },
   };
-  metrics = cumulativeTaskMetrics(
-    previousMetrics,
-    taskMetrics(startedAt, Date.now(), executionStats.tokenUsage),
-  );
+  const runMetrics = taskMetrics(startedAt, Date.now(), executionStats.tokenUsage);
+  // Shell-only continuation has its own receipts, not another model run.
+  metrics = claim.continuationOf && stepStats.length === 0 ? previousMetrics :
+    cumulativeTaskMetrics(previousMetrics, runMetrics);
 
   try {
     if (runError) {
@@ -2666,9 +2647,9 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
           taskId: task.id,
           attempt: claim.attempt,
           status: attemptStatus,
-          startedAt: metrics?.lastRun?.startedAt,
-          completedAt: metrics?.lastRun?.completedAt,
-          durationMs: metrics?.lastRun?.durationMs,
+          startedAt: runMetrics.startedAt,
+          completedAt: runMetrics.completedAt,
+          durationMs: runMetrics.durationMs,
           modelProfile: baseExecution.modelProfile,
           model: baseExecution.model,
           reasoningEffort: baseExecution.reasoningEffort,
@@ -2681,6 +2662,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
         pipelineFile: pipeline.source,
         pipelineDigest: pipeline.digest,
         pipelineRunFile: path.basename(pipelineRunPath),
+        continuationOf: claim.continuationOf || null,
       });
     } catch (error) {
       log("usage_log_error", { task: task.id, error: error.message });
@@ -2694,7 +2676,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
       threadId,
       turnId,
       attempt: claim.attempt,
-      totalTokens: metrics?.lastRun?.tokenUsage?.totalTokens || 0,
+      totalTokens: runMetrics.tokenUsage.totalTokens || 0,
     });
     writeState();
   }
@@ -3060,42 +3042,52 @@ function startReadyTasks(config) {
     });
     writeState();
     const promise = executeTask(taskPath, claim, workerId, config).catch((error) => {
-      const current = getTaskStatus(repoRoot, id);
-      const alreadyRecorded = current.attemptLedger?.attempts?.some(
-        (attempt) => attempt.attemptId === claim.attemptId,
-      );
-      const modelAttemptStarted = Boolean(claim.attemptId);
-      const completedAt = Date.now();
-      const claimedAt = Date.parse(claim.claimedAt);
-      const metrics = !modelAttemptStarted || alreadyRecorded
-        ? current.metrics || null
-        : cumulativeTaskMetrics(
-            current.metrics || null,
-            taskMetrics(
-              Number.isFinite(claimedAt) ? claimedAt : completedAt,
-              completedAt,
-              emptyTokenUsage(),
-            ),
-          );
-      setTaskError(
-        taskPath,
-        "runner_unhandled",
-        null,
-        error.message,
-        metrics,
-        !modelAttemptStarted || alreadyRecorded
-          ? null
-          : attemptFailure(
-              claim,
-              "runner_unhandled",
-              null,
-              error.message,
-              null,
-            ),
-      );
-      releaseClaim(claim);
-      interaction.abandon(id); active.delete(id);
-      log("task_unhandled_error", { task: id, error: error.message });
+      // Record the original exception before status/ledger/cleanup can fail.
+      log("task_unhandled_error", { task: id, error: error.message, stack: error.stack });
+      try {
+        const current = getTaskStatus(repoRoot, id);
+        const alreadyRecorded = current.attemptLedger?.attempts?.some(
+          (attempt) => attempt.attemptId === claim.attemptId,
+        );
+        const modelAttemptStarted = Boolean(claim.attemptId);
+        const completedAt = Date.now();
+        const claimedAt = Date.parse(claim.claimedAt);
+        const metrics = !modelAttemptStarted || alreadyRecorded
+          ? current.metrics || null
+          : cumulativeTaskMetrics(
+              current.metrics || null,
+              taskMetrics(
+                Number.isFinite(claimedAt) ? claimedAt : completedAt,
+                completedAt,
+                emptyTokenUsage(),
+              ),
+            );
+        setTaskError(
+          taskPath,
+          "runner_unhandled",
+          null,
+          error.message,
+          metrics,
+          !modelAttemptStarted || alreadyRecorded
+            ? null
+            : attemptFailure(
+                claim,
+                "runner_unhandled",
+                null,
+                error.message,
+                null,
+              ),
+        );
+      } catch (recordingError) {
+        log("task_error_recording_failed", { task: id, error: error.message,
+          recordingError: recordingError.message });
+      } finally {
+        try { releaseClaim(claim); }
+        catch (cleanupError) { log("task_claim_release_error", { task: id, error: cleanupError.message }); }
+        try { interaction.abandon(id); }
+        catch (cleanupError) { log("task_interaction_cleanup_error", { task: id, error: cleanupError.message }); }
+        active.delete(id);
+      }
     });
     const entry = active.get(id);
     if (entry) entry.promise = promise;

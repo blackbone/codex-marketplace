@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   buildAttemptUsageV2,
   parseExecutionStats,
+  parseAppServerExecutionStats,
   parseOtlpRequestStats,
   readAttemptUsage,
 } from "./execution-stats.mjs";
@@ -407,3 +408,29 @@ assert.equal(
 );
 
 process.stdout.write("execution stats test passed\n");
+
+// Real app-server notifications report both last-request and thread-cumulative
+// counters. They are not interchangeable, including across repair turns.
+const count = (inputTokens, outputTokens = 0) => ({ inputTokens, outputTokens, cachedInputTokens: 0 });
+const usageEvent = (turnId, total, last) => ({ method: "thread/tokenUsage/updated", params: {
+  threadId: "measured-thread", turnId, tokenUsage: { total, last },
+} });
+const baseline = (total) => ({ method: "todo/tokenUsage/baseline", params: { threadId: "measured-thread", total } });
+const parseUsage = (events, turnId = "turn-1") => parseAppServerExecutionStats(events.map(JSON.stringify).join("\n"), turnId).tokenUsage;
+const notifications = [baseline(count(0)), usageEvent("turn-1", count(100, 10), count(100, 10)),
+  usageEvent("turn-1", count(350, 40), count(250, 30))];
+assert.equal(parseUsage(notifications).totalTokens, 390);
+assert.equal(parseUsage([...notifications, notifications.at(-1)]).totalTokens, 390, "duplicate notification");
+assert.equal(parseUsage([...notifications, usageEvent("turn-1", count(500, 50), count(70, 5))]).totalTokens, 550, "cumulative counter recovers missing notifications");
+assert.equal(parseUsage([baseline(count(350, 40)), usageEvent("turn-2", count(500, 50), count(150, 10))], "turn-2").totalTokens, 160, "repair excludes earlier turn");
+assert.equal(parseUsage([usageEvent("turn-1", count(350, 40), count(250, 30)), usageEvent("turn-2", count(500, 50), count(150, 10))], "turn-2").totalTokens, 160, "resume replay seeds baseline");
+const unanchored = parseUsage([usageEvent("turn-2", count(500, 50), count(150, 10))], "turn-2");
+assert.equal(unanchored.totalTokens, 160);
+assert.equal(unanchored.coverage, "partial", "cannot prove missing historical baseline");
+const reset = parseUsage([...notifications, usageEvent("turn-1", count(20, 2), count(20, 2)), usageEvent("turn-1", count(50, 5), count(30, 3))]);
+assert.equal(reset.totalTokens, 445);
+assert.equal(reset.coverage, "partial", "reset is visible but boundary completeness is unknown");
+assert.equal(parseUsage([...notifications, { method: "turn/completed", params: { threadId: "measured-thread", turn: { id: "turn-1", status: "interrupted" } } }]).totalTokens, 390, "interruption retains measured usage");
+assert.equal(parseUsage([usageEvent("turn-1", null, count(100))]).coverage, "none", "no invented total from ambiguous last-only events");
+assert.equal(parseUsage([baseline(count(0)), usageEvent("turn-1", count(0), count(0))]).available, true, "measured zero is distinct from missing usage");
+assert.equal(parseUsage([...notifications, usageEvent("turn-other", count(10), count(10)), usageEvent("turn-1", count(500, 50), count(150, 10))]).totalTokens, 550, "late unrelated turn cannot rewind baseline");

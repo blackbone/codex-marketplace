@@ -1,10 +1,15 @@
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { appendTaskChat } from "./task-chat.mjs";
 import { claimTask, formatTaskThreadTitle, getTaskDetails, readTask, releaseClaim, writeTask } from "./lib.mjs";
 
 export function createTaskInteraction({ repoRoot, active, getAppServer, getClient, getOwnerThreadId, onChange = () => {} }) {
   const pendingUserInputs = new Map();
+  function record(taskId, event) {
+    try { appendTaskChat(repoRoot, taskId, event); return {}; }
+    catch { return { warning: "Accepted, but the chat history could not be saved." }; }
+  }
 function handleAgentInputRequest(message) {
   if (message.method !== "item/tool/requestUserInput") {
     throw new Error(`Interactive server request is unsupported: ${message.method}`);
@@ -21,6 +26,7 @@ function handleAgentInputRequest(message) {
     nativeThreadId: task.metadata.interaction?.nativeThreadId || null,
     questions, question: questions.map(item => item.question).join("\n"), updatedAt: new Date().toISOString() };
   writeTask(task);
+  record(task.id, { role: "assistant", label: "Question", text: questions.map(item => item.question).join("\n\n") });
   onChange();
   return new Promise((resolve, reject) => {
     pendingUserInputs.set(requestId, { taskId: task.id, taskPath: task.path, claimToken: entry.claim.token, resolve, reject });
@@ -35,7 +41,7 @@ async function desktopTaskAction({ taskId, action, text = "", expectedTurnId, re
     if (typeof text !== "string" || !text.trim() || text.length > 8000) throw new Error("Enter an instruction (1-8000 characters)");
     if (entry?.threadId && entry.turnId && entry.turnId === expectedTurnId) {
       const result = await getAppServer().steerTurn(entry.threadId, entry.turnId, text.trim());
-      return { accepted: true, turnId: result.turnId };
+      return { accepted: true, turnId: result.turnId, ...record(task.id, { role: "user", label: "Instruction", text: text.trim() }) };
     }
     const owner = task.claim?.owner;
     if (entry || !owner?.threadId || !owner.turnId || owner.turnId !== expectedTurnId) {
@@ -47,7 +53,7 @@ async function desktopTaskAction({ taskId, action, text = "", expectedTurnId, re
       throw new Error("The app turn changed. Open its chat to continue.");
     }
     await client.call("send_message_to_thread", { threadId: owner.threadId, prompt: text.trim() }, getOwnerThreadId());
-    return { accepted: true, threadId: owner.threadId };
+    return { accepted: true, threadId: owner.threadId, ...record(task.id, { role: "user", label: "Instruction", text: text.trim() }) };
   }
   if (action === "reply" && task.interaction?.requestId) {
     const pending = pendingUserInputs.get(requestId);
@@ -64,7 +70,9 @@ async function desktopTaskAction({ taskId, action, text = "", expectedTurnId, re
     writeTask(current);
     pendingUserInputs.delete(requestId);
     pending.resolve({ answers: result });
-    return { accepted: true };
+    onChange();
+    return { accepted: true, ...record(task.id, { role: "user", label: "Answer",
+      text: task.interaction.questions.map(q => `${q.question}\n${answers[q.id].trim()}`).join("\n\n") }) };
   }
   if (!["open", "native", "reply"].includes(action)) throw new Error("Unsupported task action");
   const ownerThreadId = getOwnerThreadId();
@@ -125,7 +133,7 @@ async function desktopTaskAction({ taskId, action, text = "", expectedTurnId, re
         owner: current.metadata.interaction?.owner || { threadId, turnId: null } };
       writeTask(current);
     }
-    return { accepted: true, threadId };
+    return { accepted: true, threadId, ...record(task.id, { role: "user", label: "Instruction", text: answerText || "Continue this task" }) };
   }
   await client.call("send_message_to_thread", { threadId, prompt }, ownerThreadId);
   if (existsSync(task.path)) {
@@ -135,7 +143,7 @@ async function desktopTaskAction({ taskId, action, text = "", expectedTurnId, re
       owner: current.metadata.interaction?.owner || { threadId, turnId: null } };
     writeTask(current);
   }
-  return { accepted: true, threadId };
+  return { accepted: true, threadId, ...record(task.id, { role: "user", label: "Instruction", text: answerText || "Continue this task" }) };
 }
 
 

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { atomicJson, cacheDir, readConfig, scan, sourceEntry, IGNORED, CONFIG_NAME } from './common.mjs';
+import { atomicJson, cacheDir, readConfig, scan, sourceEntry, IGNORED, CONFIG_NAME, isLinkedWorktree } from './common.mjs';
 import { indexedFiles, fingerprint, chunkDocument, commitDocuments, indexSummary } from './index.mjs';
 import { getEmbedder } from './embedding.mjs';
 
@@ -39,6 +39,7 @@ export class IndexQueue {
     for (const saved of state.projects) {
       try {
         if (!path.isAbsolute(saved.root) || !fs.existsSync(path.join(saved.root, CONFIG_NAME))) continue;
+        if (isLinkedWorktree(saved.root)) continue;
         const { root, config } = readConfig(saved.root);
         if (root !== saved.root) continue;
         this.addProject(root, config, (saved.owners || []).filter(owner => typeof owner === 'string' && !owner.startsWith('request:')));
@@ -64,6 +65,9 @@ export class IndexQueue {
 
   register(cwd, owner) {
     if (typeof owner !== 'string' || !owner || owner.length > 300) throw new Error('A stable registration owner is required');
+    // Enforce this in the daemon too: hooks from an older installed package may
+    // still be running. Explicit search/index requests retain their local scope.
+    if (!owner.startsWith('request:') && isLinkedWorktree(cwd)) return null;
     const { root, config } = readConfig(cwd);
     let project = this.projects.get(root);
     const fresh = !project;

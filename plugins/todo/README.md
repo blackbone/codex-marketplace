@@ -43,7 +43,7 @@ Classify each operation by its purpose and effects, not just its file path or th
 - Product code, project documentation, application dependencies, build, CI/CD, and deployment changes still require ToDo, even when performed through a plugin or described as "tooling setup". Developing a plugin as the repository's product is also a project change.
 - Split mixed requests: perform tool setup directly and route project changes through ToDo. Complete prerequisite setup before publishing dependent project tasks; a setup failure must not publish tasks that depend on it.
 - A user's request to configure a tool already authorizes that setup; do not ask for a separate routing confirmation. Preserve existing permission, access, authentication, and hook-trust requirements; never approve hook trust on the user's behalf.
-- Examples: semantic-search:init writing .semantic-search.json and indexing docs/ is direct; configuring another Codex plugin or MCP connection is direct; editing source code or docs/ through a plugin requires ToDo; changing a build pipeline or deployment under the label "tooling setup" requires ToDo; connecting a documentation search tool and then rewriting project documentation splits into direct setup and a ToDo documentation task.
+- Examples: docs:init writing .semantic-search.json and indexing docs/ is direct; configuring another Codex plugin or MCP connection is direct; editing source code or docs/ through a plugin requires ToDo; changing a build pipeline or deployment under the label "tooling setup" requires ToDo; connecting a documentation search tool and then rewriting project documentation splits into direct setup and a ToDo documentation task.
 
 The tooling exception does not expand a claimed worker's assigned task scope, repository access, permissions, or authority to create follow-up tasks. Perform tool setup only when required for the assigned task and already allowed by its restrictions; never use it to alter unrelated repositories, managed routing instructions, or .todo runtime state.
 <!-- TODO TOOLING EXCEPTION END -->
@@ -171,8 +171,14 @@ user-facing entry points; direct tool calls are agent internals.
 ## Human input and native app execution
 
 The dashboard's **Answer** / **Chat / input** control shows the outstanding
-question, accepts answers, sends instructions, and opens the associated Codex
-chat. **Logs** continues to show per-attempt execution evidence. `waiting-input`
+question in a chat popup with live agent messages and expandable tool output,
+including pipeline steps. Accepted instructions and answers persist in the local
+chat history. Polling preserves drafts, expanded tools, and scroll position; a
+changed question or turn requires reviewing the input before sending. **Logs**
+continues to show per-attempt execution evidence. The popup shows up to 300 recent
+messages from bounded local log tails (8 attempts, 16 stages per attempt, 2 MiB
+per read); older evidence remains on disk. Native app conversations still open
+separately through the conditional app adapter. `waiting-input`
 is a separate status; automatic retries do not consume unanswered questions.
 An app-server `item/tool/requestUserInput` request stays attached to its live
 turn. Dashboard replies must match its request and claim; steer must match the
@@ -518,6 +524,24 @@ two-space mappings and sequences, comments, plain or quoted scalars, JSON-style
 inline collections, and `|`/`>` block strings. YAML tags, anchors, aliases, and
 merge keys are rejected.
 
+After `task_run_finish(status: "completed")`, a ready checkpoint continues the
+accepted implementation without allocating a model retry. Continuation receipts
+live in `.todo/logs/<task>/continuation-<run-id>/` and link to the completed
+attempt; shell-only runs do not increase model attempt counts. The attempt ledger
+still rejects retries of completed implementations. A failed gate or delivery
+keeps its concrete error; a secondary ledger-recording failure is retained as
+`error.attemptLedgerError` without replacing the original error or stopping the daemon.
+
+To recover a queued task stranded by an older daemon at this checkpoint, install
+the updated plugin, open a new Codex task to load its MCP tools, and call
+`runner_start` with the repository's absolute `repoPath`. Use `runner_status` to
+verify the new runtime; if startup reports `restart-pending`, wait for the safe
+restart and call `runner_start` again. If the task has a recorded failure, resolve
+that error and call `task_retry` before starting the runner. Continuation retries
+preserve the checkpoint, model profile, worktree, and completed model attempts;
+all required shell and delivery checks still apply. Do not call `task_run_start`
+to repeat an already accepted implementation or edit `.todo` statuses manually.
+
 See [`examples/pipelines/quality.yaml`](examples/pipelines/quality.yaml) for a
 copyable build, test, coverage, and lint pipeline.
 
@@ -525,7 +549,7 @@ copyable build, test, coverage, and lint pipeline.
 
 The dashboard shows tasks separately from worker state, including the singleton
 merge worker, merge-queue and merge-conflict states, dependencies, model and
-delivery retries, timing, attempt-local token usage, coverage, errors, and links
+delivery retries, timing, cumulative task token usage, coverage, errors, and links
 to logs. It patches keyed rows and cells in place and appends log text,
 so polling does not rebuild unchanged completed tasks or disrupt text selection,
 scroll positions, filters, or controls. The default random port is sticky within
@@ -548,9 +572,19 @@ the dashboard marks partial totals with `*`. Raw model-request telemetry is held
 only long enough to reduce it to these numeric statistics and is never persisted.
 Existing `promptBytes`, usage schema v2, and the attempt ledger expose the actual
 cost and retry count of the full contour. ToDo does not claim token savings
-without a comparable measured baseline. `app-server` currently exposes
-turn-level usage rather than transport-request retry counts, so request-level
-telemetry is marked unavailable instead of being inferred.
+without a comparable measured baseline. App-server accounting uses differences
+between cumulative thread counters, with a saved baseline before each turn.
+Repeated notifications contribute zero; repair turns exclude earlier turns;
+failed and interrupted steps retain their measured usage. Task totals include
+all model attempts and repair steps, including retries. Counter resets or an
+unproven starting baseline reduce coverage to `partial`. Transport retry counts
+and usage not reported by Codex remain unavailable rather than being inferred.
+
+Historical app-server totals are recalculated from retained attempt/step logs
+when task status or the dashboard is read. This is a cached, read-only projection:
+original history, usage files, and ledger receipts remain unchanged as audit
+evidence. Missing logs reduce coverage; no token count is fabricated. New runs
+carry `tokenAccountingVersion: 2` in their metrics and do not need this recovery.
 
 Model attempts and Git delivery attempts are separate immutable ledger entries.
 Each records its UUID, ordinal, retry trigger and predecessor, classified status,

@@ -1,4 +1,5 @@
 import { readLogPreview } from "./bounded-log.mjs";
+import { readTaskChat } from "./task-chat.mjs";
 import { createServer } from "node:http";
 import {
   existsSync,
@@ -1258,6 +1259,7 @@ const DASHBOARD_SCRIPT = `(() => {
       const response = await fetch("/api/status", { cache: "no-store" });
       if (!response.ok) throw new Error("HTTP " + response.status);
       render(await response.json());
+      syncTaskInput();
     } catch {
       summary.classList.add("disconnected");
       if (!summary.textContent.includes(" · disconnected")) {
@@ -1271,55 +1273,156 @@ const DASHBOARD_SCRIPT = `(() => {
   const inputDialog = document.querySelector("#input-dialog");
   const inputFields = document.querySelector("#input-fields");
   const inputStatus = document.querySelector("#input-status");
+  const chatContent = document.querySelector("#chat-content");
+  const chatStatus = document.querySelector("#chat-status");
   let inputTask = null;
+  let inputBinding = null;
   let inputSending = false;
-  function openTaskInput(taskId) {
-    inputTask = latestPayload?.tasks.find(task => task.id === taskId);
-    if (!inputTask) return;
-    document.querySelector("#input-title").textContent = inputTask.title;
-    document.querySelector("#input-question").textContent = inputTask.interaction?.question || "Send an instruction or open this task in Codex.";
-    document.querySelector("#input-question").hidden = inputTask.status === "waiting-input" && Boolean(inputTask.interaction?.questions?.length);
+  let chatGeneration = 0;
+  let chatTimer = null;
+  let chatRequest = null;
+  function inputKey(task) {
+    return task.status === "waiting-input"
+      ? "reply:" + (task.interaction?.requestId || JSON.stringify(task.interaction?.questions || task.interaction?.question))
+      : task.status + ":" + (task.claim?.owner?.turnId || task.codexThread?.lastTurnId || "");
+  }
+  function bindInput(task) {
+    inputBinding = task;
     inputFields.replaceChildren();
-    const questions = (inputTask.status === "waiting-input" && inputTask.interaction?.questions) || [{ id: "prompt", question: "Your instruction" }];
+    const questions = (task.status === "waiting-input" && task.interaction?.questions?.length && task.interaction.questions) || [{ id: "prompt", question: "Your instruction" }];
     for (const question of questions) {
       const label = document.createElement("label");
       label.textContent = question.question;
       const field = document.createElement("textarea");
       field.dataset.questionId = question.id;
-      field.rows = 3;
+      field.rows = questions.length > 1 ? 2 : 3;
       field.maxLength = 8000;
       if (question.options?.length) field.placeholder = question.options.map(option => option.label).join(" / ");
       label.append(field);
       inputFields.append(label);
     }
-    inputStatus.textContent = "";
+  }
+  function syncTaskInput() {
+    if (!inputTask || !inputDialog.open) return;
+    const latest = latestPayload?.tasks.find(task => task.id === inputTask.id);
+    if (latest) inputTask = latest;
+    const changed = inputKey(inputTask) !== inputKey(inputBinding);
+    const hasDraft = [...inputFields.querySelectorAll("textarea")].some(field => field.value.trim());
+    if (changed && !hasDraft && !inputSending) bindInput(inputTask);
+    const stale = inputKey(inputTask) !== inputKey(inputBinding);
+    document.querySelector("#input-title").textContent = taskNumber(inputTask.id) + ": " + inputTask.title;
+    document.querySelector("#input-state").textContent = inputTask.status;
+    const question = document.querySelector("#input-question");
+    question.textContent = stale ? "The task moved on. Your draft is preserved; review the current question or turn before sending." : inputTask.status === "waiting-input" ? inputTask.interaction?.question || "Waiting for your answer" : "";
+    question.hidden = !question.textContent || !stale && inputTask.status === "waiting-input" && Boolean(inputTask.interaction?.questions?.length);
+    document.querySelector("#input-refresh").hidden = !stale;
     const send = document.querySelector("#input-send");
     send.textContent = inputTask.status === "waiting-input" ? "Send answer" : inputTask.status === "running" ? "Steer" : "Continue in Codex";
+    send.disabled = inputSending || stale || !latest;
+    document.querySelector("#input-open").disabled = inputSending;
+  }
+  function renderChat(payload) {
+    const follow = chatContent.scrollHeight - chatContent.scrollTop - chatContent.clientHeight < 80;
+    const existing = new Map([...chatContent.children].map(node => [node.dataset.messageId, node]));
+    const keep = new Set();
+    for (const message of payload.messages) {
+      keep.add(message.id);
+      let node = existing.get(message.id);
+      if (!node) {
+        node = document.createElement(message.role === "tool" ? "details" : "article");
+        node.className = "chat-message chat-" + (["user", "assistant", "tool"].includes(message.role) ? message.role : "system");
+        node.dataset.messageId = message.id;
+        node.append(document.createElement(message.role === "tool" ? "summary" : "header"), document.createElement("pre"));
+      }
+      const label = (message.role === "user" ? "You" : message.role === "assistant" ? "Agent" : "Tool") + (message.label ? " · " + message.label : "") + (message.status ? " · " + message.status : "");
+      if (node.firstChild.textContent !== label) node.firstChild.textContent = label;
+      if (node.lastChild.textContent !== message.text) node.lastChild.textContent = message.text;
+      node.title = message.source === "chat" ? "" : message.source;
+      // Reuse nodes so expanded tools and text selection survive polling.
+      const index = [...keep].length - 1;
+      if (chatContent.children[index] !== node) chatContent.insertBefore(node, chatContent.children[index] || null);
+    }
+    for (const [id, node] of existing) if (!keep.has(id)) node.remove();
+    if (!payload.messages.length) {
+      const empty = document.createElement("p");
+      empty.dataset.messageId = "empty";
+      empty.textContent = "No local execution messages yet. Codex app conversations are opened separately.";
+      chatContent.append(empty);
+    }
+    chatStatus.textContent = payload.truncated ? "Live · recent messages; full history in Logs" : "Live · 1s";
+    if (follow) chatContent.scrollTop = chatContent.scrollHeight;
+  }
+  async function pollChat(generation) {
+    if (!inputDialog.open || generation !== chatGeneration) return;
+    chatRequest = new AbortController();
+    try {
+      const response = await fetch("/api/chat?task=" + encodeURIComponent(inputTask.id), { cache: "no-store", signal: chatRequest.signal });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const payload = await response.json();
+      if (inputDialog.open && generation === chatGeneration) renderChat(payload);
+    } catch (error) {
+      if (error.name !== "AbortError" && generation === chatGeneration) chatStatus.textContent = "Disconnected · retrying";
+    } finally {
+      if (inputDialog.open && generation === chatGeneration) chatTimer = setTimeout(() => pollChat(generation), 1000);
+    }
+  }
+  function openTaskInput(taskId) {
+    inputTask = latestPayload?.tasks.find(task => task.id === taskId);
+    if (!inputTask) return;
+    bindInput(inputTask);
+    inputStatus.textContent = "";
+    chatContent.replaceChildren();
+    chatStatus.textContent = "Loading…";
     inputDialog.showModal();
+    syncTaskInput();
+    clearTimeout(chatTimer);
+    chatRequest?.abort();
+    pollChat(++chatGeneration);
   }
   async function sendTaskAction(action) {
-    if (!inputTask || inputSending) return;
+    if (!inputBinding || inputSending) return;
+    const task = inputBinding;
+    const generation = chatGeneration;
     inputSending = true;
-    const buttons = [...inputDialog.querySelectorAll("#input-send, #input-open")];
-    buttons.forEach(button => { button.disabled = true; });
-    const answers = Object.fromEntries([...inputFields.querySelectorAll("textarea")].map(field => [field.dataset.questionId, field.value]));
+    syncTaskInput();
+    const fields = [...inputFields.querySelectorAll("textarea")];
+    const answers = Object.fromEntries(fields.map(field => [field.dataset.questionId, field.value]));
     inputStatus.textContent = "Sending…";
     try {
       const response = await fetch("/api/task-action", {
         method: "POST", headers: { "Content-Type": "application/json", "X-ToDo-Action": "1" },
-        body: JSON.stringify({ taskId: inputTask.id, action, text: answers.prompt || "",
-          answers, requestId: inputTask.interaction?.requestId,
-          expectedTurnId: inputTask.claim?.owner?.turnId || inputTask.codexThread?.lastTurnId }),
+        body: JSON.stringify({ taskId: task.id, action, text: answers.prompt || "", answers,
+          requestId: task.interaction?.requestId,
+          expectedTurnId: task.claim?.owner?.turnId || task.codexThread?.lastTurnId }),
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Action failed");
-      inputStatus.textContent = result.opened ? "Opened in Codex" : "Accepted";
-    } catch (error) { inputStatus.textContent = error.message; }
-    finally { inputSending = false; buttons.forEach(button => { button.disabled = false; }); }
+      if (generation !== chatGeneration) return;
+      inputStatus.textContent = result.warning || (result.opened ? "Opened in Codex" : "Accepted");
+      if (result.accepted) for (const field of fields) {
+        if (field.value === answers[field.dataset.questionId]) field.value = "";
+      }
+      const status = await fetch("/api/status", { cache: "no-store" });
+      if (status.ok && generation === chatGeneration) render(await status.json());
+    } catch (error) { if (generation === chatGeneration) inputStatus.textContent = error.message; }
+    finally { inputSending = false; syncTaskInput(); }
   }
+  inputDialog.addEventListener("close", () => {
+    ++chatGeneration;
+    clearTimeout(chatTimer);
+    chatRequest?.abort();
+  });
+  document.querySelector("#input-refresh").addEventListener("click", () => {
+    // Keep the old draft visible for copying; never map an answer to a new question silently.
+    const draft = [...inputFields.querySelectorAll("textarea")].map(field => field.value).filter(Boolean).join("\\n\\n");
+    bindInput(inputTask);
+    inputStatus.textContent = draft ? "Previous draft:\\n" + draft : "";
+    syncTaskInput();
+  });
+  document.querySelector("#input-logs").addEventListener("click", () => openLogs(inputTask.id));
   document.querySelector("#input-open").addEventListener("click", () => sendTaskAction("open"));
   document.querySelector("#input-send").addEventListener("click", () => sendTaskAction(
-    inputTask?.status === "waiting-input" ? "reply" : inputTask?.status === "running" ? "steer" : "native"));
+    inputBinding?.status === "waiting-input" ? "reply" : inputBinding?.status === "running" ? "steer" : "native"));
   document.addEventListener("click", (event) => {
     const control = event.target.closest("button[data-control-task]");
     if (control) { openTaskInput(control.dataset.controlTask); return; }
@@ -1684,14 +1787,26 @@ function renderDashboard(repoRoot, requestUrl) {
     .filter-token { padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
     .status-running { color: #d97706; }
     .status-waiting-input { color: #d97706; }
-    #input-dialog { box-sizing: border-box; width: min(640px, calc(100vw - 32px)); height: fit-content; max-height: calc(100vh - 32px); padding: 18px; border-radius: 6px; }
-    #input-dialog h2 { margin: 0 0 18px; font-size: 18px; }
+    #input-dialog { box-sizing: border-box; width: min(920px, calc(100vw - 24px)); height: min(900px, calc(100dvh - 24px)); padding: 18px; border-radius: 8px; }
+    #input-dialog[open] { display: flex; flex-direction: column; gap: 12px; }
+    .chat-header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    #input-dialog h2 { margin: 0; font-size: 18px; flex: 1; }
+    #chat-status { font-size: 12px; opacity: .7; }
+    #input-state { font-size: 12px; padding: 4px 8px; background: #8882; border-radius: 12px; }
+    #chat-content { flex: 1; min-height: 100px; overflow: auto; padding: 12px; border: 1px solid #8884; border-radius: 6px; overflow-wrap: anywhere; }
+    .chat-message { margin: 0 0 12px; padding: 10px 12px; border-radius: 8px; background: #8881; }
+    .chat-user { margin-left: 12%; background: #3b82f619; }
+    .chat-message header, .chat-message summary { font-size: 12px; opacity: .75; overflow-wrap: anywhere; }
+    .chat-message summary { cursor: pointer; }
+    .chat-message pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; margin: 8px 0 0; }
+    .chat-tool pre { font: 12px ui-monospace, monospace; max-height: 220px; overflow: auto; }
     #input-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     #input-actions button { padding: 6px 10px; }
     #input-actions form { margin-left: auto; }
-    #input-fields label { display: block; margin-bottom: 12px; }
-    #input-fields textarea { box-sizing: border-box; display: block; width: 100%; margin-top: 6px; font: inherit; }
-    #input-status { white-space: pre-wrap; overflow-wrap: anywhere; }
+    #input-fields { max-height: 28vh; overflow: auto; flex-shrink: 0; }
+    #input-fields label { display: block; margin-bottom: 6px; }
+    #input-fields textarea { box-sizing: border-box; display: block; width: 100%; margin-top: 6px; font: inherit; resize: vertical; }
+    #input-status, #input-question { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; max-height: 90px; overflow: auto; flex-shrink: 0; }
     .status-merge-queued { color: #0284c7; }
     .status-merge-conflict { color: #ea580c; }
     .status-completed { color: #16a34a; }
@@ -1758,11 +1873,14 @@ function renderDashboard(repoRoot, requestUrl) {
     <tbody>${rows || '<tr data-empty-state><td colspan="15">No tasks</td></tr>'}</tbody>
   </table></div>
   <dialog id="input-dialog" aria-labelledby="input-title">
-    <h2 id="input-title">Task input</h2>
+    <div class="chat-header"><h2 id="input-title">Task chat</h2><span id="input-state"></span><span id="chat-status" role="status"></span></div>
+    <div id="chat-content" tabindex="0" aria-label="Execution messages"></div>
     <p id="input-question"></p>
     <div id="input-fields"></div>
     <p id="input-status" role="status"></p>
     <div id="input-actions">
+      <button type="button" id="input-refresh" hidden>Review current input</button>
+      <button type="button" id="input-logs">Logs</button>
       <button type="button" id="input-open">Open chat in Codex</button>
       <button type="button" id="input-send">Send</button>
       <form method="dialog"><button type="submit">Close</button></form>
@@ -1862,6 +1980,17 @@ function createDashboardServer(repoRoot, port, onTaskAction) {
         return;
       }
       const requestUrl = new URL(request.url || "/", "http://localhost");
+      if (requestUrl.pathname === "/api/chat") {
+        try {
+          const chat = readTaskChat(repoRoot, requestUrl.searchParams.get("task") || "");
+          response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+          response.end(JSON.stringify(chat));
+        } catch (error) {
+          response.writeHead(400, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          response.end(JSON.stringify({ error: error.message }));
+        }
+        return;
+      }
       if (requestUrl.pathname === "/api/logs") {
         const selectedTask = requestUrl.searchParams.get("task");
         let logs;

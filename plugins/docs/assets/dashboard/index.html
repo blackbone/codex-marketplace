@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Docs — Индексация</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><div><span class="eyebrow">DOCS</span><h1>Индексация</h1></div><span id="connection" role="status">Подключение…</span></header>
+    <p class="intro">Документы, которые готовятся к поиску.</p>
+    <div id="error" role="alert" hidden></div>
+    <section class="metrics" aria-label="Общая статистика">
+      <div><span>Проекты</span><strong id="projects-count">—</strong></div>
+      <div><span>Файлов в индексе</span><strong id="indexed-count">—</strong></div>
+      <div><span id="active-label">В обработке</span><strong id="active-count">—</strong></div>
+      <div><span>В очереди</span><strong id="pending-count">—</strong></div>
+    </section>
+    <section id="projects" aria-label="Проекты"></section>
+    <p id="empty" hidden>Пока нет проектов. Запусти $docs:init в папке с документацией или открой $docs:status в уже настроенном проекте.</p>
+    <footer><span id="updated">Ожидаем данные</span><span>Обновляется каждые 2 секунды</span></footer>
+    <p class="note">Счётчики показывают сохранённый индекс и очередь. Пустая очередь сама по себе не подтверждает актуальность всех документов. Страница не запускает индексацию.</p>
+  </main>
+</body>
+</html>

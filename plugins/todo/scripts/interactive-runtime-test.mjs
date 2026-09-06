@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,7 @@ import { DesktopClient, executionOwner } from "./desktop-client.mjs";
 import { AppServerClient } from "./app-server-client.mjs";
 import { runPipeline } from "./pipeline.mjs";
 import { startDashboard } from "./dashboard.mjs";
+import { appendTaskChat, parseChatEvents, readTaskChat } from "./task-chat.mjs";
 
 const scripts = path.dirname(fileURLToPath(import.meta.url));
 function fixture(t) {
@@ -91,6 +92,7 @@ test("a live input answer is fenced by request and claim; steering is fenced by 
   await assert.rejects(control.action({ taskId: task.id, action: "steer", expectedTurnId: "old", text: "Change" }), /active turn changed/);
   await control.action({ taskId: task.id, action: "steer", expectedTurnId: "turn", text: "Change" });
   assert.deepEqual(steers, [["worker", "turn", "Change"]]);
+  assert.deepEqual(readTaskChat(root, task.id).messages.filter(m => m.role === "user").map(m => m.text), ["Which color?\nBlue", "Change"]);
   const abandoned = control.onServerRequest({ method: "item/tool/requestUserInput", params: {
     threadId: "worker", turnId: "turn", questions: [{ id: "confirm", question: "Proceed?" }],
   } });
@@ -177,6 +179,45 @@ test("dashboard accepts actions only from its own origin and rejects oversized i
   const html = await (await fetch(url)).text();
   assert(html.includes('id="input-dialog"'));
   assert(html.includes('data-control-task="' + task.id + '"'));
+  appendTaskChat(root, task.id, { role: "user", text: "Saved answer" });
+  assert.equal((await (await fetch(url + "/api/chat?task=" + task.id)).json()).messages[0].text, "Saved answer");
+  assert.equal((await fetch(url + "/api/chat?task=../../outside")).status, 400);
+});
+
+test("chat combines streaming deltas with completed items without duplication or reasoning", () => {
+  const events = [
+    { method: "item/agentMessage/delta", params: { itemId: "m", delta: "Hello" } },
+    { method: "item/agentMessage/delta", params: { itemId: "m", delta: " world" } },
+    { method: "item/completed", params: { item: { id: "m", type: "agentMessage", text: "Hello world!" } } },
+    { type: "item.completed", item: { id: "c", type: "command_execution", command: "build", aggregated_output: "Passed", status: "completed" } },
+    { method: "item/completed", params: { item: { id: "r", type: "reasoning", text: "Internal" } } },
+  ];
+  const messages = parseChatEvents('partial record\n' + events.map(e => JSON.stringify(e)).join("\n") + '\n{"incomplete":', "stage", 10);
+  assert.equal(messages.length, 2);
+  assert.equal(messages[0].text, "Hello world!");
+  assert.equal(messages[1].text, "Passed");
+  assert.equal(messages[1].role, "tool");
+});
+
+test("chat reads pipeline stages with a bounded tail and rejects linked log paths", t => {
+  const root = fixture(t);
+  const task = createTask(root, { title: "Pipeline chat", description: "Review" });
+  const logs = path.join(root, ".todo", "logs", task.id);
+  const stage = path.join(logs, "attempt-1", "pipeline", "001-review-run");
+  mkdirSync(stage, { recursive: true });
+  const line = JSON.stringify({ method: "item/completed", params: { item: { id: "last", type: "agentMessage", text: "Reviewed" } } });
+  writeFileSync(path.join(stage, "stdout.log"), "x".repeat(300000) + "\n" + line + "\n");
+  const outside = path.join(root, "private.log");
+  writeFileSync(outside, "PRIVATE");
+  symlinkSync(outside, path.join(stage, "stderr.log"));
+  symlinkSync(root, path.join(logs, "attempt-linked"));
+  const chat = readTaskChat(root, task.id);
+  assert.equal(chat.truncated, true);
+  assert.deepEqual(chat.messages.map(m => m.text), ["Reviewed"]);
+  assert(!JSON.stringify(chat).includes("PRIVATE"));
+  symlinkSync(outside, path.join(logs, "chat.jsonl"));
+  assert.throws(() => appendTaskChat(root, task.id, { role: "user", text: "No" }), /Invalid task chat file/);
+  assert.equal(readFileSync(outside, "utf8"), "PRIVATE");
 });
 
 test("desktop adapter speaks standard MCP and passes executor ownership", async t => {

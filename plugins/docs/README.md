@@ -1,11 +1,13 @@
-# Semantic Search
+# Docs
 
 A local Codex plugin that makes project documentation available to the agent through skills, MCP tools and context hooks.
 
 ![Documentation setup example](assets/screenshots/setup.png)
 ![Multilingual search example](assets/screenshots/search.png)
+![Live indexing status](assets/screenshots/status.png)
+![Live indexing status in dark mode](assets/screenshots/status-dark.png)
 
-These documentation screenshots display recorded tool output from an example project; they do not depict a separate product interface.
+Setup and search previews show recorded tool output. The status screenshot shows the actual local dashboard with a test project.
 
 ## Use
 
@@ -13,10 +15,10 @@ Install from this marketplace checkout:
 
 ```sh
 codex plugin marketplace add .
-codex plugin add semantic-search@blackbone
+codex plugin add docs@blackbone
 ```
 
-Install the plugin in Codex, start a new task in a project and invoke `$semantic-search:init`. The skill briefly inspects the current folder, asks which directories contain documentation, and writes `.semantic-search.json` in that exact folder. It does not require Git.
+Install the plugin in Codex, start a new task in a project and invoke `$docs:init`. The skill briefly inspects the current folder, asks which directories contain documentation, and writes `.semantic-search.json` in that exact folder. It does not require Git.
 
 ```json
 {
@@ -28,6 +30,18 @@ Install the plugin in Codex, start a new task in a project and invoke `$semantic
 ```
 
 Folders and exclude prefixes are relative to that file. Nested initialized folders take precedence. Existing configuration is never overwritten by init. Hidden files, common build/dependency directories and symlinks are skipped. Unsupported file types are reported; PDF/Office conversion is not included. UTF-8 documents are indexed in full, up to 4 MiB per file, with token-bounded chunks and source line ranges.
+
+Search with `$docs:find "some thing"`. The CLI also accepts `find`; `search` remains a compatibility alias.
+
+The plugin was renamed from Semantic Search to Docs. Existing `.semantic-search.json`, `.semantic-search/` indexes and the `SEMANTIC_SEARCH_TMP_ROOT` setting remain compatible; no project migration is needed.
+
+## Live status
+
+Use `$docs:status` to open a small local page in Codex. The page follows the system light or dark appearance automatically. It refreshes every two seconds and shows registered projects (plus the current configured project), documentation folders, saved file/fragment counts, active file paths and the waiting queue. Lists display up to 100 paths per project while counters include the full queue.
+
+The dashboard reads the shared queue journal and opens existing indexes read-only. It does not start or restart the indexing daemon, register watchers, scan document contents, download models, or trigger indexing. Counts describe the saved index, not a percentage of current source coverage. When the indexing service is offline, persisted work is labeled as interrupted/recovery state. Read and connection errors are shown explicitly.
+
+Its separate server binds only to `127.0.0.1`, uses a private unguessable URL, accepts only read requests and rejects foreign browser origins/Host headers. No external assets or document contents are served. Keep the local URL private; anyone with it on the same computer can view project and file names. The server exits after two minutes without page requests; reopening the skill returns a fresh working URL. Its metadata/logs live in the shared temporary cache.
 
 ## Indexing lifecycle
 
@@ -56,12 +70,15 @@ Search combines multilingual embeddings and SQLite FTS5 keyword ranking. Vector 
 
 Plugin hooks on `SessionStart` (including resume/compact), `UserPromptSubmit`, and `SubagentStart` inject a short requirement to search and read relevant documentation. They register the session with the shared daemon, which schedules initial checking/indexing in the background. `SessionEnd` unregisters that session across its projects. Hook registration does not wait for embeddings or model downloads. Codex requires the user to review/trust plugin hooks before running them. This is an instruction to the agent, not a hard enforcement gate.
 
-MCP tools: `repo_inspect`, `repo_init`, `docs_search`, `docs_read`, `docs_index`, `docs_status`. Every tool takes the current absolute `cwd`. Calls can also be made with the bundled CLI:
+Hooks skip linked Git worktrees and ToDo background workers (`TODO_RUNNER_WORKER=1`), without injecting a search instruction or starting the daemon. A copied configuration does not automatically register a worktree as another project. The daemon also rejects worktree session registrations from older hooks and drops saved worktree registrations and their queued work on restart; existing index files are preserved. Explicit search/index calls in a worktree still use its own configured documentation and release their temporary registration when done. Main checkouts and folders without Git keep automatic registration.
+
+MCP tools: `repo_inspect`, `repo_init`, `docs_search`, `docs_read`, `docs_index`, `docs_status`, `docs_dashboard`. Every tool takes the current absolute `cwd`. Calls can also be made with the bundled CLI:
 
 ```sh
-node /path/to/semantic-search/scripts/cli.mjs inspect
-node /path/to/semantic-search/scripts/cli.mjs init docs design
-node /path/to/semantic-search/scripts/cli.mjs search 'How are sessions revoked?'
+node /path/to/docs/scripts/cli.mjs inspect
+node /path/to/docs/scripts/cli.mjs init docs design
+node /path/to/docs/scripts/cli.mjs find 'How are sessions revoked?'
+node /path/to/docs/scripts/cli.mjs dashboard
 ```
 
 The CLI always uses its working directory. `SEMANTIC_SEARCH_TMP_ROOT` can override the cache root for isolated tests. Package and model dependencies are pinned; model metadata/license: https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2 . Transformers.js: https://huggingface.co/docs/transformers.js/v3.8.1/en/index .

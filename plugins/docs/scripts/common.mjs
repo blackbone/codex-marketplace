@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 
 export const CONFIG_NAME = '.semantic-search.json';
 export const ENGINE = 'v1';
@@ -83,9 +84,20 @@ export function currentRoot(cwd = process.cwd()) {
   while (true) {
     if (fs.existsSync(path.join(dir, CONFIG_NAME))) return dir;
     const parent = path.dirname(dir);
-    if (parent === dir) throw new Error(`No ${CONFIG_NAME} found. Run $semantic-search:init in the project folder first.`);
+    if (parent === dir) throw new Error(`No ${CONFIG_NAME} found. Run $docs:init in the project folder first.`);
     dir = parent;
   }
+}
+
+export function isLinkedWorktree(cwd) {
+  // Git metadata distinguishes linked worktrees from the main checkout and
+  // submodules, including when called from a nested documentation directory.
+  const git = spawnSync('git', ['-C', cwd, 'rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'], {
+    encoding: 'utf8', timeout: 5000, windowsHide: true,
+  });
+  if (git.status !== 0) return false; // Documentation folders need not use Git.
+  const [gitDir, commonDir] = git.stdout.trim().split('\n');
+  return Boolean(gitDir && commonDir && fs.realpathSync(gitDir) !== fs.realpathSync(commonDir));
 }
 
 export function readConfig(cwd) {
