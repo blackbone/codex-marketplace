@@ -1,0 +1,30 @@
+{
+  "name": "semantic-search",
+  "version": "0.1.0+codex.20260904232151",
+  "description": "Local semantic documentation search with a shared watcher daemon, batched indexing and project-local SQLite indexes.",
+  "author": {
+    "name": "blackbone"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Semantic Search",
+    "shortDescription": "Search current local project documentation",
+    "longDescription": "Initialize documentation folders in each project. Session hooks register watchers with one shared daemon. A recoverable queue batches multilingual embeddings across projects; SQLite indexes stay in each project, while the model and queue journal live in system tmp.",
+    "developerName": "blackbone",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use $semantic-search:init in this folder.",
+      "Use $semantic-search:search to find relevant project documentation."
+    ],
+    "screenshots": [
+      "./assets/screenshots/setup.png",
+      "./assets/screenshots/search.png"
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

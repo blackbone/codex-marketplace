@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "semantic-search": {
+      "command": "sh",
+      "args": ["-c", "exec node \"$PLUGIN_ROOT/scripts/mcp-server.mjs\""],
+      "cwd": ".",
+      "env": { "PLUGIN_ROOT": "." },
+      "tool_timeout_sec": 900
+    }
+  }
+}
