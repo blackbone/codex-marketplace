@@ -172,7 +172,7 @@ test("omitted models remain inherited and old task models resolve through the sa
     assert.equal(current.modelProfile, "expert");
     assert.equal(current.model, "gpt-6-astra");
     assert.equal(current.reasoningEffort, "xhigh");
-    assert.equal(current.backend, "exec");
+    assert.equal(current.backend, "app-server");
     assert.equal(current.ephemeral, true);
     assert.equal(previous.model, "obsolete-model");
     const oldPipeline = { steps: [

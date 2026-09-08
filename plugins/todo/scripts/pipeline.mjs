@@ -530,12 +530,12 @@ export async function runPipeline(pipeline, handlers, continuation = null) {
   let repairRound = continuation?.repairRound || 0;
   let index = continuation ? continuation.nextIndex ?? 0 : 0;
   if (continuation) {
-    if (!continuation.ready || continuation.result?.status !== "completed" ||
+    if ((!continuation.resume && (!continuation.ready || continuation.result?.status !== "completed")) ||
         (continuation.digest && continuation.digest !== pipeline.digest) ||
         !Number.isInteger(index) || index < 0 || index > pipeline.steps.length) {
       throw new Error("Invalid interactive pipeline continuation");
     }
-    executions.push({ stepId: continuation.stage?.id || "interactive", type: "interactive",
+    if (!continuation.resume) executions.push({ stepId: continuation.stage?.id || "interactive", type: "interactive",
       repairRound, ...continuation.result });
   }
   const publish = async (status, currentStep = null) => {
@@ -547,6 +547,24 @@ export async function runPipeline(pipeline, handlers, continuation = null) {
     });
   };
   await publish("running");
+  if (continuation?.resume) {
+    // A user answer is input to the paused stage, never proof that it passed.
+    const repair = Boolean(continuation.failure);
+    const stage = repair ? pipeline.repair : pipeline.steps[index - 1];
+    if (!stage || stage.id !== continuation.stage?.id || stage.type !== continuation.stage?.type ||
+        (repair && index !== shellStart)) throw new Error("Invalid paused pipeline stage");
+    const result = stage.type === "shell"
+      ? await handlers.runShell(stage, { repairRound, executions: [...executions] })
+      : await handlers.runCodex(stage, { mode: repair ? "repair" : "step",
+          failure: continuation.failure, repairRound, executions: [...executions] });
+    executions.push({ stepId: stage.id, type: stage.type, repairRound, ...(repair ? { repair: true } : {}), ...result });
+    await publish(result.status === "completed" ? "running" : "step-failed", stage.id);
+    if (result.status !== "completed") return {
+      status: "failed", failedStep: stage, failure: result, repairRound, executions,
+      continuation: result.requiresInteractive ? { digest: pipeline.digest, stage, nextIndex: index,
+        repairRound, executions: executions.slice(0, -1), ...(repair ? { failure: continuation.failure } : {}) } : null,
+    };
+  }
   while (index < pipeline.steps.length) {
     const step = pipeline.steps[index];
     const result =

@@ -31,7 +31,7 @@ Install the plugin in Codex, start a new task in a project and invoke `$docs:ini
 
 Folders and exclude prefixes are relative to that file. Nested initialized folders take precedence. Existing configuration is never overwritten by init. Hidden files, common build/dependency directories and symlinks are skipped. Unsupported file types are reported; PDF/Office conversion is not included. UTF-8 documents are indexed in full, up to 4 MiB per file, with token-bounded chunks and source line ranges.
 
-Search with `$docs:find "some thing"`. The CLI also accepts `find`; `search` remains a compatibility alias.
+Search with `$docs:find "some thing"` to get relevant documentation fragments with paths and line ranges. The skill optionally reads matching ranges and briefly reports empty results or unavailable search. Further reading and context gathering are up to the agent's main task. The CLI also accepts `find`; `search` remains a compatibility alias.
 
 The plugin was renamed from Semantic Search to Docs. Existing `.semantic-search.json`, `.semantic-search/` indexes and the `SEMANTIC_SEARCH_TMP_ROOT` setting remain compatible; no project migration is needed.
 
@@ -68,7 +68,7 @@ Search combines multilingual embeddings and SQLite FTS5 keyword ranking. Vector 
 
 ## Agent integration
 
-Plugin hooks on `SessionStart` (including resume/compact), `UserPromptSubmit`, and `SubagentStart` inject a short requirement to search and read relevant documentation. They register the session with the shared daemon, which schedules initial checking/indexing in the background. `SessionEnd` unregisters that session across its projects. Hook registration does not wait for embeddings or model downloads. Codex requires the user to review/trust plugin hooks before running them. This is an instruction to the agent, not a hard enforcement gate.
+Plugin hooks on `SessionStart` (including resume/compact), `UserPromptSubmit`, and `SubagentStart` inject a short description of topic search and fragment retrieval. They register the session with the shared daemon, which schedules initial checking/indexing in the background. `SessionEnd` unregisters that session across its projects. Hook registration does not wait for embeddings or model downloads. Codex requires the user to review/trust plugin hooks before running them.
 
 Hooks skip linked Git worktrees and ToDo background workers (`TODO_RUNNER_WORKER=1`), without injecting a search instruction or starting the daemon. A copied configuration does not automatically register a worktree as another project. The daemon also rejects worktree session registrations from older hooks and drops saved worktree registrations and their queued work on restart; existing index files are preserved. Explicit search/index calls in a worktree still use its own configured documentation and release their temporary registration when done. Main checkouts and folders without Git keep automatic registration.
 

@@ -656,55 +656,24 @@ if (args.includes("--version")) {
   process.stdout.write("fake-codex 1.0\\n");
   process.exit(0);
 }
-if (args[0] === "app-server") {
-  for await (const line of createInterface({ input: process.stdin })) {
-    const message = JSON.parse(line);
-    if (message.id) process.stdout.write(JSON.stringify({ id: message.id, result: message.method === "model/list" ? fakeModelList() : {} }) + "\\n");
-  }
-  process.exit(0);
-}
-const outputIndex = args.indexOf("--output-last-message");
-let input = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => { input += chunk; });
-process.stdin.on("end", async () => {
-  appendFileSync(${JSON.stringify(invocationLog)}, JSON.stringify({ args, input }) + "\\n");
-	  const telemetryConfig = args.find((arg) => arg.startsWith("otel.exporter="));
-	  const telemetryEndpoint = telemetryConfig?.match(/endpoint="([^"]+)"/)?.[1];
-	  if (telemetryEndpoint) {
-	    await fetch(telemetryEndpoint, {
-	      method: "POST",
-	      headers: { "content-type": "application/json" },
-	      body: JSON.stringify({
-	        resourceLogs: [{
-	          resource: { attributes: [{ key: "user.email", value: { stringValue: "RAW_OTLP_SHOULD_NOT_PERSIST" } }] },
-	          scopeLogs: [{ logRecords: [
-	            { attributes: [
-	              { key: "event.name", value: { stringValue: "codex.api_request" } },
-	              { key: "attempt", value: { intValue: "0" } }
-	            ] },
-	            { body: { stringValue: "RAW_OTLP_SHOULD_NOT_PERSIST" }, attributes: [
-	              { key: "event.name", value: { stringValue: "codex.sse_event" } },
-	              { key: "event.kind", value: { stringValue: "response.completed" } },
-	              { key: "input_token_count", value: { intValue: "101" } },
-	              { key: "cached_token_count", value: { intValue: "40" } },
-	              { key: "cache_write_token_count", value: { intValue: "0" } },
-	              { key: "output_token_count", value: { intValue: "17" } },
-	              { key: "reasoning_token_count", value: { intValue: "3" } },
-	              { key: "ttft_ms", value: { intValue: "25" } }
-	            ] }
-	          ] }]
-	        }]
-	      })
-	    });
-	  }
+if (args[0] !== "app-server") process.exit(64);
+const send = m => process.stdout.write(JSON.stringify(m) + "\\n");
+const contexts = new Map(); const totals = new Map(); let nextThread = 0; let nextTurn = 0;
+function run(message) {
+  const params = message.params; const threadId = params.threadId;
+  const turnId = "smoke-turn-" + (++nextTurn); const cwd = params.cwd;
+  const current = params.input.map(i => i.text || "").join("\\n");
+  const input = (contexts.get(threadId) || "") + current;
+  if (!contexts.has(threadId)) contexts.set(threadId, current + "\\n");
+  appendFileSync(${JSON.stringify(invocationLog)}, JSON.stringify({ params, input }) + "\\n");
+  send({ id: message.id, result: { turn: { id: turnId, status: "inProgress", items: [] } } });
 	  const retryFixture = input.includes("Retry this task after first failure.");
 	  const interactiveRequiredFixture = input.includes(
 	    "This task requires a current-thread browser capability.",
 	  );
 	  const mergeOrderSlowFixture = input.includes("MERGE_QUEUE_ORDER_SLOW_FIXTURE");
 	  const mergeOrderFastFixture = input.includes("MERGE_QUEUE_ORDER_FAST_FIXTURE");
-	  const mergeConflictExecFixture = input.includes("MERGE_CONFLICT_EXEC_FIXTURE");
+	  const mergeConflictExecFixture = input.includes("MERGE_CONFLICT_EXEC_FIXTURE") && !current.includes("merge-conflict repair attempt");
 	  const mergeConflictRepair = input.includes("merge-conflict repair attempt");
   const retryAttempt = retryFixture
     ? readFileSync(${JSON.stringify(invocationLog)}, "utf8")
@@ -716,42 +685,26 @@ process.stdin.on("end", async () => {
         .length
     : 0;
 	  if (mergeOrderSlowFixture) {
-	    writeFileSync(process.env.TODO_RUNNER_WORKTREE + "/merge-order-slow.txt", "slow\\n");
+	    writeFileSync(cwd + "/merge-order-slow.txt", "slow\\n");
 	  }
 	  if (mergeOrderFastFixture) {
-	    writeFileSync(process.env.TODO_RUNNER_WORKTREE + "/merge-order-fast.txt", "fast\\n");
+	    writeFileSync(cwd + "/merge-order-fast.txt", "fast\\n");
 	  }
 	  if (mergeConflictExecFixture) {
-	    writeFileSync(process.env.TODO_RUNNER_WORKTREE + "/merge-conflict-exec.txt", "task\\n");
+	    writeFileSync(cwd + "/merge-conflict-exec.txt", "task\\n");
 	    writeFileSync(process.env.TODO_RUNNER_REPO_ROOT + "/merge-conflict-exec.txt", "main\\n");
 	    spawnSync("git", ["-C", process.env.TODO_RUNNER_REPO_ROOT, "add", "merge-conflict-exec.txt"]);
 	    spawnSync("git", ["-C", process.env.TODO_RUNNER_REPO_ROOT, "commit", "--quiet", "-m", "advance exec merge target"]);
 	  }
 	  if (mergeConflictRepair && input.includes("merge-conflict-exec.txt")) {
-	    writeFileSync(process.env.TODO_RUNNER_WORKTREE + "/merge-conflict-exec.txt", "main and task\\n");
+	    writeFileSync(cwd + "/merge-conflict-exec.txt", "main and task\\n");
 	  }
 	  const shouldFail =
 	    (retryFixture && retryAttempt === 1) || interactiveRequiredFixture;
 	  const delayMs = mergeOrderSlowFixture ? 1800 : mergeOrderFastFixture ? 100 : 1200;
+
   setTimeout(() => {
-    process.stdout.write(JSON.stringify({
-      type: "item.completed",
-      item: {
-        id: "fake-agent-message",
-        type: "agent_message",
-        text: "fake agent execution message"
-      }
-    }) + "\\n");
-    process.stdout.write(JSON.stringify({
-      type: "turn.completed",
-      usage: {
-        input_tokens: 101,
-        cached_input_tokens: 40,
-        output_tokens: 17,
-        reasoning_output_tokens: 3
-      }
-    }) + "\\n");
-	    writeFileSync(args[outputIndex + 1], JSON.stringify({
+    const result = {
 	      status: shouldFail ? "failed" : "completed",
 	      summary: interactiveRequiredFixture
 	        ? "current-thread browser capability required"
@@ -768,10 +721,25 @@ process.stdin.on("end", async () => {
 	      interactiveReason: interactiveRequiredFixture
 	        ? "Browser access is required to finish the task"
 	        : null
-	    }));
-    process.exit(0);
+    };
+    send({method: "item/completed", params: {threadId, turnId, item: {id: turnId, type: "agentMessage", text: "fake agent execution message"}}});
+    send({method: "item/completed", params: {threadId, turnId, item: {id: turnId + "-final", type: "agentMessage", text: JSON.stringify(result)}}});
+    const usage = {inputTokens:101, cachedInputTokens:40, cacheWriteInputTokens:0, outputTokens:17, reasoningOutputTokens:3, totalTokens:118};
+    const previous = totals.get(threadId) || {};
+    const total = Object.fromEntries(Object.entries(usage).map(([key,value]) => [key,(previous[key] || 0) + value]));
+    totals.set(threadId,total);
+    send({method:"thread/tokenUsage/updated",params:{threadId,turnId,tokenUsage:{last:usage,total}}});
+    send({method:"turn/completed",params:{threadId,turn:{id:turnId,status:"completed",items:[]}}});
   }, delayMs);
-});
+}
+for await (const line of createInterface({ input: process.stdin })) {
+  const message=JSON.parse(line); if (message.id == null) continue;
+  if (message.method === "thread/start") send({id:message.id,result:{thread:{id:"smoke-thread-"+(++nextThread)}}});
+  else if (message.method === "thread/resume") send({id:message.id,result:{thread:{id:message.params.threadId}}});
+  else if (message.method === "turn/start") run(message);
+  else send({id:message.id,result:message.method === "model/list" ? fakeModelList() : {}});
+}
+
 `,
     "utf8",
   );
@@ -1207,43 +1175,14 @@ process.stdin.on("end", async () => {
     path.join(scriptDir, "..", "skills", "supervise", "SKILL.md"),
     "utf8",
   );
-  assert(
-    superviseSkillText.includes("supervisor_get") &&
-      superviseSkillText.includes('status: "ACTIVE"') &&
-      superviseSkillText.includes("PAUSED") &&
-      superviseSkillText.includes("task_run_start") &&
-      superviseSkillText.includes("exactly one bounded subagent"),
-    "supervise skill does not preserve the active/idle recovery contract",
-  );
-  const startSkillText = readFileSync(
-    path.join(scriptDir, "..", "skills", "start", "SKILL.md"),
-    "utf8",
-  );
-  assert(
-    startSkillText.includes("current invoking chat") &&
-      startSkillText.includes("$browser:control-in-app-browser") &&
-      startSkillText.includes("targetThreadId") &&
-      startSkillText.includes("dashboardThreadId") &&
-      startSkillText.includes("new in-app Browser tab") &&
-      startSkillText.includes("exact returned URL") &&
-      startSkillText.includes("Never guess a dashboard URL") &&
-      startSkillText.includes("delete that exact host automation") &&
-      startSkillText.includes("supervisor_clear") &&
-      startSkillText.includes("FREQ=MINUTELY;INTERVAL=15") &&
-      startSkillText.includes("destination `thread`") &&
-      startSkillText.includes("idle repository starts as `PAUSED`") &&
-      startSkillText.includes("supervisor_bind") &&
-      startSkillText.indexOf("supervisor_bind") <
-        startSkillText.indexOf("runner_start"),
-    "start skill does not rebind supervision to the invoking chat",
-  );
-  for (const skill of ["create", "reopen", "retry", "route", "stop", "supervise"]) {
-    assert(
-      readFileSync(path.join(scriptDir, "..", "skills", skill, "SKILL.md"), "utf8").includes(
-        "targetThreadId",
-      ),
-      `${skill} skill can retarget the configured supervisor`,
-    );
+  assert(superviseSkillText.includes("runner_status") && superviseSkillText.includes("task_retry"),
+    "supervise must inspect the runner without a host automation");
+  const startSkillText = readFileSync(path.join(scriptDir, "..", "skills", "start", "SKILL.md"), "utf8");
+  assert(startSkillText.includes("runner_start") && startSkillText.includes("dashboardUrl"),
+    "start must return the runner dashboard URL");
+  for (const skill of ["start", "create", "reopen", "retry", "route", "stop", "supervise"]) {
+    const text = readFileSync(path.join(scriptDir, "..", "skills", skill, "SKILL.md"), "utf8");
+    assert(!/supervisor_bind|automation_update|FREQ=MINUTELY/.test(text), `${skill} must not manage host automations`);
   }
   const runSkillDir = path.join(scriptDir, "..", "skills", "run");
   const runSkillText = readFileSync(path.join(runSkillDir, "SKILL.md"), "utf8");
@@ -1773,24 +1712,10 @@ process.stdin.on("end", async () => {
       ),
     "daemon did not respect background, fallback, and explicit interactive modes",
   );
-  assert(
-    fastInvocation &&
-      !fastInvocation.args.includes("--ephemeral") &&
-      fastInvocation.args.includes("--json") &&
-      fastInvocation.args[fastInvocation.args.indexOf("--model") + 1] ===
-        "gpt-test-fast" &&
-      fastInvocation.args.includes('model_reasoning_effort="low"'),
-    "daemon did not pass the selected fast profile",
-  );
-  assert(
-    persistentInvocation &&
-      !persistentInvocation.args.includes("--ephemeral") &&
-      persistentInvocation.args[
-        persistentInvocation.args.indexOf("--model") + 1
-      ] === "gpt-test-expert" &&
-      persistentInvocation.args.includes('model_reasoning_effort="high"'),
-    "daemon did not honor ephemeral=false and the expert profile",
-  );
+  assert(fastInvocation?.params.model === "gpt-test-fast" && fastInvocation.params.effort === "low",
+    "daemon did not pass the selected fast profile through app-server");
+  assert(persistentInvocation?.params.model === "gpt-test-expert" && persistentInvocation.params.effort === "high",
+    "daemon did not pass the expert profile through app-server");
   for (const task of [first, blocked, parallel]) {
     assert(
       getTaskStatus(repoRoot, task.id).status === "completed",
@@ -1872,10 +1797,8 @@ process.stdin.on("end", async () => {
       firstUsage.tokenUsage.outputTokens === 17 &&
       firstUsage.tokenUsage.reasoningOutputTokens === 3 &&
       firstUsage.tokenUsage.totalTokens === 118 &&
-      firstUsage.requestStats?.available === true &&
-      firstUsage.requestStats.coverage === "full" &&
-      firstUsage.requestStats.requests?.length === 1 &&
-      firstUsage.requestStats.requests[0].ttftMs === 25 &&
+      firstUsage.requestStats?.available === false &&
+      firstUsage.requestStats.reason === "app_server_protocol_has_no_transport_retry_counts" &&
       !JSON.stringify(firstUsage).includes("RAW_OTLP_SHOULD_NOT_PERSIST") &&
       firstUsage.promptFile === "prompt.txt" &&
       firstPrompt.includes("You are a ToDo worker") &&
@@ -1901,7 +1824,7 @@ process.stdin.on("end", async () => {
       runnerLog.includes('changed=["workers","modelProfiles","defaultModelProfile"]') &&
       runnerLog.includes("activeTasksPreserved=2") &&
       runnerLog.includes("event=config_reload_rejected"),
-    "task time and token usage were not logged at start and completion",
+    "task time and token usage were not logged at start and completion: " + JSON.stringify({firstUsage, runnerTail: runnerLog.slice(-2500), transcript: transcript.slice(0,300)}),
   );
   assert(
     firstReceipt.metrics?.startedAt === firstUsage.startedAt &&
@@ -2012,7 +1935,7 @@ process.stdin.on("end", async () => {
           usage.schemaVersion === 2 &&
           usage.attempt === index + 1 &&
           usage.tokenUsage.totalTokens === 118 &&
-          usage.requestStats.coverage === "full" &&
+          usage.requestStats.coverage === "none" &&
           usage.runs === undefined &&
           usage.lastRun === undefined,
       ) &&
@@ -2022,13 +1945,11 @@ process.stdin.on("end", async () => {
       retryUsageFiles[1].modelProfile === "expert" &&
       retriedReceipt.execution?.modelProfile === "expert" &&
       retryPrompts.length === 2 &&
-      retryPrompts.every(
-        (prompt) =>
-          prompt.includes(retryImplementationBrief) &&
-          prompt.indexOf(TODO_PONYTAIL_FULL_CONTOUR) ===
-            prompt.lastIndexOf(TODO_PONYTAIL_FULL_CONTOUR) &&
-          !prompt.includes('<!-- TODO {"version":'),
-      ) &&
+      retryPrompts[0].includes(retryImplementationBrief) &&
+      retryPrompts[0].indexOf(TODO_PONYTAIL_FULL_CONTOUR) === retryPrompts[0].lastIndexOf(TODO_PONYTAIL_FULL_CONTOUR) &&
+      retryPrompts[1].includes("Continue ToDo task") &&
+      !retryPrompts[1].includes(TODO_PONYTAIL_FULL_CONTOUR) &&
+      retryPrompts.every(prompt => !prompt.includes('<!-- TODO {"version":')) &&
       retriedReceipt.attemptLedger?.attempts?.length === 2 &&
       retriedReceipt.attemptLedger.attempts[0].trigger === "initial" &&
       retriedReceipt.attemptLedger.attempts[1].trigger ===

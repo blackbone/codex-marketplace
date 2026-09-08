@@ -13,7 +13,6 @@ import {
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import http from "node:http";
 import { fileURLToPath } from "node:url";
 import { readLogTail } from "./bounded-log.mjs";
 import { runShellCommand } from "./shell-step.mjs";
@@ -36,8 +35,6 @@ import {
   ensureLayout,
   getSupervisorStatus,
   getTaskStatus,
-  listTaskStatuses,
-  reconcileInteractiveClaim,
   formatTaskThreadTitle,
   isActivated,
   isCurrentDaemonState,
@@ -55,7 +52,6 @@ import {
   readDashboardThreadRequest,
   readTask,
   recoveredTaskMetrics,
-  readClaim,
   releaseClaim,
   resolveTaskExecution,
   resolveSavedExecution,
@@ -63,6 +59,7 @@ import {
   retryTask,
   setTaskError,
   finishTaskMergeConflictRepair,
+  buildMergeConflictPrompt,
   taskBatchPublicationActive,
   taskMetrics,
   taskIdFromFilename,
@@ -73,13 +70,10 @@ import {
 import {
   buildAttemptUsageV2,
   parseAppServerExecutionStats,
-  parseExecutionStats,
-  parseOtlpRequestStats,
 } from "./execution-stats.mjs";
 import { AppServerClient } from "./app-server-client.mjs";
 import { combineUsage } from "./usage-recovery.mjs";
 import { createTaskInteraction } from "./task-interaction.mjs";
-import { DesktopClient } from "./desktop-client.mjs";
 import { classifyFailure } from "./attempt-ledger.mjs";
 import { loadPipelineSnapshot, runPipeline } from "./pipeline.mjs";
 import { WORKER_TOOLING_BOUNDARY } from "./routing-policy.mjs";
@@ -106,13 +100,6 @@ const daemonToken = randomUUID();
 const daemonStartedAt = new Date().toISOString();
 const pluginVersion = ownRuntime.pluginVersion;
 const active = new Map();
-let desktopClient = null;
-let desktopMaintenance = null;
-let nextDesktopAttemptAt = 0;
-const desktopThreadStates = new Map();
-const desktopThreadRetryAt = new Map();
-const desktopDispatches = new Set();
-let nextDesktopDispatchAt = 0;
 let dashboard = null;
 let stopping = false;
 let lastWarning = null;
@@ -346,7 +333,7 @@ async function reloadDashboard(previousConfig, nextConfig) {
       repoRoot,
       nextConfig.dashboardPort,
       dashboard?.threadId || null,
-      desktopTaskAction,
+      taskAction,
     );
   } catch (error) {
     log("dashboard_config_reload_error", {
@@ -381,7 +368,7 @@ async function syncDashboardThread() {
 
   let replacement;
   try {
-    replacement = await startDashboard(repoRoot, 0, threadId, desktopTaskAction);
+    replacement = await startDashboard(repoRoot, 0, threadId, taskAction);
   } catch (error) {
     log("dashboard_thread_reload_error", {
       threadId,
@@ -537,6 +524,7 @@ function buildPrompt(task, worktreePath) {
     `Task ID: ${task.id}`,
     "",
     task.body,
+    task.metadata.interaction?.response ? `User answer:\n${task.metadata.interaction.response.text}` : "",
   ].join("\n");
 }
 
@@ -550,6 +538,7 @@ function buildAppServerPrompt(task, worktreePath, claim) {
     "Reuse the task requirements, repository findings, and tool results already present in this thread.",
     "Inspect only facts that may have changed, address the recorded failure, finish the implementation, and run the smallest relevant validation.",
     previousError ? `Recorded failure: ${previousError}` : null,
+    task.metadata.interaction?.response ? `User answer:\n${task.metadata.interaction.response.text}` : null,
     "Return only the JSON object required by the existing output schema.",
   ]
     .filter(Boolean)
@@ -589,6 +578,7 @@ function buildPipelineStepPrompt(
     : null;
   const stage = [
     `Pipeline step: ${step.id} (${step.type}).`,
+    task.metadata.interaction?.response ? `User answer:\n${task.metadata.interaction.response.text}` : null,
     step.prompt,
     previousSummaries.length > 0
       ? `Previously completed pipeline steps:\n${previousSummaries.join("\n")}`
@@ -634,23 +624,6 @@ function buildPipelineStepPrompt(
   ].join("\n");
 }
 
-function buildMergeConflictPrompt(task, worktreePath, claim) {
-  const conflict = task.metadata.git?.mergeConflict || {};
-  return [
-    `Continue original ToDo task ${task.id} in its existing Codex thread.`,
-    `This is merge-conflict repair attempt ${claim.attempt || 1}.`,
-    `The merge queue rebased ${task.metadata.git?.branch} onto the current ${task.metadata.git?.targetBranch} at ${conflict.targetCommit || "the latest target commit"}.`,
-    `The rebase is paused in ${worktreePath}.`,
-    conflict.files?.length
-      ? `Conflicted files: ${conflict.files.join(", ")}.`
-      : "Inspect the paused rebase to identify every conflict.",
-    "Resolve the files so the original task functionality remains correct while preserving the newer target-branch functionality and contracts.",
-    "Review the target changes made since the task branch diverged and check affected callers; do not choose one side mechanically.",
-    "Edit the conflicted files and run the smallest relevant tests or verification. Do not run git add, commit, merge, cherry-pick, rebase, push, or branch commands; the merge worker owns the paused rebase and will continue it after your result.",
-    "If the two requirements are logically incompatible or a safe resolution needs a product decision, return status failed with the concrete logical conflict. The task will leave the merge queue with that error.",
-    "Return only the JSON object required by the existing output schema.",
-  ].join("\n");
-}
 
 function markInteractiveRequired(
   taskPath,
@@ -670,7 +643,6 @@ function markInteractiveRequired(
   const task = readTask(taskPath);
   task.metadata.execution = { ...execution, mode: "interactive" };
   task.metadata.interaction = { state: "waiting-input", question: message,
-    nativeThreadId: task.metadata.interaction?.nativeThreadId || null,
     updatedAt: new Date().toISOString() };
   writeTask(task);
 }
@@ -696,76 +668,6 @@ function attemptFailure(
     errorKind: failure.errorKind,
     usagePath,
   };
-}
-
-async function startRequestTelemetry() {
-  const nonce = randomUUID();
-  const batches = [];
-  let retainedBytes = 0;
-  const maxRequestBytes = 2 * 1024 * 1024;
-  const maxRetainedBytes = 8 * 1024 * 1024;
-  const server = http.createServer((request, response) => {
-    if (request.method !== "POST" || request.url !== `/${nonce}/v1/logs`) {
-      response.writeHead(404).end();
-      return;
-    }
-    const chunks = [];
-    let bytes = 0;
-    request.on("data", (chunk) => {
-      bytes += chunk.length;
-      if (bytes <= maxRequestBytes) chunks.push(chunk);
-    });
-    request.on("end", () => {
-      if (bytes <= maxRequestBytes && retainedBytes + bytes <= maxRetainedBytes) {
-        try {
-          batches.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-          retainedBytes += bytes;
-        } catch {
-          // Telemetry is optional; malformed batches only reduce coverage.
-        }
-      }
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end("{}");
-    });
-  });
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  return {
-    endpoint: `http://127.0.0.1:${address.port}/${nonce}/v1/logs`,
-    batches,
-    close: () =>
-      new Promise((resolve) => {
-        server.close(resolve);
-        server.closeIdleConnections?.();
-      }),
-  };
-}
-
-function readExecutionStats(eventsFile, telemetry) {
-  const stats = parseExecutionStats(
-    existsSync(eventsFile) ? readFileSync(eventsFile, "utf8") : "",
-  );
-  stats.requestStats = parseOtlpRequestStats(
-    telemetry?.batches || [],
-    stats.tokenUsage,
-  );
-  if (!stats.tokenUsage.available && stats.requestStats.available) {
-    stats.tokenUsage = {
-      ...stats.requestStats.tokenUsage,
-      coverage: "partial",
-    };
-  } else if (stats.tokenUsage.available) {
-    stats.tokenUsage.coverage =
-      stats.requestStats.available && stats.requestStats.coverage === "full"
-        ? "full"
-        : "partial";
-  } else {
-    stats.tokenUsage.coverage = "none";
-  }
-  return stats;
 }
 
 async function ensureAppServer(config) {
@@ -806,95 +708,12 @@ async function ensureAppServer(config) {
   }
 }
 
-function appTools(config) {
-  desktopClient ||= new DesktopClient({ command: config.codexCommand });
-  return desktopClient;
-}
-
 const interaction = createTaskInteraction({
   repoRoot, active, getAppServer: () => appServer,
-  getClient: () => appTools(runtimeConfig),
-  getOwnerThreadId: () => getSupervisorStatus(repoRoot).automation?.targetThreadId,
   onChange: () => scheduleSupervisorThreadTitleSync(runtimeConfig),
 });
-const desktopTaskAction = interaction.action;
+const taskAction = interaction.action;
 const handleAgentInputRequest = interaction.onServerRequest;
-
-function scheduleDesktopMaintenance(config) {
-  if (desktopMaintenance || Date.now() < nextDesktopAttemptAt || !process.env.CODEX_APP_TOOLS_PIPE_PATH) return;
-  const ownerThreadId = getSupervisorStatus(repoRoot).automation?.targetThreadId;
-  if (!ownerThreadId) return;
-  const tasks = listTaskStatuses(repoRoot, { includeClosed: true, limit: null, recoverUsage: false });
-  const claimed = tasks.filter(task => task.claim?.owner?.threadId && task.claim.owner.turnId);
-  desktopMaintenance = (async () => {
-    const client = appTools(config);
-    const title = getSupervisorStatus(repoRoot).threadTitle;
-    if (desktopThreadStates.get(ownerThreadId) !== title) {
-      await client.call("set_thread_title", { threadId: ownerThreadId, title }, ownerThreadId);
-      desktopThreadStates.set(ownerThreadId, title);
-    }
-    for (const task of claimed) {
-      try {
-        const claim = readClaim(`${task.path}.lock`, { includeToken: true });
-        if (!claim?.owner) continue;
-        const observed = await client.call("read_thread", {
-          threadId: claim.owner.threadId, turnLimit: 10, includeOutputs: false,
-        }, ownerThreadId);
-        reconcileInteractiveClaim(repoRoot, task.id, observed, claim.token);
-      } catch (error) { log("desktop_claim_reconcile_error", { task: task.id, error: error.message }); }
-    }
-    let synced = 0;
-    for (const task of tasks) {
-      const threadId = task.interaction?.nativeThreadId || task.codexThread?.id;
-      if (!threadId || task.claim || active.has(task.id)) continue;
-      if (Date.now() < (desktopThreadRetryAt.get(threadId) || 0)) continue;
-      const name = formatTaskThreadTitle(repoRoot, task);
-      const shouldArchive = task.status !== "waiting-input" &&
-        (task.codexThread?.state === "archived" || ["completed", "failed", "canceled", "rejected"].includes(task.status));
-      const key = `${name}:${shouldArchive}`;
-      if (desktopThreadStates.get(threadId) === key) continue;
-      try {
-      const observed = await client.call("read_thread", { threadId, turnLimit: 1, includeOutputs: false }, ownerThreadId);
-      if (observed.thread?.status?.type === "active") continue;
-      // The app cannot rename an archived rollout. Reopen it without starting
-      // a turn, then restore archival even if renaming fails.
-      if (shouldArchive) await client.call("set_thread_archived", { threadId, archived: false }, ownerThreadId);
-      try {
-        await client.call("set_thread_title", { threadId, title: name }, ownerThreadId);
-      } finally {
-        if (shouldArchive) await client.call("set_thread_archived", { threadId, archived: true }, ownerThreadId);
-      }
-      desktopThreadStates.set(threadId, key);
-      } catch (error) {
-        desktopThreadRetryAt.set(threadId, Date.now() + 60000);
-        log("desktop_thread_reconcile_error", { task: task.id, error: error.message });
-      }
-      if (++synced >= 4) break;
-    }
-  })().catch(error => {
-    nextDesktopAttemptAt = Date.now() + 30000;
-    log("desktop_reconcile_error", { error: error.message });
-  })
-    .finally(() => { desktopMaintenance = null; });
-}
-
-function scheduleNativeTasks(config) {
-  if (Date.now() < nextDesktopDispatchAt || !process.env.CODEX_APP_TOOLS_PIPE_PATH ||
-      !getSupervisorStatus(repoRoot).automation?.targetThreadId || taskBatchPublicationActive(repoRoot)) return;
-  const tasks = listTaskStatuses(repoRoot, { recoverUsage: false });
-  let occupied = implementationActiveCount() + desktopDispatches.size +
-    tasks.filter(task => task.claim?.owner?.threadId || task.interaction?.dispatching).length;
-  for (const task of tasks) {
-    if (occupied >= config.workers) break;
-    if (task.execution?.mode !== "interactive" || task.status !== "queued" || task.claim ||
-        task.existingBlockers?.length || desktopDispatches.has(task.id) || task.interaction?.dispatching) continue;
-    desktopDispatches.add(task.id); occupied++;
-    desktopTaskAction({ taskId: task.id, action: "native" }).catch(error => {
-      nextDesktopDispatchAt = Date.now() + 30000;
-      log("desktop_dispatch_error", { task: task.id, error: error.message });
-    }).finally(() => desktopDispatches.delete(task.id));
-  }
-}
 
 async function syncSupervisorThreadTitle(config) {
   const supervisor = getSupervisorStatus(repoRoot);
@@ -1190,461 +1009,6 @@ async function executeDeliveryOnly(taskPath, claim, workerId, config) {
   }
 }
 
-async function executeTaskWithExec(taskPath, claim, workerId, config) {
-  const task = readTask(taskPath);
-  const isMergeRepair = task.metadata.git?.phase === "merge-conflict";
-  if (
-    ["model-completed", "committing", "committed", "delivered"].includes(
-      task.metadata.git?.phase,
-    )
-  ) {
-    await executeDeliveryOnly(taskPath, claim, workerId, config);
-    return;
-  }
-  const previousMetrics = recoveredTaskMetrics(repoRoot, task.id, task.metadata.metrics);
-  const execution =
-    task.metadata.execution || resolveTaskExecution(config, {});
-  let preparedGit;
-  try {
-    preparedGit = isMergeRepair
-      ? {
-          worktreePath: task.metadata.git.worktreePath,
-          expectedHead: task.metadata.git.headCommit,
-        }
-      : await prepareTaskGit(repoRoot, taskPath);
-  } catch (error) {
-    setTaskError(
-      taskPath,
-      error.kind || "git_prepare",
-      null,
-      error.message,
-      previousMetrics,
-    );
-    releaseClaim(claim);
-    interaction.abandon(task.id); active.delete(task.id);
-    log("task_pre_model_failure", {
-      task: task.id,
-      kind: error.kind || "git_prepare",
-      error: error.message,
-    });
-    writeState();
-    return;
-  }
-  beginModelAttempt(taskPath, claim);
-  const attemptDir = path.join(
-    todoDir(repoRoot),
-    "logs",
-    task.id,
-    `attempt-${String(claim.attempt || 1).padStart(3, "0")}-${claim.attemptId}`,
-  );
-  mkdirSync(attemptDir, { recursive: true });
-  const stdoutPath = path.join(attemptDir, "stdout.log");
-  const stderrPath = path.join(attemptDir, "stderr.log");
-  const resultPath = path.join(attemptDir, "result.json");
-  const usagePath = path.join(attemptDir, "usage.json");
-  const promptPath = path.join(attemptDir, "prompt.txt");
-  const executionPrompt = isMergeRepair
-    ? buildMergeConflictPrompt(task, preparedGit.worktreePath, claim)
-    : buildPrompt(task, preparedGit.worktreePath);
-  writeFileSync(promptPath, `${executionPrompt}\n`, "utf8");
-  const stdoutFd = openSync(stdoutPath, "a");
-  const stderrFd = openSync(stderrPath, "a");
-  let telemetry = null;
-  try {
-    telemetry = await startRequestTelemetry();
-  } catch (error) {
-    log("request_telemetry_unavailable", {
-      task: task.id,
-      error: error.message,
-    });
-  }
-
-  const args = [
-    "exec",
-    ...(execution.ephemeral ? ["--ephemeral"] : []),
-    "--model",
-    execution.model,
-    "-c",
-    `model_reasoning_effort=${JSON.stringify(execution.reasoningEffort)}`,
-    "--sandbox",
-    "workspace-write",
-    "-c",
-    'approval_policy="never"',
-    ...(telemetry
-      ? [
-          "-c",
-          "otel.log_user_prompt=false",
-          "-c",
-          `otel.exporter={otlp-http={endpoint=${JSON.stringify(telemetry.endpoint)},protocol="json"}}`,
-          "-c",
-          'otel.trace_exporter="none"',
-          "-c",
-          'otel.metrics_exporter="none"',
-        ]
-      : []),
-    "-C",
-    preparedGit.worktreePath,
-    "--color",
-    "never",
-    "--json",
-    "--output-schema",
-    resultSchema,
-    "--output-last-message",
-    resultPath,
-    "-",
-  ];
-
-  const claimedAt = Date.parse(claim.claimedAt);
-  const startedAt = Number.isFinite(claimedAt) ? claimedAt : Date.now();
-  log("task_start", {
-    task: task.id,
-    worker: workerId,
-    startedAt: new Date(startedAt).toISOString(),
-    modelProfile: execution.modelProfile,
-    model: execution.model,
-    reasoningEffort: execution.reasoningEffort,
-    ephemeral: execution.ephemeral,
-    attempt: claim.attempt,
-    attemptId: claim.attemptId,
-    trigger: claim.trigger,
-    usagePath: path.relative(repoRoot, usagePath),
-    promptPath: path.relative(repoRoot, promptPath),
-    worktreePath: preparedGit.worktreePath,
-    branch: task.metadata.git?.branch,
-  });
-  atomicWriteJson(usagePath, {
-    schemaVersion: 2,
-    taskId: task.id,
-    attempt: claim.attempt,
-    attemptId: claim.attemptId,
-    retryOf: claim.retryOf,
-    trigger: claim.trigger,
-    status: "running",
-    startedAt: new Date(startedAt).toISOString(),
-    completedAt: null,
-    durationMs: 0,
-    modelProfile: execution.modelProfile,
-    model: execution.model,
-    reasoningEffort: execution.reasoningEffort,
-    threadId: null,
-    source: "codex exec --json + numeric OTLP",
-    eventsFile: path.basename(stdoutPath),
-    promptFile: path.basename(promptPath),
-    tokenUsage: emptyTokenUsage(),
-    observable: {
-      context: {
-        promptBytes: Buffer.byteLength(executionPrompt),
-        taskBodyBytes: Buffer.byteLength(task.body),
-        outputSchemaBytes: readFileSync(resultSchema).length,
-      },
-    },
-    requestStats: {
-      available: false,
-      coverage: "none",
-      requests: [],
-      transportRetries: 0,
-      reason: "attempt_running",
-    },
-  });
-  let child;
-  let exitCode = null;
-  let spawnError = null;
-  let tokenUsage = emptyTokenUsage();
-  let executionStats = parseExecutionStats("");
-  let metrics = null;
-
-  try {
-    if (stopping) {
-      const error = new Error("ToDo daemon stopped before model start");
-      error.kind = "interrupted";
-      throw error;
-    }
-    child = spawn(config.codexCommand, args, {
-      cwd: preparedGit.worktreePath,
-      env: {
-        ...process.env,
-        TODO_RUNNER_WORKER: "1",
-        TODO_RUNNER_REPO_ROOT: repoRoot,
-        TODO_RUNNER_WORKTREE: preparedGit.worktreePath,
-        TODO_RUNNER_TASK_ID: task.id,
-      },
-      stdio: ["pipe", stdoutFd, stderrFd],
-    });
-    active.get(task.id).child = child;
-    if (stopping && child.exitCode === null && child.signalCode === null) {
-      child.kill();
-    }
-    writeState();
-    child.stdin.end(executionPrompt);
-    exitCode = await new Promise((resolve) => {
-      child.once("error", (error) => {
-        spawnError = error;
-        resolve(null);
-      });
-      child.once("close", (code) => resolve(code));
-    });
-  } finally {
-    closeSync(stdoutFd);
-    closeSync(stderrFd);
-    if (telemetry) await telemetry.close();
-    executionStats = readExecutionStats(stdoutPath, telemetry);
-    executionStats.observable.context = {
-      promptBytes: Buffer.byteLength(executionPrompt),
-      taskBodyBytes: Buffer.byteLength(task.body),
-      outputSchemaBytes: readFileSync(resultSchema).length,
-    };
-    tokenUsage = executionStats.tokenUsage;
-    metrics = cumulativeTaskMetrics(
-      previousMetrics,
-      taskMetrics(startedAt, Date.now(), tokenUsage),
-    );
-  }
-
-  try {
-    if (isMergeRepair) {
-      let repairResult;
-      if (spawnError) {
-        repairResult = {
-          status: "failed",
-          summary: spawnError.message,
-          error: spawnError.message,
-          validation: [],
-        };
-      } else if (exitCode !== 0) {
-        const detail = readLogTail(stderrPath) || readLogTail(stdoutPath);
-        const message = detail || `codex exec exited with code ${exitCode}`;
-        repairResult = {
-          status: "failed",
-          summary: message,
-          error: message,
-          validation: [],
-        };
-      } else {
-        try {
-          repairResult = parseResult(resultPath);
-        } catch (error) {
-          repairResult = {
-            status: "failed",
-            summary: error.message,
-            error: error.message,
-            validation: [],
-          };
-        }
-      }
-      await finishTaskMergeConflictRepair(
-        repoRoot,
-        taskPath,
-        claim,
-        repairResult,
-        metrics,
-        path.relative(repoRoot, usagePath),
-      );
-      return;
-    }
-    if (spawnError) {
-      setTaskError(
-        taskPath,
-        "codex_spawn",
-        null,
-        spawnError.message,
-        metrics,
-        attemptFailure(
-          claim,
-          "codex_spawn",
-          null,
-          spawnError.message,
-          path.relative(repoRoot, usagePath),
-        ),
-      );
-      return;
-    }
-    if (exitCode !== 0) {
-      const detail = readLogTail(stderrPath) || readLogTail(stdoutPath);
-      const message = detail || `codex exec exited with code ${exitCode}`;
-      setTaskError(
-        taskPath,
-        "codex_exec",
-        exitCode,
-        message,
-        metrics,
-        attemptFailure(
-          claim,
-          "codex_exec",
-          exitCode,
-          message,
-          path.relative(repoRoot, usagePath),
-        ),
-      );
-      return;
-    }
-
-    let result;
-    try {
-      result = parseResult(resultPath);
-    } catch (error) {
-      setTaskError(
-        taskPath,
-        "invalid_result",
-        exitCode,
-        error.message,
-        metrics,
-        attemptFailure(
-          claim,
-          "invalid_result",
-          exitCode,
-          error.message,
-          path.relative(repoRoot, usagePath),
-        ),
-      );
-      return;
-    }
-    if (result.status === "failed") {
-      if (result.requiresInteractive) {
-        markInteractiveRequired(
-          taskPath,
-          execution,
-          result.interactiveReason,
-          metrics,
-          attemptFailure(
-            claim,
-            "interactive_required",
-            exitCode,
-            result.interactiveReason,
-            path.relative(repoRoot, usagePath),
-            true,
-          ),
-        );
-        return;
-      }
-      setTaskError(
-        taskPath,
-        "agent_reported_failure",
-        exitCode,
-        result.error || result.summary,
-        metrics,
-        attemptFailure(
-          claim,
-          "agent_reported_failure",
-          exitCode,
-          result.error || result.summary,
-          path.relative(repoRoot, usagePath),
-        ),
-      );
-      return;
-    }
-    markTaskModelCompleted(
-      taskPath,
-      claim,
-      result,
-      metrics,
-      path.relative(repoRoot, usagePath),
-    );
-    try {
-      const finalized = await finalizeTaskGit(
-        repoRoot,
-        taskPath,
-        path.relative(repoRoot, path.join(attemptDir, "delivery.json")),
-      );
-      atomicWriteJson(path.join(attemptDir, "delivery.json"), {
-        status: finalized.mergeQueued ? "merge-queued" : "completed",
-        deliveryAttemptId: finalized.deliveryAttemptId,
-        delivery: finalized.delivery,
-      });
-      if (!finalized.mergeQueued) {
-        completeTask(repoRoot, taskPath, finalized.result, metrics);
-      }
-    } catch (error) {
-      const deliveryAttemptId = getTaskStatus(
-        repoRoot,
-        task.id,
-      ).attemptLedger?.deliveryAttempts?.at(-1)?.attemptId;
-      atomicWriteJson(path.join(attemptDir, "delivery.json"), {
-        status: "failed",
-        deliveryAttemptId: deliveryAttemptId || null,
-        errorKind:
-          error.taskFailure?.errorKind || error.kind || "git_delivery",
-        error: String(error.message).slice(0, 4000),
-      });
-      setTaskError(
-        taskPath,
-        error.taskFailure?.errorKind || error.kind || "git_delivery",
-        null,
-        error.message,
-        metrics,
-        error.taskFailure
-          ? {
-              status: error.taskFailure.status,
-              errorKind: error.taskFailure.errorKind,
-            }
-          : null,
-      );
-    }
-  } catch (error) {
-    setTaskError(
-      taskPath,
-      "runner",
-      exitCode,
-      error.message,
-      metrics,
-      getTaskStatus(repoRoot, task.id).attemptLedger?.attempts?.some(
-        (attempt) => attempt.attemptId === claim.attemptId,
-      )
-        ? null
-        : attemptFailure(
-            claim,
-            "runner",
-            exitCode,
-            error.message,
-            path.relative(repoRoot, usagePath),
-          ),
-    );
-  } finally {
-    releaseClaim(claim);
-    interaction.abandon(task.id); active.delete(task.id);
-    const finalStatus = getTaskStatus(repoRoot, task.id);
-    const status = finalStatus.status;
-    const modelAttemptStatus =
-      finalStatus.attemptLedger?.attempts?.find(
-        (attempt) => attempt.attemptId === claim.attemptId,
-      )?.status || status;
-    try {
-      atomicWriteJson(usagePath, {
-        ...buildAttemptUsageV2({
-          taskId: task.id,
-          attempt: claim.attempt,
-          status: modelAttemptStatus,
-          startedAt: metrics?.lastRun?.startedAt,
-          completedAt: metrics?.lastRun?.completedAt,
-          durationMs: metrics?.lastRun?.durationMs,
-          modelProfile: execution.modelProfile,
-          model: execution.model,
-          reasoningEffort: execution.reasoningEffort,
-          stats: executionStats,
-        }),
-        attemptId: claim.attemptId,
-        retryOf: claim.retryOf,
-        trigger: claim.trigger,
-        eventsFile: path.basename(stdoutPath),
-        promptFile: path.basename(promptPath),
-      });
-    } catch (error) {
-      log("usage_log_error", { task: task.id, error: error.message });
-    }
-    log("task_end", {
-      task: task.id,
-      status,
-      outcome: modelAttemptStatus,
-      attempt: claim.attempt,
-      attemptId: claim.attemptId,
-      durationMs: metrics?.lastRun?.durationMs || 0,
-      totalTokens: metrics?.lastRun?.tokenUsage?.totalTokens || 0,
-      coverage: metrics?.lastRun?.tokenUsage?.coverage || "none",
-      usagePath: path.relative(repoRoot, usagePath),
-    });
-    writeState();
-  }
-}
-
 async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
   const task = readTask(taskPath);
   const isMergeRepair = task.metadata.git?.phase === "merge-conflict";
@@ -1716,6 +1080,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
 
   log("task_start", {
     task: task.id,
+    startedAt: new Date(startedAt).toISOString(),
     worker: workerId,
     backend: "app-server",
     modelProfile: execution.modelProfile,
@@ -1835,6 +1200,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
           status: "failed",
           summary: runError.message,
           error: runError.message,
+          errorKind: runError.kind || "app_server",
           validation: [],
         };
       } else {
@@ -2017,6 +1383,8 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
       threadId,
       turnId,
       attempt: claim.attempt,
+      durationMs: metrics?.lastRun?.durationMs || 0,
+      coverage: metrics?.lastRun?.tokenUsage?.coverage || "none",
       totalTokens: metrics?.lastRun?.tokenUsage?.totalTokens || 0,
     });
     writeState();
@@ -2120,121 +1488,6 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
       backend,
       mode: "background",
     };
-  };
-
-  const runExecStep = async (step, context) => {
-    const execution = stepExecution(step, "exec");
-    const directory = stepDirectory(step, context);
-    const stdoutPath = path.join(directory, "stdout.log");
-    const stderrPath = path.join(directory, "stderr.log");
-    const resultPath = path.join(directory, "result.json");
-    const promptPath = path.join(directory, "prompt.txt");
-    const receiptPath = path.join(directory, "receipt.json");
-    const prompt = buildPipelineStepPrompt(
-      readTask(taskPath),
-      preparedGit.worktreePath,
-      step,
-      context,
-    );
-    writeFileSync(promptPath, `${prompt}\n`, "utf8");
-    const stdoutFd = openSync(stdoutPath, "a");
-    const stderrFd = openSync(stderrPath, "a");
-    const args = [
-      "exec",
-      ...(execution.ephemeral ? ["--ephemeral"] : []),
-      "--model",
-      execution.model,
-      "-c",
-      `model_reasoning_effort=${JSON.stringify(execution.reasoningEffort)}`,
-      "--sandbox",
-      config.codexSandbox,
-      "-c",
-      'approval_policy="never"',
-      "-C",
-      preparedGit.worktreePath,
-      "--color",
-      "never",
-      "--json",
-      "--output-schema",
-      pipelineResultSchema,
-      "--output-last-message",
-      resultPath,
-      "-",
-    ];
-    log("pipeline_step_start", {
-      task: task.id,
-      step: step.id,
-      type: step.type,
-      repairRound: context.repairRound,
-      modelProfile: execution.modelProfile,
-    });
-    let child;
-    let spawnError = null;
-    let exitCode = null;
-    try {
-      child = spawn(config.codexCommand, args, {
-        cwd: preparedGit.worktreePath,
-        env: {
-          ...process.env,
-          TODO_RUNNER_WORKER: "1",
-          TODO_RUNNER_REPO_ROOT: repoRoot,
-          TODO_RUNNER_TASK_FILE: taskPath,
-        },
-        stdio: ["pipe", stdoutFd, stderrFd],
-      });
-      const entry = active.get(task.id);
-      if (entry) entry.child = child;
-      child.stdin.end(prompt);
-      exitCode = await new Promise((resolve) => {
-        child.once("error", (error) => {
-          spawnError = error;
-          resolve(null);
-        });
-        child.once("close", (code) => resolve(code));
-      });
-    } finally {
-      closeSync(stdoutFd);
-      closeSync(stderrFd);
-      const entry = active.get(task.id);
-      if (entry?.child === child) entry.child = null;
-    }
-    const stats = parseExecutionStats(
-      existsSync(stdoutPath) ? readFileSync(stdoutPath, "utf8") : "",
-    );
-    stepStats.push({ stepId: step.id, type: step.type, execution, stats });
-    if (spawnError || exitCode !== 0) {
-      const detail = readLogTail(stderrPath) || readLogTail(stdoutPath);
-      const error = new Error(
-        spawnError?.message || detail || `codex exec exited with code ${exitCode}`,
-      );
-      error.kind = spawnError ? "codex_spawn" : "codex_exec";
-      error.code = exitCode;
-      throw error;
-    }
-    let result;
-    try {
-      result = parsePipelineStepResult(resultPath);
-    } catch (error) {
-      error.kind = "invalid_result";
-      throw error;
-    }
-    const receipt = {
-      status: result.status,
-      summary: result.summary,
-      modelProfile: execution.modelProfile,
-      resultPath: path.relative(repoRoot, resultPath),
-      stdoutPath: path.relative(repoRoot, stdoutPath),
-      stderrPath: path.relative(repoRoot, stderrPath),
-    };
-    atomicWriteJson(receiptPath, receipt);
-    log("pipeline_step_end", {
-      task: task.id,
-      step: step.id,
-      type: step.type,
-      status: result.status,
-      repairRound: context.repairRound,
-    });
-    return { ...result, receipt };
   };
 
   const runThreadStep = async (step, context) => {
@@ -2444,7 +1697,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     pipelineResult = await runPipeline(pipeline, {
       runCodex: (step, context) => {
         if (stopping) throw new Error("Pipeline interrupted by runner shutdown");
-        return step.type === "codex-exec" ? runExecStep(step, context) : runThreadStep(step, context);
+        return runThreadStep(step, context);
       },
       runShell: (step, context) => {
         if (stopping) throw new Error("Pipeline interrupted by runner shutdown");
@@ -2465,7 +1718,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
           ...state,
         });
       },
-    }, task.metadata.pipelineContinuation?.ready ? task.metadata.pipelineContinuation : null);
+    }, (task.metadata.pipelineContinuation?.ready || task.metadata.pipelineContinuation?.resume) ? task.metadata.pipelineContinuation : null);
   } catch (error) {
     runError = error;
   }
@@ -2537,7 +1790,6 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
         const waiting = readTask(taskPath);
         waiting.metadata.pipelineContinuation = pipelineResult.continuation;
         waiting.metadata.interaction = { state: "waiting-input", question: failure.interactiveReason,
-          nativeThreadId: waiting.metadata.interaction?.nativeThreadId || null,
           updatedAt: new Date().toISOString() };
         waiting.metadata.execution = { ...waiting.metadata.execution, mode: "interactive" };
         writeTask(waiting);
@@ -2718,11 +1970,7 @@ async function executeTask(taskPath, claim, workerId, config) {
   ) {
     return executeTaskWithPipeline(taskPath, claim, workerId, config);
   }
-  const execution =
-    task.metadata.execution || resolveTaskExecution(config, {});
-  return execution.backend === "exec"
-    ? executeTaskWithExec(taskPath, claim, workerId, config)
-    : executeTaskWithAppServer(taskPath, claim, workerId, config);
+  return executeTaskWithAppServer(taskPath, claim, workerId, config);
 }
 
 function hasSpecialWorker(workerId) {
@@ -2869,7 +2117,7 @@ function startMergeQueueWorker(config) {
         repoRoot,
         taskPath,
         path.relative(repoRoot, deliveryPath),
-        { onChild: child => { entry.child = child; }, signal: entry.abortController.signal },
+        { claim, onChild: child => { entry.child = child; }, signal: entry.abortController.signal },
       );
       atomicWriteJson(deliveryPath, merged);
       if (merged.status === "merged") {
@@ -2907,42 +2155,33 @@ function startMergeConflictRepair(config) {
   if (hasSpecialWorker("merge-repair")) return;
   const candidate = listTaskFiles(repoRoot)
     .map((taskPath) => ({ taskPath, status: getTaskStatus(repoRoot, taskIdFromFilename(path.basename(taskPath))) }))
-    .find(({ status }) => status.status === "merge-conflict" && !active.has(status.id));
+    .find(({ status }) => status.status === "merge-conflict" && status.execution?.mode !== "interactive" && !active.has(status.id));
   if (!candidate) return;
   const { taskPath } = candidate;
   let status = candidate.status;
-  const backend = status.execution?.backend || config.executionBackend;
-  if (backend === "app-server" && !status.codexThread?.id) {
+  let claim;
+  try { claim = claimTask(taskPath, "merge-repair"); }
+  catch (error) {
+    if (error.code !== "EEXIST") log("merge_repair_claim_error", { task: status.id, error: error.message });
+    return;
+  }
+  try {
+    status = getTaskStatus(repoRoot, status.id);
+    if (status.interaction?.state === "waiting-input" || status.execution?.mode === "interactive") {
+      releaseClaim(claim);
+      return;
+    }
+    status = prepareTaskMergeConflictRepair(repoRoot, taskPath, claim);
+  } catch (error) {
     const task = readTask(taskPath);
-    task.metadata.git = {
-      ...task.metadata.git,
-      phase: "merge-failed",
-      deliveryError: "Merge conflict repair requires the original persistent app-server thread",
-    };
-    task.metadata.error = {
-      at: new Date().toISOString(),
-      kind: "merge_thread_unavailable",
-      exit_code: null,
-      message: task.metadata.git.deliveryError,
-    };
+    task.metadata.git.phase = "merge-failed";
+    task.metadata.git.deliveryError = error.message;
+    task.metadata.error = { at: new Date().toISOString(), kind: error.kind || "merge_repair_unavailable",
+      message: error.message, exit_code: null };
     task.metadata.outcome = "failed_permanent";
     writeTask(task);
-    log("merge_repair_unavailable", { task: status.id });
-    return;
-  }
-  try {
-    status = prepareTaskMergeConflictRepair(repoRoot, taskPath);
-  } catch (error) {
+    releaseClaim(claim);
     log("merge_repair_prepare_error", { task: status.id, error: error.message });
-    return;
-  }
-  let claim;
-  try {
-    claim = claimTask(taskPath, "merge-repair");
-  } catch (error) {
-    if (error.code !== "EEXIST") {
-      log("merge_repair_claim_error", { task: status.id, error: error.message });
-    }
     return;
   }
   const entry = {
@@ -3192,7 +2431,6 @@ async function shutdown(signal) {
   if (current?.token === daemonToken && existsSync(daemonStatePath(repoRoot))) {
     unlinkSync(daemonStatePath(repoRoot));
   }
-  desktopClient?.close();
   process.exit(0);
 }
 
@@ -3218,7 +2456,6 @@ async function shutdownForRuntimeUpdate() {
   if (current?.token === daemonToken && existsSync(daemonStatePath(repoRoot))) {
     unlinkSync(daemonStatePath(repoRoot));
   }
-  desktopClient?.close();
   process.exit(0);
 }
 
@@ -3246,7 +2483,7 @@ try {
     repoRoot,
     runtimeConfig.dashboardPort,
     initialDashboardThreadId,
-    desktopTaskAction,
+    taskAction,
   );
 } catch (error) {
   if (runtimeConfig.dashboardPort === 0) throw error;
@@ -3254,7 +2491,7 @@ try {
     requestedPort: runtimeConfig.dashboardPort,
     error: error.message,
   });
-  dashboard = await startDashboard(repoRoot, 0, initialDashboardThreadId, desktopTaskAction);
+  dashboard = await startDashboard(repoRoot, 0, initialDashboardThreadId, taskAction);
 }
 watchDashboardErrors(dashboard);
 log("daemon_start", {
@@ -3273,8 +2510,6 @@ const taskChanges = watch(todoDir(repoRoot), (_event, filename) => {
   titleChangeTimer = setTimeout(() => {
     if (!stopping) {
       scheduleSupervisorThreadTitleSync(runtimeConfig);
-      scheduleDesktopMaintenance(runtimeConfig);
-    scheduleNativeTasks(runtimeConfig);
     }
   }, 25);
 });
@@ -3349,8 +2584,6 @@ while (!stopping) {
     await processPendingThreadArchives(runtimeConfig);
     scheduleSupervisorThreadTitleSync(runtimeConfig);
     startReadyTasks(runtimeConfig);
-    scheduleDesktopMaintenance(runtimeConfig);
-    scheduleNativeTasks(runtimeConfig);
     startMergeQueueWorker(runtimeConfig);
     startMergeConflictRepair(runtimeConfig);
     scheduleSupervisorThreadTitleSync(runtimeConfig);

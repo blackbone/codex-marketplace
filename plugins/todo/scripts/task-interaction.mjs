@@ -1,10 +1,9 @@
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import { appendTaskChat } from "./task-chat.mjs";
-import { claimTask, formatTaskThreadTitle, getTaskDetails, readTask, releaseClaim, writeTask } from "./lib.mjs";
+import { resumeTaskMergeRepair, claimTask, getTaskDetails, readTask, releaseClaim, writeTask } from "./lib.mjs";
 
-export function createTaskInteraction({ repoRoot, active, getAppServer, getClient, getOwnerThreadId, onChange = () => {} }) {
+export function createTaskInteraction({ repoRoot, active, getAppServer, onChange = () => {} }) {
   const pendingUserInputs = new Map();
   function record(taskId, event) {
     try { appendTaskChat(repoRoot, taskId, event); return {}; }
@@ -23,7 +22,6 @@ function handleAgentInputRequest(message) {
   const requestId = randomUUID();
   const task = readTask(entry.taskPath);
   task.metadata.interaction = { state: "waiting-input", requestId, threadId, turnId,
-    nativeThreadId: task.metadata.interaction?.nativeThreadId || null,
     questions, question: questions.map(item => item.question).join("\n"), updatedAt: new Date().toISOString() };
   writeTask(task);
   record(task.id, { role: "assistant", label: "Question", text: questions.map(item => item.question).join("\n\n") });
@@ -33,7 +31,7 @@ function handleAgentInputRequest(message) {
   });
 }
 
-async function desktopTaskAction({ taskId, action, text = "", expectedTurnId, requestId, answers }) {
+async function taskAction({ taskId, action, text = "", expectedTurnId, expectedInteractionId, requestId, answers }) {
   const task = getTaskDetails(repoRoot, taskId);
   if (!task.id || task.status === "unknown") throw new Error("Task not found");
   const entry = active.get(task.id);
@@ -43,19 +41,10 @@ async function desktopTaskAction({ taskId, action, text = "", expectedTurnId, re
       const result = await getAppServer().steerTurn(entry.threadId, entry.turnId, text.trim());
       return { accepted: true, turnId: result.turnId, ...record(task.id, { role: "user", label: "Instruction", text: text.trim() }) };
     }
-    const owner = task.claim?.owner;
-    if (entry || !owner?.threadId || !owner.turnId || owner.turnId !== expectedTurnId) {
-      throw new Error("The task's active turn changed. Refresh before sending an instruction.");
-    }
-    const client = getClient();
-    const observed = await client.call("read_thread", { threadId: owner.threadId, turnLimit: 1 }, getOwnerThreadId());
-    if (observed.thread?.status?.type !== "active" || observed.turns?.[0]?.id !== owner.turnId) {
-      throw new Error("The app turn changed. Open its chat to continue.");
-    }
-    await client.call("send_message_to_thread", { threadId: owner.threadId, prompt: text.trim() }, getOwnerThreadId());
-    return { accepted: true, threadId: owner.threadId, ...record(task.id, { role: "user", label: "Instruction", text: text.trim() }) };
+    throw new Error("The task's active turn changed. Refresh before sending an instruction.");
   }
-  if (action === "reply" && task.interaction?.requestId) {
+
+  if (action === "reply" && task.interaction?.requestId && entry) {
     const pending = pendingUserInputs.get(requestId);
     if (!pending || requestId !== task.interaction.requestId || pending.taskId !== task.id ||
         pending.claimToken !== entry?.claim.token) throw new Error("This input request is no longer active. Open the task to continue.");
@@ -74,77 +63,54 @@ async function desktopTaskAction({ taskId, action, text = "", expectedTurnId, re
     return { accepted: true, ...record(task.id, { role: "user", label: "Answer",
       text: task.interaction.questions.map(q => `${q.question}\n${answers[q.id].trim()}`).join("\n\n") }) };
   }
-  if (!["open", "native", "reply"].includes(action)) throw new Error("Unsupported task action");
-  const ownerThreadId = getOwnerThreadId();
-  if (!ownerThreadId) throw new Error("Start ToDo in the Codex app to bind an owner chat");
-  let threadId = task.interaction?.nativeThreadId || task.interaction?.owner?.threadId || task.codexThread?.id;
-  const dedicated = threadId && (task.interaction?.nativeThreadId === threadId || task.codexThread?.id === threadId);
-  const client = getClient();
-  if (action === "open") {
-    if (!threadId) throw new Error("This task has no chat yet. Choose Continue in Codex to start it.");
-    if (dedicated) await client.call("set_thread_archived", { threadId, archived: false }, ownerThreadId);
-    await client.call("navigate_to_codex_page", { threadId }, ownerThreadId);
-    return { opened: true, threadId };
-  }
+  if (!["continue", "reply"].includes(action)) throw new Error("Unsupported task action");
   if (entry || task.claim) throw new Error("The task is still executing. Use Steer or wait for its current run to finish.");
-  if (!task.path) throw new Error("Reopen the completed task before starting another run");
+  if (!task.path || !existsSync(task.path)) throw new Error("Reopen the completed task before starting another run");
   if (task.existingBlockers?.length) throw new Error("The task still has active blockers");
+  if (requestId && requestId !== task.interaction?.requestId) throw new Error("This input request is no longer active. Refresh before replying.");
   if (typeof text !== "string" || text.length > 8000) throw new Error("Instruction exceeds 8000 characters");
   const answerText = task.interaction?.questions?.map(q => {
     const answer = answers?.[q.id];
     if (typeof answer !== "string" || !answer.trim() || answer.length > 8000) throw new Error(`Answer required: ${q.question}`);
     return `${q.question}\n${answer.trim()}`;
-  }).join("\n\n") || text;
-  const prompt = `Continue this ToDo task interactively in the Codex app. Use $todo:run with ${task.path}.\n` +
-    "This turn uses the interactive ToDo lifecycle: call task_run_start and task_run_finish/task_run_wait. Earlier background restrictions on ToDo tools do not apply to this interactive handoff. Use the returned worktree; the runner owns Git delivery.\n" + answerText;
-  // Check the connection and deterministic prerequisites before reserving a
-  // dispatch. A failed connection must not leave an unstartable task behind.
-  let project;
-  if (!threadId) {
-    const catalog = await client.call("list_projects", {}, ownerThreadId);
-    project = catalog.projects?.find(item => item.projectKind === "local" && path.resolve(item.path) === repoRoot);
-    if (!project) throw new Error("Save this repository as a Codex app project before starting its interactive tasks");
-  } else {
-    await client.call("set_thread_archived", { threadId, archived: false }, ownerThreadId);
-    if (dedicated) await client.call("set_thread_title", { threadId, title: formatTaskThreadTitle(repoRoot, task) }, ownerThreadId);
-  }
-  const dispatchId = randomUUID();
-  const reservation = claimTask(task.path, "desktop-dispatch");
+  }).join("\n\n") || text.trim();
+  if (action === "reply" && !answerText) throw new Error("Enter an answer (1-8000 characters)");
+  const reservation = claimTask(task.path, "task-answer");
+  let warning = {};
   try {
     const current = readTask(task.path);
-    if (current.metadata.interaction?.dispatching) throw new Error("An earlier app dispatch has an uncertain outcome. Check its chat before retrying.");
-    current.metadata.execution = { ...current.metadata.execution, mode: "interactive" };
-    current.metadata.interaction = { ...current.metadata.interaction, state: "waiting-input",
-      question: "Opening interactive execution in Codex…", dispatching: true, dispatchId, updatedAt: new Date().toISOString() };
-    writeTask(current);
-  } finally { releaseClaim(reservation); }
-  if (!threadId) {
-    // ToDo already owns the task worktree. The app session starts in the saved
-    // project and task_run_start supplies the one authoritative task checkout.
-    const created = await client.call("create_thread", {
-      title: formatTaskThreadTitle(repoRoot, task), prompt,
-      target: { type: "project", projectId: project.projectId, environment: { type: "local" } },
-    }, ownerThreadId);
-    threadId = created.threadId;
-    if (!threadId) throw new Error("Codex app setup is pending; no ready thread was returned. Inspect the app before retrying.");
-    if (existsSync(task.path)) {
-      const current = readTask(task.path);
-      current.metadata.interaction = { ...current.metadata.interaction, dispatching: false, nativeThreadId: threadId,
-        owner: current.metadata.interaction?.owner || { threadId, turnId: null } };
-      writeTask(current);
+    if (current.metadata.interaction?.dispatching) throw new Error("An earlier dispatch has an uncertain outcome. Resolve its existing execution before continuing.");
+    if ((current.metadata.interaction?.requestId && current.metadata.interaction.requestId !== requestId) ||
+        (action === "reply" && (current.metadata.interaction?.state !== "waiting-input" ||
+          !expectedInteractionId || current.metadata.interaction.updatedAt !== expectedInteractionId)) ||
+        (action === "continue" && current.metadata.interaction?.state === "waiting-input")) {
+      throw new Error("The task's question changed. Refresh before sending an answer.");
     }
-    return { accepted: true, threadId, ...record(task.id, { role: "user", label: "Instruction", text: answerText || "Continue this task" }) };
-  }
-  await client.call("send_message_to_thread", { threadId, prompt }, ownerThreadId);
-  if (existsSync(task.path)) {
-    const current = readTask(task.path);
-    current.metadata.interaction = { ...current.metadata.interaction, dispatching: false,
-      ...(dedicated ? { nativeThreadId: threadId } : {}),
-      owner: current.metadata.interaction?.owner || { threadId, turnId: null } };
+    if (current.metadata.interaction?.response && !current.metadata.error) {
+      throw new Error("An instruction is already queued for this task.");
+    }
+    current.metadata.execution = { ...current.metadata.execution, backend: "app-server", mode: "background" };
+    current.metadata.interaction = { state: "resolved", updatedAt: new Date().toISOString(),
+      response: { id: randomUUID(), text: answerText || "Continue this task",
+        question: current.metadata.interaction?.question || null } };
+    const continuation = current.metadata.pipelineContinuation;
+    if (continuation && !continuation.ready) {
+      current.metadata.pipelineContinuation = { ...continuation, resume: true };
+    }
+    if (!resumeTaskMergeRepair(repoRoot, current, { manual: true }) && current.metadata.git?.phase === "merge-failed") {
+      current.metadata.git = { ...current.metadata.git, phase: "merge-queued", mergeQueuedAt: new Date().toISOString() };
+    }
+    current.metadata.error = null;
+    // An answer continues the selected profile; it does not escalate models.
+    current.metadata.nextAttemptTrigger = "manual_retry";
     writeTask(current);
-  }
-  return { accepted: true, threadId, ...record(task.id, { role: "user", label: "Instruction", text: answerText || "Continue this task" }) };
+    warning = record(task.id, { role: "user", label: action === "reply" ? "Answer" : "Instruction",
+      text: current.metadata.interaction.response.text });
+  } finally { releaseClaim(reservation); }
+  onChange();
+  return { accepted: true, queued: true, threadId: task.codexThread?.id || null, ...warning };
 }
+
 
 
 function abandon(taskId) {
@@ -160,8 +126,8 @@ function abandon(taskId) {
         writeTask(task);
       }
     }
-    pending.reject(new Error("The execution ended before the user answered. Continue in Codex."));
+    pending.reject(new Error("The execution ended before the user answered. Answer in the dashboard to resume."));
   }
 }
-return { action: desktopTaskAction, onServerRequest: handleAgentInputRequest, abandon };
+return { action: taskAction, onServerRequest: handleAgentInputRequest, abandon };
 }

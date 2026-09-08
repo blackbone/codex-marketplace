@@ -525,9 +525,7 @@ export function buildAttemptUsageV2({
     source,
     tokenUsage: tokenUsage(stats.tokenUsage, stats.tokenUsage?.turns),
     observable: stats.observable,
-    requestStats: stats.requestStats?.available
-      ? stats.requestStats
-      : { ...REQUEST_STATS_UNAVAILABLE },
+    requestStats: stats.requestStats || { ...REQUEST_STATS_UNAVAILABLE },
   };
 }
 

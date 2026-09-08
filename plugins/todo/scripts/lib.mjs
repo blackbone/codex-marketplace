@@ -27,7 +27,6 @@ import {
   createAttemptLedger,
 } from "./attempt-ledger.mjs";
 import {
-  abortQueuedTaskRebase,
   cleanupTaskWorktree,
   commitTaskWorktree,
   continueQueuedTaskRebase,
@@ -72,6 +71,7 @@ export const DEFAULT_CONFIG = {
     delivery: DEFAULT_GIT_DELIVERY,
     targetBranch: null,
     remote: DEFAULT_GIT_REMOTE,
+    push: false,
   },
 };
 export const TASK_NAME_PATTERN =
@@ -426,18 +426,9 @@ export function loadConfig(repoRoot) {
     "workspace-write",
     "danger-full-access",
   ]);
-  const executionBackend = ["app-server", "exec"].includes(
-    raw.executionBackend,
-  )
-    ? raw.executionBackend
-    : DEFAULT_EXECUTION_BACKEND;
-  if (
-    raw.executionBackend !== undefined &&
-    raw.executionBackend !== executionBackend
-  ) {
-    warning = warning
-      ? `${warning}; executionBackend must be app-server or exec`
-      : "executionBackend must be app-server or exec";
+  const executionBackend = DEFAULT_EXECUTION_BACKEND;
+  if (raw.executionBackend !== undefined && !["app-server", "exec"].includes(raw.executionBackend)) {
+    warning = warning ? `${warning}; executionBackend must be app-server` : "executionBackend must be app-server";
   }
   const normalizedProfiles = normalizeModelProfiles(raw.models);
   if (normalizedProfiles.warning) {
@@ -522,6 +513,11 @@ export function loadConfig(repoRoot) {
     warning = warning
       ? `${warning}; git.remote is invalid`
       : "git.remote is invalid";
+    if (rawGit.push === true) readError = "git.remote is invalid; refusing to select a fallback push remote";
+  }
+  if (rawGit.push !== undefined && typeof rawGit.push !== "boolean") {
+    readError = "git.push must be a boolean";
+    warning = warning ? `${warning}; ${readError}` : readError;
   }
 
   return {
@@ -561,7 +557,7 @@ export function loadConfig(repoRoot) {
     modelProfiles: normalizedProfiles.profiles,
     defaultModelProfile,
     routingMode,
-    git: { delivery: gitDelivery, targetBranch, remote },
+    git: { delivery: gitDelivery, targetBranch, remote, push: rawGit.push === true },
     pipeline,
     warning,
     readError,
@@ -768,8 +764,11 @@ export function recoveredTaskMetrics(repoRoot, taskId, metrics) {
 
 export function canAutoRetry(config, taskStatus) {
   const ledger = taskStatus?.attemptLedger;
-  const finalizerOnly = TASK_GIT_FINALIZER_PHASES.has(taskStatus?.git?.phase);
-  const attempts = finalizerOnly
+  const repair = taskStatus?.git?.mergeConflict;
+  const finalizerOnly = TASK_GIT_FINALIZER_PHASES.has(taskStatus?.git?.phase) ||
+    (taskStatus?.git?.phase === "merge-failed" && !repair);
+  const attempts = repair ? (ledger?.attempts || []).filter(attempt =>
+    attempt.trigger === (repair.kind === "pipeline_validation" ? "merge_validation" : "merge_conflict")) : finalizerOnly
     ? ledger?.deliveryAttempts || []
     : ledger?.attempts || [];
   const last = attempts.at?.(-1);
@@ -828,7 +827,7 @@ function storedAttemptLedger(task) {
 function nextAttemptTrigger(task) {
   const attempts = storedAttemptLedger(task).attempts;
   if (attempts.length === 0) return "initial";
-  if (task.metadata.git?.phase === "merge-conflict") return "merge_conflict";
+  if (task.metadata.git?.phase === "merge-conflict") return task.metadata.git.mergeConflict?.kind === "pipeline_validation" ? "merge_validation" : "merge_conflict";
   return task.metadata.nextAttemptTrigger === "automatic_retry"
     ? "automatic_retry"
     : "manual_retry";
@@ -907,7 +906,7 @@ export function resolveTaskExecution(
     throw new Error("backend must be app-server or exec");
   }
   return {
-    backend: backend || config.executionBackend || DEFAULT_EXECUTION_BACKEND,
+    backend: "app-server", // Legacy exec snapshots migrate at the next attempt.
     modelProfile: profile.name,
     model: profile.model,
     reasoningEffort: profile.reasoningEffort,
@@ -967,23 +966,112 @@ function escalatedExecution(config, current) {
   });
 }
 
-export function prepareTaskMergeConflictRepair(repoRoot, taskPath) {
+function assertTaskClaim(taskPath, claim) {
+  const current = readClaim(`${taskPath}.lock`, { includeToken: true });
+  if (!claim?.token || current?.token !== claim.token) {
+    throw new Error("Task claim is no longer owned by this worker");
+  }
+}
+
+function mergeRepairKind(task) {
+  return task.metadata.git?.mergeConflict?.kind === "pipeline_validation" ? "validation" : "conflict";
+}
+
+function mergeRepairCount(task) {
+  const kind = mergeRepairKind(task);
+  return task.metadata.git.mergeRepairAttempts?.[kind] ?? storedAttemptLedger(task).attempts.filter(attempt =>
+    attempt.trigger === (kind === "validation" ? "merge_validation" : "merge_conflict")).length;
+}
+
+function mergeRepairLimit(repoRoot, task) {
+  const config = loadConfig(repoRoot);
+  const pipeline = task.metadata.pipeline && loadPipelineSnapshot(repoRoot, task.metadata.pipeline);
+  const kind = mergeRepairKind(task);
+  // Pipeline repair rounds bound semantic repairs; retries bound conflict repairs.
+  // Unlimited transient retries must not create an unlimited integration loop.
+  const limit = kind === "validation" && pipeline?.repair
+    ? pipeline.repair.maxRounds : 1 + Math.max(0, config.retries);
+  return limit + (task.metadata.git.mergeRepairExtra?.[kind] || 0);
+}
+
+export function resumeTaskMergeRepair(repoRoot, task, { manual = false } = {}) {
+  const git = task.metadata.git;
+  if (!git || !(git.phase === "merge-conflict" ||
+      (git.phase === "merge-failed" && (git.mergeConflict || task.metadata.error?.kind === "pipeline_validation")))) return false;
+  if (!git.mergeConflict) {
+    // Compatibility with failures written before merge validation had a repair checkpoint.
+    const directory = path.join(todoDir(repoRoot), "logs", task.id);
+    const files = existsSync(directory) ? readdirSync(directory)
+      .filter(name => name.startsWith("merge-validation-"))
+      .map(name => path.join(directory, name, "validation.json")).filter(existsSync)
+      .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs) : [];
+    let validation;
+    for (const file of files) {
+      const saved = readJson(file);
+      if (saved.headCommit !== git.headCommit) continue;
+      const gate = saved.receipts?.find(receipt => receipt.status !== "completed");
+      if (gate) { validation = { ...gate, pipelineDigest: saved.pipelineDigest, receiptPath: path.relative(repoRoot, file) }; break; }
+    }
+    git.mergeConflict = { kind: "pipeline_validation", headCommit: git.headCommit,
+      message: task.metadata.error?.message || git.deliveryError, ...(validation || {}) };
+  }
+  const kind = mergeRepairKind(task);
+  if (manual && mergeRepairCount(task) >= mergeRepairLimit(repoRoot, task)) {
+    git.mergeRepairExtra = { ...git.mergeRepairExtra, [kind]: (git.mergeRepairExtra?.[kind] || 0) + 1 };
+  }
+  git.phase = "merge-conflict";
+  task.metadata.error = null;
+  return true;
+}
+
+export function buildMergeConflictPrompt(task, worktreePath, claim) {
+  const repair = task.metadata.git?.mergeConflict || {};
+  const validation = repair.kind === "pipeline_validation";
+  return [
+    `Continue original ToDo task ${task.id} in its existing Codex thread. Do not restart its implementation or create another task.`,
+    `This is ${validation ? "merge-validation" : "merge-conflict"} repair attempt ${claim.attempt || 1}.`,
+    `Existing worktree: ${worktreePath}. Task HEAD: ${repair.currentHeadCommit || repair.headCommit || task.metadata.git.headCommit}. Target ${task.metadata.git.targetBranch} HEAD: ${repair.currentTargetCommit || repair.targetCommit || "inspect current target"}.`,
+    validation ? `The rebase completed. Fix only the integration incompatibility reported by mandatory gate ${repair.stepId || "in the saved validation log"}.` :
+      `The rebase is paused. Conflicted files: ${(repair.files || []).join(", ") || "inspect the paused rebase"}.`,
+    validation ? `Failed gate evaluated task HEAD ${repair.headCommit} against target HEAD ${repair.targetCommit || "not recorded by older runtime"}.` : "",
+    repair.command ? `Gate command: ${repair.command}; cwd: ${repair.cwd || "."}.` : "",
+    repair.message || "", repair.stdoutTail || repair.stdout || "", repair.stderrTail || repair.stderr || "",
+    repair.receiptPath ? `Full validation receipt: ${repair.receiptPath}; stdout: ${repair.stdoutPath}; stderr: ${repair.stderrPath}.` : "",
+    "Preserve the original implementation while preserving the newer target-branch functionality and contracts; review affected callers and fixtures. Do not weaken gates or disable tests.",
+    "Edit files and inspect your diff in this attempt. Do not run git add, commit, merge, cherry-pick, rebase, push, or branch commands. The merge worker owns integration and will rerun every mandatory shell gate on the current integrated HEAD before delivery.",
+    "If a user decision is required, return requiresInteractive=true and the exact question; preserve all code. Return only the JSON object required by the existing output schema.",
+    task.metadata.interaction?.response?.text ? `Continuation instruction: ${task.metadata.interaction.response.text}` : "",
+    "Original task requirements:", task.body,
+  ].filter(Boolean).join("\n\n");
+}
+
+export function prepareTaskMergeConflictRepair(repoRoot, taskPath, claim) {
+  assertTaskClaim(taskPath, claim);
   const task = readTask(taskPath);
-  if (task.metadata.git?.phase !== "merge-conflict") {
-    throw new Error(`Task is not waiting for merge repair: ${task.id}`);
+  if (task.metadata.git?.phase !== "merge-conflict") throw new Error(`Task is not waiting for merge repair: ${task.id}`);
+  const kind = mergeRepairKind(task);
+  if (mergeRepairCount(task) >= mergeRepairLimit(repoRoot, task)) {
+    const error = new Error(`Merge ${kind} repair attempts exhausted. Code and repair context retained; use task_retry or task_run_start in the original thread for one further repair.`);
+    error.kind = "merge_repair_exhausted";
+    throw error;
   }
-  if (task.metadata.git.mergeConflict?.profileEscalated !== true) {
+  if (!task.metadata.codexThread?.id) throw new Error("Merge repair requires the original persistent app-server thread");
+  const head = (cwd, ref) => {
+    const result = spawnSync("git", ["-C", cwd, "rev-parse", "--verify", ref], { encoding: "utf8" });
+    if (result.status !== 0) throw new Error(result.stderr || `Cannot inspect ${ref}`);
+    return result.stdout.trim();
+  };
+  const repair = task.metadata.git.mergeConflict;
+  repair.currentHeadCommit = head(task.metadata.git.worktreePath, "HEAD");
+  repair.currentTargetCommit = head(repoRoot, `refs/heads/${task.metadata.git.targetBranch}`);
+  if (repair.profileEscalated !== true) {
     const config = loadConfig(repoRoot);
-    const current =
-      task.metadata.execution || resolveTaskExecution(config, {});
-    task.metadata.execution = escalatedExecution(config, current);
-    task.metadata.git.mergeConflict = {
-      ...task.metadata.git.mergeConflict,
-      profileEscalated: true,
-      repairProfile: task.metadata.execution.modelProfile,
-    };
-    writeTask(task);
+    task.metadata.execution = escalatedExecution(config, task.metadata.execution || resolveTaskExecution(config, {}));
+    repair.profileEscalated = true;
+    repair.repairProfile = task.metadata.execution.modelProfile;
   }
+  if (task.metadata.codexThread.state === "archived") task.metadata.codexThread.state = "unarchive-pending";
+  writeTask(task);
   return getTaskStatus(repoRoot, task.id);
 }
 
@@ -1370,6 +1458,7 @@ export function readTask(taskPath) {
       typeof git.targetBranch !== "string" ||
       !git.targetBranch ||
       !TASK_GIT_DELIVERIES.has(git.delivery) ||
+      (git.push !== undefined && typeof git.push !== "boolean") ||
       !TASK_GIT_PHASES.has(git.phase) ||
       (git.worktreePath !== undefined &&
         typeof git.worktreePath !== "string") ||
@@ -2170,6 +2259,7 @@ export function createTask(
       typeof gitSnapshot.targetBranch !== "string" ||
       !gitSnapshot.targetBranch.trim() ||
       typeof gitSnapshot.remote !== "string" ||
+      (gitSnapshot.push !== undefined && typeof gitSnapshot.push !== "boolean") ||
       !/^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/.test(gitSnapshot.remote))
   ) {
     throw new Error("gitSnapshot is invalid");
@@ -2213,6 +2303,8 @@ export function createTask(
   const resolvedDelivery =
     delivery || gitSnapshot?.delivery || config.git.delivery;
   const remote = gitSnapshot?.remote || config.git.remote;
+  if (config.readError) throw new Error(config.readError);
+  const push = gitSnapshot?.push ?? config.git.push;
   const execution = resolveTaskExecution(config, {
     modelProfile,
     ephemeral,
@@ -2305,6 +2397,7 @@ export function createTask(
           targetBranch,
           delivery: resolvedDelivery,
           remote,
+          push,
           phase: "queued",
         },
         attemptLedger: createAttemptLedger(),
@@ -2976,6 +3069,7 @@ function ensureTaskGitMetadata(repoRoot, task) {
     targetBranch,
     delivery: config.git.delivery,
     remote: config.git.remote,
+    push: false,
     phase: "queued",
   };
   task.metadata.attemptLedger = storedAttemptLedger(task);
@@ -2992,6 +3086,8 @@ function worktreePlan(repoRoot, task) {
     targetBranch: git.targetBranch,
     delivery: git.delivery,
     branch: git.branch,
+    push: git.push ?? false,
+    remote: git.remote || DEFAULT_GIT_REMOTE,
   });
 }
 
@@ -3213,7 +3309,9 @@ export async function finalizeTaskGit(repoRoot, taskPath, usagePath = null) {
   }
 }
 
-export async function processTaskMergeQueue(repoRoot, taskPath, usagePath = null, { onChild, signal } = {}) {
+export async function processTaskMergeQueue(repoRoot, taskPath, usagePath = null, { onChild, signal, claim: ownerClaim } = {}) {
+  const claim = ownerClaim || claimTask(taskPath, "merge-queue");
+  assertTaskClaim(taskPath, claim);
   const startedAt = Date.now();
   let deliveryAttemptId = null;
   try {
@@ -3227,7 +3325,34 @@ export async function processTaskMergeQueue(repoRoot, taskPath, usagePath = null
     const result = await mergeQueuedTaskWorktree(
       plan,
       task.metadata.git.headCommit,
-      { validate: task.metadata.pipeline ? async ({ headCommit, worktreePath }) => {
+      { onDelivered: async result => {
+        const completedAt = Date.now();
+        task = readTask(taskPath);
+        task.metadata.attemptLedger = appendDeliveryAttempt(
+          storedAttemptLedger(task),
+          {
+            status: "completed",
+            attemptId: deliveryAttemptId,
+            timing: deliveryTiming(startedAt, completedAt),
+            usagePath,
+          },
+        );
+        const { deliveryAttemptId: _completedAttempt, ...completedGit } =
+          task.metadata.git;
+        task.metadata.git = {
+          ...completedGit,
+          phase: "delivered",
+          headCommit: result.headCommit,
+          deliveryResult: result,
+        };
+        delete task.metadata.git.mergeConflict;
+        task.metadata.outcome = "completed";
+        writeTask(task);
+      }, onIntegrated: ({ headCommit }) => {
+        const current = readTask(taskPath);
+        current.metadata.git.headCommit = headCommit;
+        writeTask(current);
+      }, validate: task.metadata.pipeline ? async ({ headCommit, targetCommit, worktreePath }) => {
         const pipeline = loadPipelineSnapshot(repoRoot, task.metadata.pipeline);
         const directory = path.join(todoDir(repoRoot), "logs", task.id, `merge-validation-${deliveryAttemptId}`);
         mkdirSync(directory, { recursive: true });
@@ -3239,12 +3364,14 @@ export async function processTaskMergeQueue(repoRoot, taskPath, usagePath = null
             cwd: path.resolve(worktreePath, step.cwd), timeoutSeconds: step.timeoutSeconds,
             env: { ...process.env, TODO_RUNNER_WORKER: "1", TODO_RUNNER_REPO_ROOT: repoRoot, TODO_RUNNER_TASK_FILE: taskPath },
             stdoutPath, stderrPath, onChild, signal });
-          receipts.push({ stepId: step.id, headCommit, ...receipt,
+          receipts.push({ stepId: step.id, cwd: step.cwd, headCommit, targetCommit, ...receipt,
             stdoutPath: path.relative(repoRoot, stdoutPath), stderrPath: path.relative(repoRoot, stderrPath) });
-          atomicWriteJson(path.join(directory, "validation.json"), { headCommit, pipelineDigest: pipeline.digest, receipts });
+          atomicWriteJson(path.join(directory, "validation.json"), { headCommit, targetCommit, pipelineDigest: pipeline.digest, receipts });
           if (receipt.status !== "completed") {
             const error = new Error(`Merge gate ${step.id} failed: ${receipt.error || receipt.stderrTail || receipt.stdoutTail || (receipt.timedOut ? "timeout" : receipt.exitCode)}`);
-            error.kind = "pipeline_validation";
+            error.kind = receipt.interrupted ? "interrupted" : "pipeline_validation";
+            error.details = { ...receipts.at(-1), pipelineDigest: pipeline.digest,
+              receiptPath: path.relative(repoRoot, path.join(directory, "validation.json")) };
             throw error;
           }
         }
@@ -3275,27 +3402,8 @@ export async function processTaskMergeQueue(repoRoot, taskPath, usagePath = null
       return { status: "conflict", taskId: task.id, conflict: result };
     }
 
-    const completedAt = Date.now();
     task = readTask(taskPath);
-    task.metadata.attemptLedger = appendDeliveryAttempt(
-      storedAttemptLedger(task),
-      {
-        status: "completed",
-        attemptId: deliveryAttemptId,
-        timing: deliveryTiming(startedAt, completedAt),
-        usagePath,
-      },
-    );
-    const { deliveryAttemptId: _completedAttempt, ...completedGit } =
-      task.metadata.git;
-    task.metadata.git = {
-      ...completedGit,
-      phase: "delivered",
-      headCommit: result.headCommit,
-      deliveryResult: result,
-    };
-    delete task.metadata.git.mergeConflict;
-    task.metadata.outcome = "completed";
+    task.metadata.git.deliveryResult = result;
     writeTask(task);
     return {
       status: "merged",
@@ -3307,6 +3415,11 @@ export async function processTaskMergeQueue(repoRoot, taskPath, usagePath = null
     const completedAt = Date.now();
     if (existsSync(taskPath)) {
       const task = readTask(taskPath);
+      if (task.metadata.git?.phase === "delivered") {
+        return { status: "merged", result: task.metadata.git.pendingResult,
+          delivery: { ...task.metadata.git.deliveryResult,
+            cleanupWarnings: [...(task.metadata.git.deliveryResult?.cleanupWarnings || []), error.message] }, deliveryAttemptId };
+      }
       const failure = classifyFailure({
         errorKind: error.kind || "git_delivery",
         code: error.code,
@@ -3330,6 +3443,10 @@ export async function processTaskMergeQueue(repoRoot, taskPath, usagePath = null
         ...(typeof error.details?.headCommit === "string"
           ? { headCommit: error.details.headCommit }
           : {}),
+        ...(error.kind === "pipeline_validation" ? { mergeConflict: {
+          ...error.details, kind: "pipeline_validation", message: String(error.message).slice(0, 4000),
+          detectedAt: new Date().toISOString(),
+        } } : {}),
         deliveryError: String(error.message).slice(0, 4000),
       };
       task.metadata.error = {
@@ -3339,10 +3456,20 @@ export async function processTaskMergeQueue(repoRoot, taskPath, usagePath = null
         message: String(error.message).slice(0, 4000),
       };
       task.metadata.outcome = failure.status;
+      if (error.kind === "pipeline_validation" &&
+          mergeRepairCount(task) < mergeRepairLimit(repoRoot, task)) {
+        resumeTaskMergeRepair(repoRoot, task);
+        writeTask(task);
+        return { status: "conflict", taskId: task.id, conflict: task.metadata.git.mergeConflict };
+      }
+      if (error.kind === "pipeline_validation") task.metadata.git.mergeConflict.recovery =
+        "Repair limit reached; use task_retry or task_run_start in the original thread for one further repair. Code and failed gate logs are retained.";
       writeTask(task);
       error.taskFailure = failure;
     }
     throw error;
+  } finally {
+    if (!ownerClaim) releaseClaim(claim);
   }
 }
 
@@ -3354,26 +3481,28 @@ export async function finishTaskMergeConflictRepair(
   metrics,
   usagePath = null,
 ) {
+  assertTaskClaim(taskPath, claim);
   let task = readTask(taskPath);
   if (task.metadata.git?.phase !== "merge-conflict") {
     throw new Error(`Task is not resolving a merge conflict: ${task.id}`);
   }
   const plan = worktreePlan(repoRoot, task);
   if (result.status !== "completed") {
-    await abortQueuedTaskRebase(plan);
     task = readTask(taskPath);
+    const failure = classifyFailure({ errorKind: result.requiresInteractive ? "interactive_required" : result.errorKind || "merge_logical_conflict",
+      message: result.error || result.summary, requiresInteractive: result.requiresInteractive });
     task.metadata.metrics = metrics;
     task.metadata.attemptLedger = appendClaimedAttempt(
       task,
       claim,
-      "failed_permanent",
-      "merge_logical_conflict",
+      failure.status,
+      failure.errorKind,
       metrics,
       usagePath,
     );
     task.metadata.error = {
       at: new Date().toISOString(),
-      kind: "merge_logical_conflict",
+      kind: failure.errorKind,
       exit_code: null,
       message: String(result.error || result.summary).slice(0, 4000),
     };
@@ -3382,26 +3511,26 @@ export async function finishTaskMergeConflictRepair(
       phase: "merge-failed",
       deliveryError: task.metadata.error.message,
     };
-    task.metadata.outcome = "failed_permanent";
+    task.metadata.outcome = failure.status;
+    task.metadata.git.mergeConflict.profileEscalated = false;
+    if (result.requiresInteractive) {
+      task.metadata.execution = { ...task.metadata.execution, mode: "interactive" };
+      task.metadata.interaction = { state: "waiting-input", question: result.interactiveReason || result.error || result.summary,
+        updatedAt: new Date().toISOString() };
+    }
     writeTask(task);
     return { status: "failed", error: task.metadata.error };
   }
 
-  const continued = await continueQueuedTaskRebase(plan);
-  if (continued.status === "conflict") {
-    return finishTaskMergeConflictRepair(
-      repoRoot,
-      taskPath,
-      claim,
-      {
-        status: "failed",
-        summary: "Conflict repair left unresolved rebase conflicts",
-        error: "Conflict repair left unresolved rebase conflicts",
-        validation: result.validation || [],
-      },
-      metrics,
-      usagePath,
-    );
+  let continued;
+  try {
+    continued = task.metadata.git.mergeConflict?.kind === "pipeline_validation"
+      ? await commitTaskWorktree(plan, { expectedHead: task.metadata.git.headCommit,
+          recoverCommittedHead: true, message: `todo(${task.id}): repair merge validation` })
+      : await continueQueuedTaskRebase(plan, { expectedHead: task.metadata.git.headCommit });
+  } catch (error) {
+    return finishTaskMergeConflictRepair(repoRoot, taskPath, claim,
+      { status: "failed", summary: error.message, error: error.message, errorKind: error.kind || "git_delivery" }, metrics, usagePath);
   }
   task = readTask(taskPath);
   task.metadata.metrics = metrics;
@@ -3418,11 +3547,14 @@ export async function finishTaskMergeConflictRepair(
   delete task.metadata.nextAttemptTrigger;
   task.metadata.git = {
     ...task.metadata.git,
-    phase: "merge-queued",
-    headCommit: continued.headCommit,
+    phase: continued.status === "conflict" ? "merge-conflict" : "merge-queued",
+    headCommit: continued.headCommit || task.metadata.git.headCommit,
     mergeQueuedAt: new Date().toISOString(),
   };
-  delete task.metadata.git.mergeConflict;
+  if (continued.status === "conflict") task.metadata.git.mergeConflict = continued;
+  else delete task.metadata.git.mergeConflict;
+  task.metadata.execution = { ...task.metadata.execution, mode: "background" };
+  task.metadata.interaction = { ...task.metadata.interaction, state: "resolved", response: null };
   const previous = task.metadata.git.pendingResult || {
     status: "completed",
     summary: result.summary,
@@ -3451,33 +3583,37 @@ export function retryTask(
   const taskPath = path.join(todoDir(repoRoot), filename);
   if (!existsSync(taskPath)) throw new Error(`Task does not exist: ${id}`);
   if (existsSync(`${taskPath}.lock`)) throw new Error(`Task is running: ${id}`);
-  const task = readTask(taskPath);
-  const modelWasUnavailable = task.metadata.error?.kind === "model_unavailable";
-  if (task.metadata.interaction?.state === "waiting-input") {
-    throw new Error("Task is waiting for user input. Answer in the dashboard or continue with $todo:run.");
-  }
-  task.metadata.error = null;
-  const wasMergeFailed = task.metadata.git?.phase === "merge-failed";
-  const modelRetry =
-    !wasMergeFailed && !TASK_GIT_FINALIZER_PHASES.has(task.metadata.git?.phase) &&
-    !completedPipelineContinuation(task);
-  if (wasMergeFailed) {
-    task.metadata.git = {
-      ...task.metadata.git,
-      phase: "merge-queued",
-      mergeQueuedAt: new Date().toISOString(),
-    };
-  }
-  if (modelRetry) {
-    const config = loadConfig(repoRoot);
-    const current =
-      task.metadata.execution || resolveTaskExecution(config, {});
-    task.metadata.execution = modelWasUnavailable
-      ? resolveSavedExecution({ ...config, modelCatalog: null }, current)
-      : escalatedExecution(config, current);
-    task.metadata.nextAttemptTrigger = trigger;
-  }
-  writeTask(task);
+  const reservation = claimTask(taskPath, "task-retry");
+  try {
+    const task = readTask(taskPath);
+    const modelWasUnavailable = task.metadata.error?.kind === "model_unavailable";
+    if (task.metadata.interaction?.state === "waiting-input") {
+      throw new Error("Task is waiting for user input. Answer in the dashboard or continue with $todo:run.");
+    }
+    const repair = resumeTaskMergeRepair(repoRoot, task, { manual: trigger === "manual_retry" });
+    task.metadata.error = null;
+    const wasMergeFailed = task.metadata.git?.phase === "merge-failed";
+    const modelRetry =
+      !repair && !wasMergeFailed && !TASK_GIT_FINALIZER_PHASES.has(task.metadata.git?.phase) &&
+      !completedPipelineContinuation(task);
+    if (wasMergeFailed && !repair) {
+      task.metadata.git = {
+        ...task.metadata.git,
+        phase: "merge-queued",
+        mergeQueuedAt: new Date().toISOString(),
+      };
+    }
+    if (modelRetry) {
+      const config = loadConfig(repoRoot);
+      const current =
+        task.metadata.execution || resolveTaskExecution(config, {});
+      task.metadata.execution = modelWasUnavailable
+        ? resolveSavedExecution({ ...config, modelCatalog: null }, current)
+        : escalatedExecution(config, current);
+      task.metadata.nextAttemptTrigger = trigger;
+    }
+    writeTask(task);
+  } finally { releaseClaim(reservation); }
   return getTaskStatus(repoRoot, id);
 }
 
@@ -3575,6 +3711,7 @@ export function reopenTask(repoRoot, id) {
         targetBranch,
         delivery: receipt.git?.delivery || loadConfig(repoRoot).git.delivery,
         remote: receipt.git?.remote || loadConfig(repoRoot).git.remote,
+        push: receipt.git?.push ?? false,
         phase: "queued",
       },
     },
@@ -3596,7 +3733,9 @@ export async function startInteractiveTask(repoRoot, id, { owner = null } = {}) 
         status.git?.worktreePath && existsSync(status.git.worktreePath)) {
       return {
         claimToken: saved.token, worktreePath: status.git.worktreePath,
-        expectedHead: status.git.baseCommit, deliveryOnly: TASK_GIT_FINALIZER_PHASES.has(status.git.phase),
+        ...(status.git.phase === "merge-conflict" ? { mergeRepair: { ...status.git.mergeConflict,
+          prompt: buildMergeConflictPrompt(readTask(taskPath), status.git.worktreePath, saved) } } : {}),
+        expectedHead: status.git.mergeConflict?.currentHeadCommit || status.git.baseCommit, deliveryOnly: TASK_GIT_FINALIZER_PHASES.has(status.git.phase),
         pipelineStage: status.pipelineContinuation?.stage || null,
         requiresPipelineValidation: Boolean(status.pipeline), task: getTaskDetails(repoRoot, id),
       };
@@ -3607,6 +3746,29 @@ export async function startInteractiveTask(repoRoot, id, { owner = null } = {}) 
     throw new Error(
       `Task is blocked by: ${status.existingBlockers.join(", ")}`,
     );
+  }
+  if (status.git?.phase === "merge-conflict" || (status.git?.phase === "merge-failed" &&
+      (status.git.mergeConflict || status.error?.kind === "pipeline_validation"))) {
+    if (!owner?.threadId || !owner.turnId || owner.threadId !== status.codexThread?.id) {
+      throw new Error("Merge repair must continue in the original Codex thread with executor thread and turn metadata");
+    }
+    const claim = claimTask(taskPath, "interactive", { owner });
+    try {
+      const task = readTask(taskPath);
+      if (task.metadata.interaction?.dispatching) throw new Error("An earlier execution has an uncertain outcome; resolve its owner before continuing");
+      if (!resumeTaskMergeRepair(repoRoot, task, { manual: true })) throw new Error("Task merge state changed; refresh before continuing");
+      task.metadata.interaction = { ...task.metadata.interaction, state: "running", owner, dispatching: false };
+      task.metadata.execution = { ...task.metadata.execution, mode: "interactive" };
+      writeTask(task);
+      prepareTaskMergeConflictRepair(repoRoot, taskPath, claim);
+      beginModelAttempt(taskPath, claim);
+      const current = readTask(taskPath);
+      return { claimToken: claim.token, worktreePath: current.metadata.git.worktreePath,
+        expectedHead: current.metadata.git.mergeConflict.currentHeadCommit, deliveryOnly: false,
+        mergeRepair: { ...current.metadata.git.mergeConflict,
+          prompt: buildMergeConflictPrompt(current, current.metadata.git.worktreePath, claim) },
+        pipelineStage: null, requiresPipelineValidation: true, task: getTaskDetails(repoRoot, id) };
+    } catch (error) { releaseClaim(claim); throw error; }
   }
   if (status.git?.phase?.startsWith("merge-")) {
     throw new Error(
@@ -3759,6 +3921,17 @@ export async function finishInteractiveTask(
     trigger: currentClaim.trigger,
     retryOf: currentClaim.retryOf,
   };
+  if (task.metadata.git?.phase === "merge-conflict") {
+    try {
+      await finishTaskMergeConflictRepair(repoRoot, taskPath, claim,
+        { status, summary: summary.trim(), validation, error }, metrics);
+    } catch (repairError) {
+      setTaskError(taskPath, repairError.kind || "merge_repair", null, repairError.message, metrics,
+        { claim, ...classifyFailure({ errorKind: repairError.kind, message: repairError.message }) });
+      throw repairError;
+    } finally { releaseClaim(claim); }
+    return getTaskStatus(repoRoot, id);
+  }
   if (
     task.metadata.codexThread?.id &&
     task.metadata.codexThread.state !== "archived"
@@ -3853,7 +4026,7 @@ function assertInteractiveOwner(claim, owner) {
   if (!claim.owner) return;
   if (!owner || owner.threadId !== claim.owner.threadId ||
       (claim.owner.turnId && owner.turnId !== claim.owner.turnId)) {
-    throw new Error("Interactive claim belongs to another Codex app turn");
+    throw new Error("Interactive claim belongs to another executor turn");
   }
 }
 
@@ -3901,7 +4074,7 @@ export function reconcileInteractiveClaim(repoRoot, id, observed, expectedToken)
   recordInteractivePause(task, claim);
   task.metadata.interaction = { state: "waiting-input", owner: claim.owner,
     nativeThreadId: task.metadata.interaction?.nativeThreadId || null,
-    question: "The Codex app turn ended without finishing this task. Continue in its chat or provide a new instruction.",
+    question: "The executor turn ended without finishing this task. Continue in its chat or provide a new instruction.",
     updatedAt: new Date().toISOString() };
   task.metadata.execution = { ...storedTaskExecution(repoRoot, task), mode: "interactive" };
   writeTask(task);
@@ -4048,6 +4221,12 @@ export function beginModelAttempt(taskPath, claim) {
     trigger: nextAttemptTrigger(task),
     retryOf: previous?.attemptId || null,
   };
+  if (task.metadata.git?.phase === "merge-conflict") {
+    const kind = mergeRepairKind(task);
+    task.metadata.git.mergeRepairAttempts = { ...task.metadata.git.mergeRepairAttempts,
+      [kind]: mergeRepairCount(task) + 1 };
+    writeTask(task);
+  }
   atomicWriteJson(claim.lockPath, { ...currentClaim, ...attemptFields });
   Object.assign(claim, attemptFields);
   return claim;

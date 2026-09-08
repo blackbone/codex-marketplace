@@ -1,6 +1,6 @@
 {
   "name": "docs",
-  "version": "0.1.0+codex.20260905013437",
+  "version": "0.1.0+codex.20260907134258",
   "description": "Local semantic documentation search with a shared watcher daemon, batched indexing and project-local SQLite indexes.",
   "author": {
     "name": "blackbone"

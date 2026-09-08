@@ -23,7 +23,7 @@ try {
     if (!event.turn_id || !claim.owner.turnId || event.turn_id !== claim.owner.turnId) continue;
     waitForTaskInput(root, task.id, {
       claimToken: claim.token, owner: claim.owner,
-      question: "The Codex app turn ended before finishing this task. Continue in its chat or send an instruction from the dashboard.",
+      question: "The executor turn ended before finishing this task. Continue in its chat or send an instruction from the dashboard.",
     });
   }
 } catch (error) {

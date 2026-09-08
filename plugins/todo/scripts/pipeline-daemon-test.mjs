@@ -90,14 +90,7 @@ import { createInterface } from "node:readline";
 const trace = process.env.FAKE_TRACE;
 const result = { status: "completed", summary: "fake step complete", error: null, validation: [], requiresInteractive: false, interactiveReason: null };
 const writeTrace = (value) => appendFileSync(trace, JSON.stringify(value) + "\\n");
-if (process.argv[2] === "exec") {
-  const prompt = readFileSync(0, "utf8");
-  const outputIndex = process.argv.indexOf("--output-last-message");
-  writeTrace({ mode: "exec", prompt, model: process.argv[process.argv.indexOf("--model") + 1] });
-  writeFileSync(process.argv[outputIndex + 1], JSON.stringify(result));
-  process.stdout.write(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 1 } }) + "\\n");
-  process.exit(0);
-}
+if (process.argv[2] !== "app-server") process.exit(64);
 let threadNumber = 0;
 let turnNumber = 0;
 let cumulativeInput = 0;
@@ -213,8 +206,8 @@ assert.equal(receipt.pipeline.source, "todo-pipeline.yaml");
 assert.equal(receipt.codexThread.id, "pipeline-thread-1");
 assert.equal(receipt.codexThread.state, "archived");
 assert.equal(receipt.attemptLedger.attempts.length, 2);
-assert.equal(receipt.metrics.tokenUsage.totalTokens, 180);
-assert.deepEqual(receipt.metrics.runs.map(run => run.tokenUsage.totalTokens), [65, 115]);
+assert.equal(receipt.metrics.tokenUsage.totalTokens, 200);
+assert.deepEqual(receipt.metrics.runs.map(run => run.tokenUsage.totalTokens), [50, 150]);
 assert.equal(receipt.metrics.tokenUsage.coverage, "full");
 assert.equal(receipt.attemptLedger.attempts[0].status, "failed_transient");
 assert.equal(receipt.attemptLedger.attempts[1].status, "completed");
@@ -255,8 +248,8 @@ assert.match(traceText, /PIPELINE_REPAIR/);
 assert.match(JSON.stringify(pipelineRun), /BUILD_FIXTURE_FAILURE/);
 
 const calls = traceText.trim().split("\n").map(line => JSON.parse(line));
-assert.equal(calls.find(call => call.mode === "exec").model, "current-fast");
+assert(!calls.some(call => call.mode === "exec"));
 assert.deepEqual(calls.filter(call => call.message?.method === "turn/start").map(call => call.message.params.model),
-  ["current-medium", "current-medium", "current-expert"]);
+  ["current-fast", "current-fast", "current-medium", "current-expert"]);
 console.log("todo pipeline daemon test passed");
 await import("./pipeline-continuation-test.mjs");

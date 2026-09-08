@@ -9,11 +9,11 @@
     "test:docs": "node --test plugins/docs/scripts/test.mjs plugins/docs/scripts/dashboard-test.mjs",
     "test:preflight": "node plugins/todo/scripts/preflight-test.mjs",
     "test:pipeline": "node plugins/todo/scripts/pipeline-test.mjs && node plugins/todo/scripts/pipeline-daemon-test.mjs",
-    "test:app-server": "node plugins/todo/scripts/execution-stats-test.mjs && node plugins/todo/scripts/usage-recovery-test.mjs && node plugins/todo/scripts/app-server-client-test.mjs && node plugins/todo/scripts/app-server-daemon-test.mjs",
+    "test:app-server": "node plugins/todo/scripts/execution-stats-test.mjs && node plugins/todo/scripts/usage-recovery-test.mjs && node plugins/todo/scripts/app-server-client-test.mjs && node plugins/todo/scripts/app-server-daemon-test.mjs && node --test plugins/todo/scripts/app-server-reply-test.mjs",
     "test:runtime": "node plugins/todo/scripts/runtime-update-test.mjs && node plugins/todo/scripts/merge-queue-daemon-test.mjs",
-    "test:git": "node plugins/todo/scripts/git-worktree.mjs --self-check",
+    "test:git": "node plugins/todo/scripts/git-worktree.mjs --self-check && node --test plugins/todo/scripts/git-push-test.mjs",
     "test:smoke": "node plugins/todo/scripts/smoke-test.mjs",
     "test:models": "node --test plugins/todo/scripts/model-profiles-test.mjs",
-    "test:safety": "node --test plugins/todo/scripts/runtime-safety-test.mjs plugins/todo/scripts/task-status-test.mjs plugins/todo/scripts/interactive-runtime-test.mjs"
+    "test:safety": "node --test plugins/todo/scripts/runtime-safety-test.mjs plugins/todo/scripts/task-status-test.mjs plugins/todo/scripts/interactive-runtime-test.mjs plugins/todo/scripts/merge-repair-test.mjs"
   }
 }

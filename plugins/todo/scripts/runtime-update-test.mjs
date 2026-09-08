@@ -77,7 +77,7 @@ try {
     "shell-step.mjs",
     "model-profiles.mjs",
     "app-server-client.mjs",
-    "desktop-client.mjs",
+    "execution-owner.mjs",
     "task-interaction.mjs",
     "task-chat.mjs",
     "interactive-stop.mjs",

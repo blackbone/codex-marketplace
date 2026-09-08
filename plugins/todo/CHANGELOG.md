@@ -1,5 +1,23 @@
 # Changelog
 
+## Merge validation recovery
+
+- Continue post-rebase gate failures through the original task, worktree and Codex thread, with bounded repair context and fresh mandatory checks.
+- Fence interactive repair continuation with the task claim; recover legacy validation failures through supported retry/continue actions.
+- Preserve unfinished repairs, model/delivery history and retry limits across pauses and runner restarts; reject stale target validation.
+
+## App-server dashboard replies
+
+- Remove the legacy `codex exec` runtime. Old backend settings and pipeline
+  step types use app-server on their next attempt.
+- Remove the desktop MCP adapter, native dispatch, application navigation, and
+  host automation instructions. Task session management uses app-server.
+- Persist dashboard answers and resume the existing task and paused pipeline
+  stage through the runner, including after restart and archival. Preserve
+  selected models, worktrees, required shell checks, and Git delivery ownership.
+- Reject stale or duplicate answers and retain live request/turn fencing.
+
+
 ## Unreleased - 2026-09-05
 
 - Add waiting-input state, dashboard answers/open-chat/steer controls, exact

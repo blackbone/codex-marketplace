@@ -106,12 +106,9 @@ Dependencies keep tasks blocked until their prerequisites complete. Failed tasks
 can retry automatically according to configuration or manually through
 `$todo:retry`.
 
-An optional `$todo:supervise` heartbeat keeps the queue moving across failures
-that require interactive diagnosis. It runs every 15 minutes while active task
-files exist, performs one terminal check after the queue becomes empty, then
-pauses instead of deleting itself. Creating, retrying, reopening, or starting
-work resumes the same bound heartbeat, so an idle repository has no recurring
-model runs.
+`$todo:supervise` inspects runner health and failed tasks on request. Queue
+execution and retries belong to the detached runner; no desktop host automation
+or chat binding is required.
 
 The default execution backend is one long-lived Codex `app-server` process per
 repository. Each task receives its own persistent Codex thread, and its thread
@@ -155,9 +152,9 @@ the same task body and brief and resumes from the concrete failed fact.
 | `$todo:route` | Route project changes into tasks; perform tool setup directly. |
 | `$todo:create` | Create an explicit self-contained task. |
 | `$todo:run` | Claim and execute a task in the current thread. |
-| `$todo:start` | Start the runner, bind its supervisor, and open its dashboard in the in-app Browser. |
-| `$todo:stop` | Stop the runner and pause its supervisor. |
-| `$todo:supervise` | Bind a persistent, idle-pausing heartbeat to the current chat. |
+| `$todo:start` | Start the runner and return its dashboard URL. |
+| `$todo:stop` | Stop the runner. |
+| `$todo:supervise` | Inspect runner health and failed tasks on request. |
 | `$todo:status`, `$todo:list`, `$todo:get` | Inspect tasks, workers, and results. |
 | `$todo:dashboard`, `$todo:workers` | Show the dashboard or worker state. |
 | `$todo:update`, `$todo:retry`, `$todo:reopen`, `$todo:cancel` | Manage an unclaimed or closed task. |
@@ -168,120 +165,59 @@ publication, activation, task lifecycle, interactive claims, runner control,
 artifacts, supervisor binding, status, and workers. Skills are the supported
 user-facing entry points; direct tool calls are agent internals.
 
-## Human input and native app execution
+## Human input through app-server
 
-The dashboard's **Answer** / **Chat / input** control shows the outstanding
-question in a chat popup with live agent messages and expandable tool output,
-including pipeline steps. Accepted instructions and answers persist in the local
-chat history. Polling preserves drafts, expanded tools, and scroll position; a
-changed question or turn requires reviewing the input before sending. **Logs**
-continues to show per-attempt execution evidence. The popup shows up to 300 recent
-messages from bounded local log tails (8 attempts, 16 stages per attempt, 2 MiB
-per read); older evidence remains on disk. Native app conversations still open
-separately through the conditional app adapter. `waiting-input`
-is a separate status; automatic retries do not consume unanswered questions.
-An app-server `item/tool/requestUserInput` request stays attached to its live
-turn. Dashboard replies must match its request and claim; steer must match the
-active turn. If the run ends before an answer, the task stays waiting and can
-continue in a native chat instead of pretending that the old request is live.
+The dashboard task chat shows live messages and local execution history.
+**Send answer** responds to a live `item/tool/requestUserInput` request on its
+original app-server turn. The answer must match the question and claim.
+**Steer** targets the exact active turn. Drafts, expanded tools, and scroll
+position survive polling; a changed question requires reviewing the draft.
 
-Native execution uses `$todo:run`, `task_run_start`, `task_run_wait`, and
-`task_run_finish`. The executor must supply both thread and turn metadata;
-missing ownership is an error before claiming, not a shared-MCP-PID lease.
-Repeated starts from the same prepared turn return the same claim. A different
-turn cannot finish it. `task_run_wait` persists the question and releases the
-claim. A trusted Stop hook releases only an exact matching turn; otherwise the
-runner needs a host-confirmed ended turn to recover the claim. Unknown or active
-host status never expires it. Use `$todo:run` again after answering.
+When a task is waiting after its run ended, **Send answer** saves the response
+and queues the same task for the runner. **Continue task** does the same for an
+inactive task. The runner unarchives and resumes its stored thread, then sends
+a new turn through app-server. Answers do not escalate the selected model.
+Repeated submissions and stale questions are rejected. A pipeline resumes the
+paused implementation or repair stage with the answer, then runs its required
+shell checks. An answer is never treated as a passed stage or permission to
+skip validation. The original task worktree and runner-owned Git delivery remain
+in use.
 
-Native dashboard actions and automatic dispatch of queued `runMode: interactive`
-tasks require the installed official `codex-app-tools` MCP, an inherited
-`CODEX_APP_TOOLS_PIPE_PATH`, and a host-confirmed supervisor owner. This adapter
-is conditional: an app-server process alone does not provide the Codex app's
-Browser or user-interaction capabilities. If the official MCP connection is
-unavailable (including `Codex app tools pipe closed`), dashboard app actions
-report the error and native dispatch remains unavailable. Continue from a Codex
-app chat with `$todo:run`; do not assume native access was established merely
-because a task was queued. The adapter uses the official MCP server and does not
-modify Codex's database or reproduce its private socket protocol.
+All session management uses app-server JSON-RPC. ToDo does not load a desktop
+application adapter, connect to an application pipe, navigate the application,
+or create and mutate host automations. The dashboard has no application-open
+button. Worker sessions are named and archived through app-server. An unavailable
+runtime capability remains an explicit waiting-input condition; answering does
+not grant tools, permissions, or access that the worker lacks.
 
-A connection or project-discovery failure does not reserve a dispatch. If the
-connection fails after a create/send request, its outcome is uncertain: the
-runner preserves that marker and refuses duplicate dispatch. Inspect the chat
-named `projectname [999]: taskname` and continue the original task with
-`$todo:run`; claiming it clears the marker. Native jobs use the saved project to
-start the app session and the existing ToDo worktree for implementation, so Git
-delivery remains owned by ToDo. The host retains its normal tool permissions.
-Dashboard writes require the exact loopback Host/Origin, JSON, and a custom
-request header; stale answers and turns are rejected.
+The popup reads up to 300 recent messages from bounded local log tails; full
+older evidence remains in **Logs**. Dashboard writes require the exact loopback
+Host/Origin, JSON, and a custom header. Replies retain the saved question identity
+and live turn ownership checks.
 
-Worker names follow `projectname [999]: taskname`. Task/claim changes trigger
-supervisor title updates in code. When the desktop connection is available,
-the runner also reconciles registered inactive worker chats through the app;
-archived chats are temporarily unarchived for renaming and then archived again
-without starting a turn. A missing chat does not block cleanup of later chats.
-Ordinary user discussions that execute `$todo:run` are not automatically renamed
-or archived; the runner manages only explicitly associated worker chats.
+Manual `$todo:run` execution remains available in the invoking executor. Its
+claims require the exact executor-supplied thread and turn; a different turn
+cannot finish a claim. `task_run_wait` persists a question and releases the claim.
+The Stop hook releases only an exact matching turn. No desktop transport is used.
 
 Blockers retain their existing semantics: canceling a blocker makes dependent
 tasks eligible to recheck their preconditions. This is not a tree cancellation.
 For a live preview, configure merge delivery to the working branch (for example
 `main`); Vite, backend watchers, or the Unity editor own rebuild/restart.
 
-## Supervisor lifecycle
+## Runner lifecycle
 
-Invoke `$todo:start` in the project chat that should own recovery. In addition
-to starting the runner, every invocation replaces any previously bound
-heartbeat with one 15-minute heartbeat owned by the current chat. An empty
-queue creates it paused; active work creates it active. The host automation ID
-and non-secret definition, including the host-confirmed `targetThreadId`, are
-stored in ignored `.todo/supervisor.json` only after the host confirms
-creation. Every later pause or resume passes that exact target explicitly, so
-task creation in another chat cannot take ownership. Legacy bindings without a
-target require `$todo:start` in the intended owner chat instead of guessing.
-`$todo:supervise` can also configure or
-synchronize the heartbeat directly. Scheduled runs leave healthy work alone.
-For a failed task, the supervisor claims the original task and delegates
-bounded diagnosis or repair to one subagent inside that existing task worktree
-without creating a helper ToDo task.
+`$todo:start` starts the detached runner and returns its current dashboard URL.
+`$todo:stop` leaves active tasks alone unless interruption is explicitly requested.
+`$todo:supervise` performs a single health and failure inspection; it does not
+schedule host heartbeats. Existing legacy supervisor metadata is retained for
+compatibility, and any already-bound title is updated only through app-server.
+The plugin does not change previously configured host automations.
 
-While the runner is active, its shared Codex app-server connection keeps the
-bound supervisor thread named `-> ToDo (Nr / Mq / Sf)`. `r` counts running
-tasks, `q` combines queued, blocked, staging, merge-queued, and merge-conflict
-tasks, and `f` counts failed tasks. A nonzero `w` counts tasks waiting for input.
-Title changes do not wait for the 15-minute supervisor heartbeat. The daemon reacts to task and claim file changes as well as scheduling passes,
-sends `thread/name/set` only when the target or title
-changes, and needs no model turn or worker slot. Rename failures are non-fatal,
-visible in runner state and logs, and retried with a short backoff. Without a
-persisted `targetThreadId`, title synchronization stays unbound until
-`$todo:start` rebinds the owner thread.
-
-The host scheduler exposes recurring active and paused states, not a repository
-event trigger. The heartbeat therefore makes one final run to observe that the
-queue became empty and pause itself. Later task publication, retry, or reopen
-resumes the same binding. A later `$todo:start` intentionally moves ownership
-to its invoking chat by deleting the exact old heartbeat before creating and
-binding the replacement. `$todo:stop` pauses it. Disabling the supervisor
-deletes the exact host automation first and clears the local binding only after
-confirmed deletion.
-
-Supervisor automation requires the Codex desktop host. Core queue execution and
-transient retry remain independent of it, and a failure to resume the heartbeat
-is reported separately from successful task publication.
-
-App-server worker threads are archived after every attempt. Interactive recovery
-marks any retained background worker thread `archive-pending` before closing or
-failing the claim, and the daemon reconciles every non-archived closed receipt,
-including legacy receipts incorrectly left `active`.
-
-`$todo:start` resolves and persists the host-confirmed owner thread before
-starting the dashboard. In the default random-port mode, the successfully bound
-port is saved per thread under ignored `.todo` state and reused on later starts.
-If that port is occupied, the daemon binds and saves a new free port. Fresh
-startup status then supplies the exact URL that `$todo:start` opens again in a
-new in-app Browser tab. It does not guess a port, reuse stale status, substitute
-Chrome, or inspect the dashboard unless requested. Browser opening, runner
-startup, and supervisor binding are reported as separate outcomes.
+Worker threads are archived after an attempt and unarchived before resuming.
+Closed-task archive reconciliation and task names use the same app-server
+connection as execution. Runtime updates drain active tasks before replacing
+the runner, preserving task worktrees, logs, and waiting questions.
 
 ## Git execution
 
@@ -295,9 +231,28 @@ Delivery is selected per task, with the repository default used when omitted:
 
 | Mode | Result |
 | --- | --- |
-| `keep` | Remove the clean worktree and keep the committed task branch; remove a no-change branch. |
+| `keep` | Remove the clean worktree and keep the committed task branch; remove a no-change branch unless `git.push` is enabled. |
 | `merge` | Commit and preserve the branch like `keep`, enqueue it for the singleton local merge worker, rebase it onto the latest target, then fast-forward and remove the task branch. |
 | `pr` | Push the branch and create a pull request with `gh`; this mode must be explicitly requested. |
+
+`git.push` controls remote publication independently of `keep` / `merge`:
+
+| Setting | `keep` | `merge` |
+| --- | --- | --- |
+| `false` (default) | Keep the result locally. | Update the local target branch. |
+| `true` | Push the task branch to `git.remote`. | Push the target branch to `git.remote` after successful validation and fast-forward. |
+
+Push uses an explicit commit and branch ref without force or automatic tag
+publication. Pushing a target branch also publishes its earlier local commits.
+The setting and remote are captured at task creation; configuration changes
+affect new tasks. Existing tasks without the setting retain local delivery,
+including retries and reopening. `pr` still requires a push regardless of this
+setting. With `git.push: true`, delivery completes only after Git accepts the
+push. A failed push preserves the local commit, task branch and worktree; fix
+remote access or divergence, then use `task_retry` to resume delivery without
+another model attempt. A merge that already succeeded locally is not rolled
+back. Preflight checks that the push remote is configured; it does not prove
+remote write access.
 
 The preflight checks the exact requested mode, including a clean checked-out
 merge target or GitHub remote and authentication for a pull request. A Git
@@ -325,19 +280,36 @@ blockers, earlier batch sibling, busy merge worker, or claim failure), only when
 the waiting state changes. A request addressed to the current daemon still
 blocks new claims while active work drains.
 
-A textual rebase conflict moves the task to `merge-conflict` without blocking
-other queued branches. ToDo unarchives the task's original persistent Codex
-thread, raises it by one configured model tier, and starts one out-of-quota
-merge-repair turn in the paused rebase worktree. The repair must preserve both
-the task functionality and newer target contracts, run focused verification,
-and leave Git continuation to the runner. A successful repair re-enters the
-queue and must pass a fresh rebase before fast-forward. For pipeline tasks, every
-snapshotted shell gate runs again against that final rebased commit under the
-merge lock. Failure or tracked-file changes block delivery, retain the worktree,
-and save receipts under `.todo/logs/<task>/merge-validation-*`. Retrying a failed
-merge reruns these gates; previous validation cannot authorize a new commit. A reported logical
-conflict becomes `merge_logical_conflict`, leaves the queue, and retains its
-recoverable branch and error evidence.
+Textual rebase conflicts and mandatory gate failures after a clean or repaired
+rebase use the same `merge-conflict` repair lifecycle. ToDo resumes the original
+persistent Codex thread, existing task branch and worktree; it never reruns the
+initial implementation. The bounded prompt includes original requirements, the
+failed gate and command, task/target HEAD, log excerpts and receipt paths under
+`.todo/logs/<task>/merge-validation-*`. Each repair raises the configured model
+tier and records a separate `merge_conflict` or `merge_validation` model attempt;
+completed implementation attempts remain immutable.
+
+The task claim remains exclusive across the merge worker, repair worker and
+interactive execution. `task_run_start` can resume a stopped repair only in the
+original Codex thread and returns `mergeRepair`; `task_run_finish` hands the result
+back to the queue. Dashboard continuation and `task_retry` also recover existing
+`merge-failed` / `pipeline_validation` tasks without editing runtime files.
+The queue commits repairs or continues the paused rebase, rebases against current
+main and reruns every snapshotted shell gate. Receipts cannot authorize a changed
+HEAD or target; a target change during validation stops delivery until a fresh
+rebase and validation. Model success alone never marks delivery complete.
+
+Semantic repairs use the pipeline's `repair.maxRounds` when configured;
+otherwise they allow one repair plus `retries`. Conflict repairs allow one plus
+`retries`. Unlimited transient retries (`-1`) do not remove these integration
+bounds (one repair without an explicit pipeline limit). Counts persist across
+runner restarts and target changes. At exhaustion, code, the exact error and
+repair context remain available. An explicit `task_retry`, dashboard continuation
+or `task_run_start` grants one additional repair if needed, without resetting
+counts or history. Delivery is checkpointed before branch/worktree cleanup, so a
+runner crash resumes completion without another delivery attempt. Failed or
+interrupted repairs retain all work, including a
+paused rebase; the runner does not abort it and discard the executor's changes.
 
 ## Configuration
 
@@ -359,7 +331,8 @@ The default `.todo/config.json` is:
   "git": {
     "delivery": "keep",
     "targetBranch": null,
-    "remote": "origin"
+    "remote": "origin",
+    "push": false
   }
 }
 ```
@@ -387,8 +360,8 @@ the escalation policy above. Active attempts keep the model selected at start.
 `dashboardPort: 0` selects a free local port and keeps the successful port for
 each host-confirmed Codex thread. An occupied reservation is atomically replaced
 after a new listener succeeds. `retries` is a non-negative integer or `-1` for
-unlimited retries. `executionBackend` defaults to `app-server`;
-`exec` is retained as an explicit legacy fallback. `git.delivery` accepts
+unlimited retries. `executionBackend` uses `app-server`;
+legacy `exec` settings are migrated to app-server when the next attempt starts. `git.delivery` accepts
 `keep` or `merge`; pull
 requests are an explicit per-task choice. `git.targetBranch: null` resolves to the
 branch active at preflight, and `git.remote` defaults to `origin`. The daemon
@@ -460,9 +433,9 @@ silently falling back. Only an absent `pipeline` section selects the legacy
 lifecycle.
 
 The v1 format is deliberately linear. `codex-exec` and `codex-thread` agent
-steps must come before all `shell` gates. `codex-exec` starts an independent
-structured Codex execution; `codex-thread` creates or continues the task's
-persistent app-server thread. Both accept an optional `modelProfile` and a
+steps must come before all `shell` gates. `codex-thread` creates or continues the task's
+persistent app-server thread. Legacy `codex-exec` steps now use that same
+app-server transport without changing the stored pipeline snapshot. Both accept an optional `modelProfile` and a
 required `prompt`. Omitting `modelProfile` uses the task's profile. Model IDs and
 reasoning levels are resolved from current profiles at attempt start, including
 for old pipeline snapshots; pipeline commands and prompts remain immutable.
@@ -615,12 +588,6 @@ or invalid configuration reports `update-blocked` instead of interrupting work.
 - The local dashboard can expose repository context, prompts, logs, and errors.
 - Do not commit `.todo/` runtime state or place secrets in task descriptions.
 - Stopping the runner does not interrupt active tasks unless explicitly forced.
-- A configured supervisor needs one terminal scheduled run to observe an empty
-  queue before it can pause; it performs no recurring runs after that pause.
-- `$todo:start` cannot move supervision to its current chat if deletion of the
-  previously bound host heartbeat fails; runner startup is reported separately.
-- Existing supervisor bindings created before `targetThreadId` persistence must
-  be rebound once with `$todo:start`; lifecycle actions refuse to guess a chat.
 - The runner leaves the last synchronized `-> ToDo (...)` title in place after
   it stops; it cannot publish later task-state changes while it is offline.
 - Opening the dashboard from `$todo:start` requires the bundled in-app Browser;
@@ -636,8 +603,7 @@ or invalid configuration reports `update-blocked` instead of interrupting work.
 - Worker-created follow-up tasks require explicit user authorization on the
   claimed parent; audits, findings, or complexity never imply that permission.
 - Merge-conflict repair reuses the original persistent app-server thread when it
-  exists. With the legacy `exec` backend, the runner falls back to a one-shot
-  repair turn in the paused rebase worktree instead of inventing a new thread.
+  exists, including tasks created with legacy `exec` settings.
 - A running daemon or queued task does not prove that implementation succeeded;
   inspect the task result and validation receipt.
 

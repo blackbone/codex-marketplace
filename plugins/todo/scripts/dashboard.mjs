@@ -1284,7 +1284,7 @@ const DASHBOARD_SCRIPT = `(() => {
   function inputKey(task) {
     return task.status === "waiting-input"
       ? "reply:" + (task.interaction?.requestId || JSON.stringify(task.interaction?.questions || task.interaction?.question))
-      : task.status + ":" + (task.claim?.owner?.turnId || task.codexThread?.lastTurnId || "");
+      : task.status + ":" + (task.interaction?.updatedAt || "") + ":" + (task.claim?.owner?.turnId || task.codexThread?.lastTurnId || "");
   }
   function bindInput(task) {
     inputBinding = task;
@@ -1317,9 +1317,8 @@ const DASHBOARD_SCRIPT = `(() => {
     question.hidden = !question.textContent || !stale && inputTask.status === "waiting-input" && Boolean(inputTask.interaction?.questions?.length);
     document.querySelector("#input-refresh").hidden = !stale;
     const send = document.querySelector("#input-send");
-    send.textContent = inputTask.status === "waiting-input" ? "Send answer" : inputTask.status === "running" ? "Steer" : "Continue in Codex";
+    send.textContent = inputTask.status === "waiting-input" ? "Send answer" : inputTask.status === "running" ? "Steer" : "Continue task";
     send.disabled = inputSending || stale || !latest;
-    document.querySelector("#input-open").disabled = inputSending;
   }
   function renderChat(payload) {
     const follow = chatContent.scrollHeight - chatContent.scrollTop - chatContent.clientHeight < 80;
@@ -1346,7 +1345,7 @@ const DASHBOARD_SCRIPT = `(() => {
     if (!payload.messages.length) {
       const empty = document.createElement("p");
       empty.dataset.messageId = "empty";
-      empty.textContent = "No local execution messages yet. Codex app conversations are opened separately.";
+      empty.textContent = "No local execution messages yet. Messages appear when the runner starts the task.";
       chatContent.append(empty);
     }
     chatStatus.textContent = payload.truncated ? "Live · recent messages; full history in Logs" : "Live · 1s";
@@ -1393,12 +1392,13 @@ const DASHBOARD_SCRIPT = `(() => {
         method: "POST", headers: { "Content-Type": "application/json", "X-ToDo-Action": "1" },
         body: JSON.stringify({ taskId: task.id, action, text: answers.prompt || "", answers,
           requestId: task.interaction?.requestId,
+          expectedInteractionId: task.interaction?.updatedAt,
           expectedTurnId: task.claim?.owner?.turnId || task.codexThread?.lastTurnId }),
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Action failed");
       if (generation !== chatGeneration) return;
-      inputStatus.textContent = result.warning || (result.opened ? "Opened in Codex" : "Accepted");
+      inputStatus.textContent = result.warning || (result.queued ? "Queued to continue" : "Accepted");
       if (result.accepted) for (const field of fields) {
         if (field.value === answers[field.dataset.questionId]) field.value = "";
       }
@@ -1420,9 +1420,8 @@ const DASHBOARD_SCRIPT = `(() => {
     syncTaskInput();
   });
   document.querySelector("#input-logs").addEventListener("click", () => openLogs(inputTask.id));
-  document.querySelector("#input-open").addEventListener("click", () => sendTaskAction("open"));
   document.querySelector("#input-send").addEventListener("click", () => sendTaskAction(
-    inputBinding?.status === "waiting-input" ? "reply" : inputBinding?.status === "running" ? "steer" : "native"));
+    inputBinding?.status === "waiting-input" ? "reply" : inputBinding?.status === "running" ? "steer" : "continue"));
   document.addEventListener("click", (event) => {
     const control = event.target.closest("button[data-control-task]");
     if (control) { openTaskInput(control.dataset.controlTask); return; }
@@ -1881,7 +1880,6 @@ function renderDashboard(repoRoot, requestUrl) {
     <div id="input-actions">
       <button type="button" id="input-refresh" hidden>Review current input</button>
       <button type="button" id="input-logs">Logs</button>
-      <button type="button" id="input-open">Open chat in Codex</button>
       <button type="button" id="input-send">Send</button>
       <form method="dialog"><button type="submit">Close</button></form>
     </div>

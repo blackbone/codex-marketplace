@@ -14,6 +14,7 @@ const MODEL_TRIGGERS = new Set([
   "automatic_retry",
   "manual_retry",
   "merge_conflict",
+  "merge_validation",
 ]);
 const STATUS_SET = new Set(ATTEMPT_STATUSES);
 const TRANSIENT_KINDS = new Set([
@@ -230,10 +231,10 @@ export function appendModelAttempt(ledger, input) {
     throw new TypeError("only the first model attempt may use initial trigger");
   }
   const previous = attempts.at(-1) || null;
-  if (previous?.status === "completed" && trigger !== "merge_conflict") {
+  if (previous?.status === "completed" && !["merge_conflict", "merge_validation"].includes(trigger)) {
     throw new Error("cannot retry a completed model attempt");
   }
-  if (trigger === "merge_conflict" && attempts.length === 0) {
+  if (["merge_conflict", "merge_validation"].includes(trigger) && attempts.length === 0) {
     throw new Error("merge conflict repair requires a completed implementation attempt");
   }
   if (trigger === "automatic_retry" && previous?.status !== "failed_transient") {

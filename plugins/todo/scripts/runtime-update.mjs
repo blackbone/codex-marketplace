@@ -34,7 +34,7 @@ const REQUIRED_RUNTIME_FILES = [
     "scripts/shell-step.mjs",
     "scripts/model-profiles.mjs",
     "scripts/app-server-client.mjs",
-    "scripts/desktop-client.mjs",
+    "scripts/execution-owner.mjs",
     "scripts/task-interaction.mjs",
     "scripts/task-chat.mjs",
     "scripts/interactive-stop.mjs",

@@ -9,7 +9,7 @@ import { claimTask, cleanupStaleClaims, createTask, finishInteractiveTask, forma
   getTaskStatus, initializeRepo, readTask, reconcileInteractiveClaim, releaseClaim,
   startInteractiveTask, waitForTaskInput, writeTask } from "./lib.mjs";
 import { createTaskInteraction } from "./task-interaction.mjs";
-import { DesktopClient, executionOwner } from "./desktop-client.mjs";
+import { executionOwner } from "./execution-owner.mjs";
 import { AppServerClient } from "./app-server-client.mjs";
 import { runPipeline } from "./pipeline.mjs";
 import { startDashboard } from "./dashboard.mjs";
@@ -36,7 +36,7 @@ test("interactive claims belong to an exact app turn and recover only after its 
   assert.equal((await startInteractiveTask(root, task.id, { owner })).claimToken, run.claimToken);
   assert.equal(formatTaskThreadTitle(root, task), `${path.basename(root)} [001]: Native lifecycle`);
   await assert.rejects(finishInteractiveTask(root, task.id, { ...completed, claimToken: run.claimToken,
-    owner: { ...owner, turnId: "other" } }), /another Codex app turn/);
+    owner: { ...owner, turnId: "other" } }), /another executor turn/);
   const claimFile = `${task.path}.lock`;
   const lock = JSON.parse(readFileSync(claimFile));
   writeFileSync(claimFile, JSON.stringify({ ...lock, pid: 99999999 }));
@@ -103,28 +103,44 @@ test("a live input answer is fenced by request and claim; steering is fenced by 
   assert.equal(getTaskStatus(root, task.id).interaction.requestId, undefined);
 });
 
-test("desktop precondition failures do not reserve tasks; ambiguous dispatches are never duplicated", async t => {
+test("durable answers queue the existing task without desktop dispatch or model escalation", async t => {
   const root = fixture(t);
-  const task = createTask(root, { title: "App dispatch", description: "Use native tools", runMode: "interactive" });
-  let available = false;
-  const calls = [];
-  const control = createTaskInteraction({ repoRoot: root, active: new Map(), getOwnerThreadId: () => "supervisor",
-    getClient: () => ({ call: async (name, args) => {
-      calls.push({ name, args });
-      if (!available) throw new Error("pipe closed");
-      if (name === "list_projects") return { projects: [{ projectKind: "local", path: root, projectId: "project" }] };
-      if (name === "create_thread") throw new Error("connection lost after sending");
-      throw new Error("unexpected call");
-    } }),
-  });
-  await assert.rejects(control.action({ taskId: task.id, action: "native" }), /pipe closed/);
+  const task = createTask(root, { title: "Resume a paused task", description: "Keep context" });
+  const saved = readTask(task.path);
+  const execution = { ...saved.metadata.execution };
+  saved.metadata.interaction = { state: "waiting-input", question: "Retry?", updatedAt: "question-1" };
+  saved.metadata.error = { kind: "interactive_required", message: "Retry?", at: new Date().toISOString(), exit_code: null };
+  saved.metadata.codexThread = { id: "existing", state: "archived", createdAt: new Date().toISOString() };
+  writeTask(saved);
+  const control = createTaskInteraction({ repoRoot: root, active: new Map() });
+  await assert.rejects(control.action({ taskId: task.id, action: "reply", text: "Yes", expectedInteractionId: "old" }), /question changed/);
+  await assert.rejects(control.action({ taskId: task.id, action: "reply", text: "", expectedInteractionId: "question-1" }), /Enter an answer/);
+  assert.equal(getTaskStatus(root, task.id).status, "waiting-input");
+  const result = await control.action({ taskId: task.id, action: "reply", text: "try again", expectedInteractionId: "question-1" });
+  assert.equal(result.queued, true);
+  assert.equal(result.threadId, "existing");
+  const resumed = getTaskStatus(root, task.id);
+  assert.equal(resumed.status, "queued");
+  assert.equal(resumed.execution.modelProfile, execution.modelProfile);
+  assert.equal(resumed.execution.backend, "app-server");
+  assert.equal(resumed.interaction.response.text, "try again");
+  assert.deepEqual(readTaskChat(root, task.id).messages.filter(m => m.role === "user").map(m => m.text), ["try again"]);
+  await assert.rejects(control.action({ taskId: task.id, action: "reply", text: "duplicate", expectedInteractionId: "question-1" }), /question changed/);
+  await assert.rejects(control.action({ taskId: task.id, action: "continue", text: "duplicate" }), /already queued/);
+  for (const action of ["open", "native"]) await assert.rejects(control.action({ taskId: task.id, action }), /Unsupported/);
+});
+
+test("an orphaned live question can resume after the runner loses its process", async t => {
+  const root = fixture(t);
+  const task = createTask(root, {title: "Recovered question", description: "Answer after restart"});
+  const saved = readTask(task.path);
+  saved.metadata.interaction = {state: "waiting-input", requestId: "orphan", updatedAt: "question-1",
+    questions: [{id: "confirm", question: "Continue?"}]};
+  writeTask(saved);
+  const control = createTaskInteraction({repoRoot: root, active: new Map()});
+  await control.action({taskId: task.id, action: "reply", requestId: "orphan", expectedInteractionId: "question-1", answers: {confirm: "Yes"}});
   assert.equal(getTaskStatus(root, task.id).status, "queued");
-  assert.equal(getTaskStatus(root, task.id).claim, null);
-  available = true;
-  await assert.rejects(control.action({ taskId: task.id, action: "native" }), /connection lost/);
-  assert.equal(getTaskStatus(root, task.id).interaction.dispatching, true);
-  await assert.rejects(control.action({ taskId: task.id, action: "native" }), /uncertain outcome/);
-  assert.equal(calls.filter(c => c.name === "create_thread").length, 1);
+  assert.equal(getTaskStatus(root, task.id).interaction.response.text, "Continue?\nYes");
 });
 
 test("interactive pipeline checkpoints resume their stage and preserve mandatory gates", async () => {
@@ -133,6 +149,16 @@ test("interactive pipeline checkpoints resume their stage and preserve mandatory
   const blocked = { status: "failed", requiresInteractive: true, interactiveReason: "Browser required" };
   const paused = await runPipeline(pipeline, { runCodex: async s => s.id === "implement" ? blocked : completed });
   assert.equal(paused.continuation.stage.id, "implement");
+  const answeredStages = [];
+  const answered = await runPipeline(pipeline, {
+    runCodex: async step => { answeredStages.push(step.id); return completed; },
+    runShell: async step => { answeredStages.push(step.id); return completed; },
+  }, { ...paused.continuation, resume: true });
+  assert.equal(answered.status, "completed");
+  assert.deepEqual(answeredStages, ["implement", "build", "test"]);
+  const asksAgain = await runPipeline(pipeline, { runCodex: async () => blocked }, { ...paused.continuation, resume: true });
+  assert.equal(asksAgain.status, "failed");
+  assert.equal(asksAgain.continuation.stage.id, "implement");
   const events = [];
   const resumed = await runPipeline(pipeline, { runCodex: async s => { events.push(s.id); return completed; },
     runShell: async s => { events.push(s.id); return completed; } }, { ...paused.continuation, ready: true, result: completed });
@@ -141,25 +167,18 @@ test("interactive pipeline checkpoints resume their stage and preserve mandatory
   const repair = await runPipeline(pipeline, { runCodex: async s => s.id === "repair" ? blocked : completed,
     runShell: async () => ({ status: "failed", error: "build failed" }) });
   assert.equal(repair.continuation.stage.id, "repair");
+  const repairedStages = [];
+  const repaired = await runPipeline(pipeline, {
+    runCodex: async step => { repairedStages.push(step.id); return completed; },
+    runShell: async step => { repairedStages.push(step.id); return completed; },
+  }, { ...repair.continuation, resume: true });
+  assert.equal(repaired.status, "completed");
+  assert.deepEqual(repairedStages, ["repair", "build", "test"]);
   const failed = await runPipeline(pipeline, { runShell: async () => ({ status: "failed", error: "still failing" }) },
     { ...repair.continuation, ready: true, result: completed });
   assert.equal(failed.status, "failed");
   assert.equal(failed.failedStep.id, "build");
   await assert.rejects(runPipeline(pipeline, {}, { ...paused.continuation, ready: false }), /Invalid interactive/);
-});
-
-test("continuing in a user's discussion does not turn it into a disposable worker chat", async t => {
-  const root = fixture(t);
-  const task = createTask(root, { title: "Discuss in my chat", description: "Keep the discussion", runMode: "interactive" });
-  const run = await startInteractiveTask(root, task.id, { owner });
-  waitForTaskInput(root, task.id, { claimToken: run.claimToken, owner, question: "Which option?" });
-  const calls = [];
-  const control = createTaskInteraction({ repoRoot: root, active: new Map(), getOwnerThreadId: () => "supervisor",
-    getClient: () => ({ call: async (name, args) => { calls.push({ name, args }); return {}; } }) });
-  await control.action({ taskId: task.id, action: "reply", text: "Option A" });
-  assert.deepEqual(calls.map(c => c.name), ["set_thread_archived", "send_message_to_thread"]);
-  assert.equal(calls[0].args.archived, false);
-  assert.equal(getTaskStatus(root, task.id).interaction.nativeThreadId, null);
 });
 
 test("dashboard accepts actions only from its own origin and rejects oversized input", async t => {
@@ -220,21 +239,7 @@ test("chat reads pipeline stages with a bounded tail and rejects linked log path
   assert.equal(readFileSync(outside, "utf8"), "PRIVATE");
 });
 
-test("desktop adapter speaks standard MCP and passes executor ownership", async t => {
-  const root = fixture(t);
-  const serverPath = path.join(root, "fake-mcp.mjs");
-  writeFileSync(serverPath, `import { createInterface } from "node:readline";
-for await (const line of createInterface({ input: process.stdin })) {
- const m = JSON.parse(line); if (!m.id) continue;
- let result = {};
- if (m.method === "tools/list") result = { tools: [{ name: "read_thread" }] };
- if (m.method === "tools/call") result = { content: [{ type: "text", text: JSON.stringify({ owner: m.params._meta["openai/threadId"], thread: m.params.arguments.threadId }) }] };
- process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result }) + "\\n");
-}`);
-  const client = new DesktopClient({ serverPath, env: { ...process.env, CODEX_APP_TOOLS_PIPE_PATH: "fake" } });
-  t.after(() => client.close());
-  assert.deepEqual(await client.call("read_thread", { threadId: "child" }, "owner"), { owner: "owner", thread: "child" });
-  await assert.rejects(client.call("unknown", {}, "owner"), /unavailable/);
+test("executor ownership is parsed without any desktop transport", () => {
   assert.deepEqual(executionOwner({ "x-codex-turn-metadata": JSON.stringify({ thread_id: "t", turn_id: "r" }) }, {}), { threadId: "t", turnId: "r" });
   assert.equal(executionOwner({}, {}), null);
 });

@@ -1,5 +1,5 @@
 import { refreshModelCatalog, modelProfilePlan, applyModelProfilePlan } from "./model-profiles.mjs";
-import { executionOwner } from "./desktop-client.mjs";
+import { executionOwner } from "./execution-owner.mjs";
 import { TODO_ROUTING_POLICY, TOOLING_OPERATION_POLICY, WORKER_TOOLING_BOUNDARY } from "./routing-policy.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -612,7 +612,7 @@ const tools = [
   {
     name: "task_retry",
     description:
-      "Clear a failed task error so the background runner can retry it.",
+      "Retry a failed task. Merge validation failures resume bounded repair in the original task and thread; an explicit retry after repair exhaustion permits one additional repair.",
     inputSchema: {
       type: "object",
       properties: {
@@ -654,7 +654,7 @@ const tools = [
   {
     name: "task_run_start",
     description:
-      "Claim a queued or failed ToDo task for direct execution in the current interactive Codex thread. This prevents the background daemon from running the same task.",
+      "Claim a queued or failed ToDo task for direct execution in the current interactive Codex thread. This prevents concurrent execution. A stopped merge repair may be claimed only in its original Codex thread; use the returned mergeRepair prompt and preserve implementation.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1207,7 +1207,7 @@ function preflightPath(repoRoot, id) {
   return path.join(todoDir(repoRoot), "preflight", `${id}.json`);
 }
 
-function requiredLocalChecks(deliveries) {
+function requiredLocalChecks(deliveries, push = false) {
   const checks = [
     "config",
     "runtime",
@@ -1219,6 +1219,7 @@ function requiredLocalChecks(deliveries) {
   ];
   if (deliveries.includes("merge")) checks.push("git-merge-target");
   if (deliveries.includes("pr")) checks.push("github-pr");
+  if (push && deliveries.some(delivery => delivery !== "pr")) checks.push("git-push-remote");
   return checks;
 }
 
@@ -1313,9 +1314,7 @@ async function taskPreflight(repoRoot, args) {
         run: () =>
           commandCheck(
             config.codexCommand,
-            config.executionBackend === "app-server"
-              ? ["app-server", "--help"]
-              : ["--version"],
+            ["app-server", "--help"],
             repoRoot,
           ),
       },
@@ -1385,6 +1384,19 @@ async function taskPreflight(repoRoot, args) {
         },
       },
       {
+        name: "git-push-remote",
+        required: config.git.push && deliveries.some(delivery => delivery !== "pr"),
+        run: () => {
+          // Check configuration only. Do not expose URLs (which can contain
+          // credentials), contact the remote or claim write access is proven.
+          const result = spawnSync("git", ["remote", "get-url", "--push", config.git.remote],
+            { cwd: repoRoot, encoding: "utf8", timeout: 10000 });
+          return result.status === 0
+            ? { status: "ok", summary: "push remote is configured; write access is checked at delivery" }
+            : { status: "failed", summary: "push remote is not configured" };
+        },
+      },
+      {
         name: "github-pr",
         required: deliveries.includes("pr"),
         run: () => {
@@ -1443,7 +1455,7 @@ function validatedPreflight(
     repoRoot,
     config: preflightBindingConfig(config, targetBranch),
     requiredCapabilities: args.requiredCapabilities || [],
-    requiredLocalChecks: requiredLocalChecks(deliveries),
+    requiredLocalChecks: requiredLocalChecks(deliveries, config.git.push),
   });
   return {
     receipt,
@@ -1451,6 +1463,7 @@ function validatedPreflight(
       delivery: config.git.delivery,
       targetBranch,
       remote: config.git.remote,
+      push: config.git.push,
     },
   };
 }
@@ -1593,7 +1606,7 @@ async function callTool(name, args = {}, metadata = {}) {
       // A shared MCP process's environment identifies its initial session,
       // not necessarily this caller. Require executor-provided ownership.
       const owner = executionOwner(metadata, {});
-      if (!owner?.threadId || !owner.turnId) throw new Error("Interactive execution requires thread and turn metadata from the Codex app executor. No task was claimed.");
+      if (!owner?.threadId || !owner.turnId) throw new Error("Interactive execution requires thread and turn metadata from the executor. No task was claimed.");
       return startInteractiveTask(activatedRepo(args), args.id, { owner });
     }
     case "task_run_wait":
@@ -1602,7 +1615,7 @@ async function callTool(name, args = {}, metadata = {}) {
       const repoRoot = activatedRepo(args);
       try {
         const receipt = await finishInteractiveTask(repoRoot, args.id, { ...args, owner: executionOwner(metadata, {}) });
-        if (receipt.codexThread?.state === "archive-pending" || receipt.pipelineContinuation?.ready) {
+        if (receipt.codexThread?.state === "archive-pending" || receipt.pipelineContinuation?.ready || receipt.git?.phase === "merge-queued" || receipt.git?.phase === "merge-conflict") {
           ensureDaemon(repoRoot);
         }
         return receipt;

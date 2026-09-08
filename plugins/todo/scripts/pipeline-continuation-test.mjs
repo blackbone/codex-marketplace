@@ -74,17 +74,21 @@ if (process.argv[2] === "frontend" && existsSync(root + "/fail-gate")) {
 import { fakeModelList } from ${JSON.stringify(new URL("./model-catalog-test.mjs", import.meta.url).href)};
 import { appendFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-if (process.argv[2] === "exec") {
-  appendFileSync(process.env.FIXTURE_ROOT + "/model-calls", "implement\\n");
-  writeFileSync(process.argv[process.argv.indexOf("-C") + 1] + "/implementation.txt", "preserved implementation\\n");
-  writeFileSync(process.argv[process.argv.indexOf("--output-last-message") + 1], "invalid result");
-  process.exit(0);
-}
+if (process.argv[2] !== "app-server") process.exit(64);
+const send = m => process.stdout.write(JSON.stringify(m) + "\\n");
 for await (const line of createInterface({ input: process.stdin })) {
-  const message = JSON.parse(line);
-  if (message.id != null) process.stdout.write(JSON.stringify({ id: message.id,
-    result: message.method === "model/list" ? fakeModelList() : {} }) + "\\n");
+  const message = JSON.parse(line); if (message.id == null) continue;
+  if (message.method === "thread/start" || message.method === "thread/resume") {
+    send({ id: message.id, result: { thread: { id: "continuation-thread" } } });
+  } else if (message.method === "turn/start") {
+    appendFileSync(process.env.FIXTURE_ROOT + "/model-calls", "implement\\n");
+    writeFileSync(message.params.cwd + "/implementation.txt", "preserved implementation\\n");
+    send({ id: message.id, result: { turn: { id: "turn-1", status: "inProgress" } } });
+    send({ method: "item/completed", params: {threadId: message.params.threadId, turnId: "turn-1", item: {id:"result",type:"agentMessage",text:"invalid result"}} });
+    send({ method: "turn/completed", params: {threadId: message.params.threadId, turn:{id:"turn-1",status:"completed",items:[]}} });
+  } else send({ id: message.id, result: message.method === "model/list" ? fakeModelList() : {} });
 }
+
 `);
   chmodSync(fake, 0o755);
   git("add", ".gitignore", "pipeline.yaml", "check.mjs");

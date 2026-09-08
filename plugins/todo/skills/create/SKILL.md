@@ -1,6 +1,6 @@
 ---
 name: create
-description: Create one explicitly requested self-contained repository implementation task without decomposing it into a batch. Tasks run through background codex exec by default. Use only when the user explicitly invokes $todo:create for one task; use $todo:route for a list or broad change that requires atomic decomposition.
+description: Create one explicitly requested self-contained repository implementation task without decomposing it into a batch. Tasks run through background app-server workers by default. Use only when the user explicitly invokes $todo:create for one task; use $todo:route for a list or broad change that requires atomic decomposition.
 ---
 
 # ToDo Create
@@ -40,7 +40,7 @@ Use `modelDiagnostics` and `modelProfiles` returned by preflight when selecting 
    - Set `allowWorkerTaskCreation: true` only when the current user explicitly instructs this task's worker to create follow-up ToDo tasks. Include the exact delegation scope and requested model profiles in the description; never infer permission.
    - Omit `delivery` to use the repository default. Set `pr` only when the user explicitly requests a pull request.
 6. Use `runMode: "interactive"` only when the user explicitly requests current-thread execution.
-7. Keep `ephemeral` true unless the user explicitly requires a persisted Codex session.
-8. After successful publication, call `supervisor_get`. If `actionRequired` is `"rebind"`, do not update the heartbeat; report that `$todo:start` must be invoked in the owner chat. If it is `"resume"`, update that exact heartbeat with its stored complete definition, explicitly pass its stored `targetThreadId`, and set `status: "ACTIVE"`; after host confirmation persist the same target and active definition with `supervisor_bind`. Never use the current task-creation chat as the update destination.
+7. Background tasks use persistent app-server sessions. The legacy `ephemeral` field does not switch the transport.
+8. Use `runner_status` to verify queue execution. Start a stopped runner with `runner_start` when work is ready; never call host automation or desktop application tools.
 9. Do not implement the queued task in the interactive session unless current-thread-only capabilities are independently required or the user explicitly asks for current-thread execution.
-10. Return only the task ID and initial status for the implementation portion, plus a separate supervisor-resume error if publication succeeded but the heartbeat could not be resumed.
+10. Return only the task ID and initial status for the implementation portion, and any separate runner startup error.

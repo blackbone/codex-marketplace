@@ -374,7 +374,7 @@ async function assertPlanRefs(plan) {
   return targetHead;
 }
 
-async function assertOwnedWorktree(plan) {
+async function assertOwnedWorktree(plan, { allowRebase = false } = {}) {
   if (!existsSync(plan.worktreePath)) return null;
   const root = await git(
     plan.worktreePath,
@@ -400,7 +400,14 @@ async function assertOwnedWorktree(plan) {
     );
   }
   const branch = await branchAt(plan.worktreePath);
-  if (branch !== plan.branch) {
+  let ownedRebase = false;
+  if (allowRebase && !branch) {
+    for (const state of ["rebase-merge", "rebase-apply"]) {
+      const headName = await gitStatePath(plan.worktreePath, `${state}/head-name`);
+      if (existsSync(headName) && readFileSync(headName, "utf8").trim() === `refs/heads/${plan.branch}`) ownedRebase = true;
+    }
+  }
+  if (branch !== plan.branch && !ownedRebase) {
     throw lifecycleError(
       "worktree_collision",
       `Expected ${plan.branch} at ${plan.worktreePath}, found ${branch || "detached HEAD"}`,
@@ -713,11 +720,17 @@ async function deliverMerge(plan, headCommit) {
   }
 }
 
+async function completedQueuedRebase(plan, expectedHead) {
+  return Boolean(expectedHead && await refHead(plan.worktreePath, "ORIG_HEAD") === expectedHead &&
+    await output(plan.worktreePath, ["reflog", "-1", "--format=%gs"]) ===
+      `rebase (finish): returning to refs/heads/${plan.branch}`);
+}
+
 async function ensureQueuedWorktreeUnlocked(plan, expectedHead) {
   const existingHead = await assertOwnedWorktree(plan);
   if (existingHead) {
     const dirty = await committableStatus(plan.worktreePath);
-    if (existingHead !== expectedHead || dirty) {
+    if (dirty || (existingHead !== expectedHead && !await completedQueuedRebase(plan, expectedHead))) {
       throw lifecycleError(
         "merge_queue_worktree_changed",
         `Queued task worktree does not match ${expectedHead}: ${plan.worktreePath}`,
@@ -792,11 +805,14 @@ export function queueTaskWorktreeForMerge(plan, headCommit) {
   });
 }
 
-export function mergeQueuedTaskWorktree(plan, expectedHead, { validate } = {}) {
+export function mergeQueuedTaskWorktree(plan, expectedHead, { validate, onIntegrated, onDelivered } = {}) {
   return withGitLock(plan.repoRoot, async () => {
     const targetHead = await assertPlanRefs(plan);
-    await ensureQueuedWorktreeUnlocked(plan, expectedHead);
-    const operations = await activeGitOperations(plan.worktreePath);
+    await assertOwnedWorktree(plan, { allowRebase: true });
+    const operations = existsSync(plan.worktreePath) ? await activeGitOperations(plan.worktreePath) : [];
+    if (operations.some(item => item.startsWith("rebase-"))) {
+      return mergeConflictDetails(plan, targetHead, { stdout: "Recovered paused rebase", stderr: "" });
+    }
     if (operations.length > 0) {
       throw lifecycleError(
         "merge_queue_operation_in_progress",
@@ -805,6 +821,7 @@ export function mergeQueuedTaskWorktree(plan, expectedHead, { validate } = {}) {
         { operations, worktreePath: plan.worktreePath },
       );
     }
+    await ensureQueuedWorktreeUnlocked(plan, expectedHead);
     const rebased = await git(
       plan.worktreePath,
       ["rebase", `refs/heads/${plan.targetBranch}`],
@@ -824,10 +841,11 @@ export function mergeQueuedTaskWorktree(plan, expectedHead, { validate } = {}) {
     }
 
     const headCommit = await output(plan.worktreePath, ["rev-parse", "HEAD"]);
+    await onIntegrated?.({ headCommit, targetCommit: targetHead });
     let pipelineValidation = null;
     if (validate) {
       try {
-        pipelineValidation = await validate({ headCommit, worktreePath: plan.worktreePath });
+        pipelineValidation = await validate({ headCommit, targetCommit: targetHead, worktreePath: plan.worktreePath });
         const currentHead = await output(plan.worktreePath, ["rev-parse", "HEAD"]);
         const trackedChanges = await output(plan.worktreePath, ["status", "--porcelain", "--untracked-files=no"]);
         if (currentHead !== headCommit || trackedChanges) {
@@ -835,7 +853,7 @@ export function mergeQueuedTaskWorktree(plan, expectedHead, { validate } = {}) {
         }
       } catch (error) {
         error.kind = error.kind || "pipeline_validation";
-        error.details = { ...error.details, headCommit };
+        error.details = { ...error.details, headCommit, targetCommit: targetHead };
         throw error;
       }
     }
@@ -849,6 +867,9 @@ export function mergeQueuedTaskWorktree(plan, expectedHead, { validate } = {}) {
           null,
           { dirty, headCommit },
         );
+      }
+      if (await refHead(plan.repoRoot, `refs/heads/${plan.targetBranch}`) !== targetHead) {
+        throw lifecycleError("merge_target_changed", "Target changed during merge validation; retry to rebase and rerun gates", null, { headCommit, targetCommit: targetHead });
       }
       const fastForwarded = await git(
         target.path,
@@ -877,12 +898,8 @@ export function mergeQueuedTaskWorktree(plan, expectedHead, { validate } = {}) {
         }
       }
     }
-    const cleanupWarnings = await cleanupUnlocked(plan, {
-      deleteBranch: true,
-      forceDeleteBranch: false,
-      discardIgnored: true,
-    });
-    return {
+    const pushResult = await pushDelivery(plan, plan.targetBranch, headCommit);
+    const delivery = {
       status: "merged",
       delivery: "merge",
       strategy: "rebase-fast-forward",
@@ -891,15 +908,29 @@ export function mergeQueuedTaskWorktree(plan, expectedHead, { validate } = {}) {
       previousHead: expectedHead,
       headCommit,
       targetCommit: headCommit,
-      cleanupWarnings,
+      pushResult,
+      cleanupWarnings: [],
     };
+    // Persist delivery before deleting the only task branch/worktree. A crash
+    // after this checkpoint resumes completion, never another delivery attempt.
+    await onDelivered?.(delivery);
+    const cleanupWarnings = await cleanupUnlocked(plan, {
+      deleteBranch: true,
+      forceDeleteBranch: false,
+      discardIgnored: true,
+    });
+    return { ...delivery, cleanupWarnings };
   });
 }
 
-export function continueQueuedTaskRebase(plan) {
+export function continueQueuedTaskRebase(plan, { expectedHead } = {}) {
   return withGitLock(plan.repoRoot, async () => {
+    await assertOwnedWorktree(plan, { allowRebase: true });
     const operations = await activeGitOperations(plan.worktreePath);
     if (!operations.some((item) => item.startsWith("rebase-"))) {
+      if (await completedQueuedRebase(plan, expectedHead)) {
+        return { status: "resolved", headCommit: await output(plan.worktreePath, ["rev-parse", "HEAD"]), worktreePath: plan.worktreePath };
+      }
       throw lifecycleError(
         "merge_queue_rebase_missing",
         `No queued rebase is active in ${plan.worktreePath}`,
@@ -937,6 +968,22 @@ export function abortQueuedTaskRebase(plan) {
       worktreePath: plan.worktreePath,
     };
   });
+}
+
+async function pushDelivery(plan, branch, headCommit) {
+  if (!plan.push) return { status: "local" };
+  // Pin both ends: push.default, upstreams and remote push refspecs must not
+  // publish another branch or a HEAD that moved after validation.
+  const ref = `refs/heads/${branch}`;
+  const pushed = await git(plan.repoRoot,
+    ["push", "--no-force", "--no-follow-tags", plan.remote, `${headCommit}:${ref}`],
+    { allowFailure: true });
+  if (!pushed.ok) {
+    throw lifecycleError("git_push_failed",
+      `Could not push ${branch} to ${plan.remote}; local commit ${headCommit} is preserved`,
+      null, { headCommit, remote: plan.remote, ref });
+  }
+  return { status: "pushed", remote: plan.remote, ref, headCommit };
 }
 
 async function deliverPullRequest(
@@ -996,6 +1043,8 @@ export function taskWorktreePlan({
   title,
   targetBranch,
   delivery = "keep",
+  push = false,
+  remote = "origin",
   branch = taskBranchName(taskId, title),
 }) {
   const task = normalizedTask(taskId, title);
@@ -1004,6 +1053,10 @@ export function taskWorktreePlan({
   }
   if (!deliveries.has(delivery)) {
     throw new Error("delivery must be keep, merge, or pr");
+  }
+  if (typeof push !== "boolean") throw new Error("push must be a boolean");
+  if (typeof remote !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/.test(remote)) {
+    throw new Error("Invalid Git remote");
   }
   const root = path.resolve(repoRoot);
   if (
@@ -1022,6 +1075,8 @@ export function taskWorktreePlan({
     targetBranch,
     branch,
     delivery,
+    push,
+    remote,
     worktreePath: path.join(root, ".todo", "worktrees", task.key),
   });
 }
@@ -1211,6 +1266,7 @@ export function deliverTaskWorktree(
     if (!state.branchHead) {
       if (
         provenNoChanges &&
+        !(plan.delivery === "keep" && plan.push) &&
         (await refHead(plan.repoRoot, headCommit)) === headCommit
       ) {
         return {
@@ -1245,8 +1301,10 @@ export function deliverTaskWorktree(
       }
     }
 
+    const pushResult = plan.delivery === "keep"
+      ? await pushDelivery(plan, plan.branch, headCommit) : null;
     const cleanupWarnings = await cleanupUnlocked(plan, {
-      deleteBranch: result.noChanges === true,
+      deleteBranch: result.noChanges === true && !(plan.delivery === "keep" && plan.push),
       forceDeleteBranch: false,
       discardIgnored: false,
     });
@@ -1255,6 +1313,7 @@ export function deliverTaskWorktree(
       branch: plan.branch,
       headCommit,
       ...result,
+      ...(pushResult ? { pushResult } : {}),
       cleanupWarnings,
     };
   });

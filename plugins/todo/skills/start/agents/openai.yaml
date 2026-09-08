@@ -1,6 +1,6 @@
 interface:
   display_name: "ToDo Start"
-  short_description: "Start runner, monitoring, and dashboard"
-  default_prompt: "Use $todo:start to start ToDo, bind monitoring, and open its dashboard."
+  short_description: "Start runner and get dashboard URL"
+  default_prompt: "Use $todo:start to start ToDo and return its dashboard URL."
 policy:
   allow_implicit_invocation: false
