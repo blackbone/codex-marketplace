@@ -19,6 +19,7 @@ import {
   initializeRepo,
 } from "./lib.mjs";
 
+const singleBranch = process.argv.includes("--single-branch");
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const root = mkdtempSync(path.join(os.tmpdir(), "todo-pipeline-daemon-"));
 const fake = path.join(root, "codex");
@@ -88,7 +89,7 @@ import { fakeModelList } from ${JSON.stringify(new URL("./model-catalog-test.mjs
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 const trace = process.env.FAKE_TRACE;
-const result = { status: "completed", summary: "fake step complete", error: null, validation: [], requiresInteractive: false, interactiveReason: null };
+const result = { status: "completed", summary: "fake step complete", error: null, validation: [], requiresInteractive: false, interactiveReason: null, changedFiles: [] };
 const writeTrace = (value) => appendFileSync(trace, JSON.stringify(value) + "\\n");
 if (process.argv[2] !== "app-server") process.exit(64);
 let threadNumber = 0;
@@ -118,6 +119,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     if (prompt.includes("PIPELINE_IMPLEMENT")) {
       writeFileSync(message.params.cwd + "/implemented.mjs", "export const implemented = true;\\n");
     }
+    result.changedFiles = readFileSync(message.params.cwd + "/.gitignore", "utf8") && (prompt.includes("PIPELINE_IMPLEMENT") || prompt.includes("PIPELINE_REPAIR")) ? ["implemented.mjs"] : [];
     send({ id: message.id, result: { turn: { id: turnId, status: "inProgress", items: [] } } });
     send({ method: "item/completed", params: { threadId, turnId, item: { id: "pipeline-item-" + turnNumber, type: "agentMessage", text: JSON.stringify(result) } } });
     const last = { inputTokens: 20, cachedInputTokens: turnNumber > 1 ? 10 : 0, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 1 };
@@ -152,7 +154,8 @@ writeFileSync(
   `${JSON.stringify(
     {
       ...config,
-      workers: 1,
+      workers: singleBranch ? 8 : 1,
+      ...(singleBranch ? { git: { executionMode: "single-branch", delivery: "merge" } } : {}),
       pollIntervalMs: 250,
       configReloadIntervalMs: 250,
       dashboardPort: 0,
@@ -176,6 +179,19 @@ const currentConfig = JSON.parse(readFileSync(configPath, "utf8"));
 writeFileSync(configPath, JSON.stringify({ ...currentConfig,
   models: loadConfig(root).modelProfiles.map(profile => ({ ...profile, model: `current-${profile.name}` })),
 }));
+if (singleBranch) {
+  // Deterministic external commit in the finalizer's race window, after all gates.
+  const hook = path.join(root, ".git/hooks/pre-commit");
+  writeFileSync(hook, `#!/bin/sh
+if [ ! -f .git/parallel-once ]; then
+  touch .git/parallel-once
+  printf 'outside change' > manual.txt
+  env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE git add manual.txt
+  env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE git -c core.hooksPath=/dev/null commit --only manual.txt -m outside
+fi
+`);
+  chmodSync(hook, 0o755);
+}
 const daemon = spawn(
   process.execPath,
   [path.join(scriptDir, "daemon.mjs"), "--repo", root],
@@ -205,9 +221,9 @@ assert.equal(receipt.execution.model, "current-ultra");
 assert.equal(receipt.pipeline.source, "todo-pipeline.yaml");
 assert.equal(receipt.codexThread.id, "pipeline-thread-1");
 assert.equal(receipt.codexThread.state, "archived");
-assert.equal(receipt.attemptLedger.attempts.length, 2);
-assert.equal(receipt.metrics.tokenUsage.totalTokens, 200);
-assert.deepEqual(receipt.metrics.runs.map(run => run.tokenUsage.totalTokens), [50, 150]);
+assert.equal(receipt.attemptLedger.attempts.length, singleBranch ? 3 : 2);
+assert.equal(receipt.metrics.tokenUsage.totalTokens, singleBranch ? 300 : 200);
+assert.deepEqual(receipt.metrics.runs.map(run => run.tokenUsage.totalTokens), singleBranch ? [50, 150, 100] : [50, 150]);
 assert.equal(receipt.metrics.tokenUsage.coverage, "full");
 assert.equal(receipt.attemptLedger.attempts[0].status, "failed_transient");
 assert.equal(receipt.attemptLedger.attempts[1].status, "completed");
@@ -250,6 +266,20 @@ assert.match(JSON.stringify(pipelineRun), /BUILD_FIXTURE_FAILURE/);
 const calls = traceText.trim().split("\n").map(line => JSON.parse(line));
 assert(!calls.some(call => call.mode === "exec"));
 assert.deepEqual(calls.filter(call => call.message?.method === "turn/start").map(call => call.message.params.model),
-  ["current-fast", "current-fast", "current-medium", "current-expert"]);
-console.log("todo pipeline daemon test passed");
-await import("./pipeline-continuation-test.mjs");
+  ["current-fast", "current-fast", "current-medium", "current-expert", ...(singleBranch ? ["current-fast", "current-medium"] : [])]);
+if (singleBranch) {
+  assert.equal(receipt.attemptLedger.attempts[2].trigger, "workspace_refresh");
+  assert.equal(receipt.attemptLedger.deliveryAttempts.length, 1);
+  assert.equal(spawnSync("git", ["show", "HEAD:manual.txt"], { cwd: root, encoding: "utf8" }).stdout, "outside change");
+  assert.equal(receipt.git.branch, "main");
+  assert.equal(receipt.git.executionMode, "single-branch");
+  assert.equal(loadConfig(root).workers, 1);
+  assert(existsSync(path.join(root, ".pipeline-once")), "failed shell gate cache survives repairs and completion");
+  assert.equal(existsSync(path.join(root, ".todo", "worktrees")), false);
+  for (const call of calls.filter(call => ["thread/start", "thread/resume", "turn/start"].includes(call.message?.method))) {
+    assert.equal(spawnSync("realpath", [call.message.params.cwd], { encoding: "utf8" }).stdout.trim(),
+      spawnSync("realpath", [root], { encoding: "utf8" }).stdout.trim());
+  }
+}
+console.log(`todo pipeline daemon test passed (${singleBranch ? "single-branch" : "worktree"})`);
+if (!singleBranch) await import("./pipeline-continuation-test.mjs");

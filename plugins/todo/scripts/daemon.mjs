@@ -1,3 +1,4 @@
+import { singleBranchInstructions, singleBranchOutputSchema, executionCwd, recordSingleBranchExecutor } from "./single-branch.mjs";
 import { refreshModelCatalog, assertProfilesAvailable } from "./model-profiles.mjs";
 import {
   closeSync,
@@ -46,6 +47,7 @@ import {
   markTaskModelCompleted,
   markClosedTaskThreadArchived,
   prepareTaskGit,
+  recordTaskChangedFiles,
   prepareTaskMergeConflictRepair,
   processTaskMergeQueue,
   readDaemonState,
@@ -505,6 +507,7 @@ function buildPrompt(task, worktreePath) {
         ];
   return [
     `You are a ToDo worker in the task worktree ${worktreePath}.`,
+    singleBranchInstructions(task, worktreePath),
     "Implement the claimed task directly. Do not enqueue the claimed task again.",
     WORKER_TOOLING_BOUNDARY,
     ...taskCreationInstructions,
@@ -533,6 +536,7 @@ function buildAppServerPrompt(task, worktreePath, claim) {
   const previousError = task.metadata.error?.message;
   return [
     `Continue ToDo task ${task.id} in the existing Codex thread.`,
+    singleBranchInstructions(task, worktreePath),
     `This is ${claim.trigger || "manual_retry"} attempt ${claim.attempt || 1}.`,
     `The current task worktree is ${worktreePath}.`,
     "Reuse the task requirements, repository findings, and tool results already present in this thread.",
@@ -577,6 +581,7 @@ function buildPipelineStepPrompt(
       ).slice(0, 16000)
     : null;
   const stage = [
+    singleBranchInstructions(task, worktreePath),
     `Pipeline step: ${step.id} (${step.type}).`,
     task.metadata.interaction?.response ? `User answer:\n${task.metadata.interaction.response.text}` : null,
     step.prompt,
@@ -940,6 +945,10 @@ async function executeDeliveryOnly(taskPath, claim, workerId, config) {
       taskPath,
       path.relative(repoRoot, deliveryPath),
     );
+    if (finalized.reviewRequired) {
+      atomicWriteJson(deliveryPath, { status: "review-required", reason: finalized.reason });
+      return;
+    }
     atomicWriteJson(deliveryPath, {
       status: finalized.mergeQueued ? "merge-queued" : "completed",
       deliveryAttemptId: finalized.deliveryAttemptId,
@@ -1010,7 +1019,7 @@ async function executeDeliveryOnly(taskPath, claim, workerId, config) {
 }
 
 async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
-  const task = readTask(taskPath);
+  let task = readTask(taskPath);
   const isMergeRepair = task.metadata.git?.phase === "merge-conflict";
   if (
     ["model-completed", "committing", "committed", "delivered"].includes(
@@ -1050,6 +1059,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
     return;
   }
 
+  task = readTask(taskPath);
   beginModelAttempt(taskPath, claim);
   const attemptDir = path.join(
     todoDir(repoRoot),
@@ -1066,7 +1076,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
   const executionPrompt = isMergeRepair
     ? buildMergeConflictPrompt(task, preparedGit.worktreePath, claim)
     : buildAppServerPrompt(task, preparedGit.worktreePath, claim);
-  const outputSchema = JSON.parse(readFileSync(resultSchema, "utf8"));
+  const outputSchema = singleBranchOutputSchema(JSON.parse(readFileSync(resultSchema, "utf8")), task);
   writeFileSync(promptPath, `${executionPrompt}\n`, "utf8");
   const claimedAt = Date.parse(claim.claimedAt);
   const startedAt = Number.isFinite(claimedAt) ? claimedAt : Date.now();
@@ -1132,6 +1142,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
     const client = await ensureAppServer(config);
     const entry = active.get(task.id);
     if (entry) entry.threadId = threadId;
+    recordSingleBranchExecutor(repoRoot, taskPath, claim, "app-server", { pid: client.pid });
     turnId = await client.startTurn(
       {
         threadId,
@@ -1157,6 +1168,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
     updateTaskCodexThread(taskPath, { state: "active", lastTurnId: turnId });
     if (entry) entry.turnId = turnId;
     turn = await client.waitForTurn(threadId, turnId);
+    recordSingleBranchExecutor(repoRoot, taskPath, claim, "app-server", null);
     if (turn.status !== "completed") {
       const error = new Error(
         turn.error?.message || `Codex turn ended with status ${turn.status}`,
@@ -1311,6 +1323,10 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
         taskPath,
         path.relative(repoRoot, deliveryPath),
       );
+      if (finalized.reviewRequired) {
+        atomicWriteJson(deliveryPath, { status: "review-required", reason: finalized.reason });
+        return;
+      }
       atomicWriteJson(deliveryPath, {
         status: finalized.mergeQueued ? "merge-queued" : "completed",
         deliveryAttemptId: finalized.deliveryAttemptId,
@@ -1344,8 +1360,6 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
         error: error.message,
       });
     }
-    releaseClaim(claim);
-    interaction.abandon(task.id); active.delete(task.id);
     const finalStatus = getTaskStatus(repoRoot, task.id);
     const modelAttemptStatus =
       finalStatus.attemptLedger?.attempts?.find(
@@ -1376,9 +1390,12 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
     } catch (error) {
       log("usage_log_error", { task: task.id, error: error.message });
     }
+    // Keep execution ownership through the final accounting receipt.
+    releaseClaim(claim);
+    interaction.abandon(task.id); active.delete(task.id);
     log("task_end", {
       task: task.id,
-      status: finalStatus.status,
+      status: getTaskStatus(repoRoot, task.id).status,
       backend: "app-server",
       threadId,
       turnId,
@@ -1392,7 +1409,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
 }
 
 async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
-  const task = readTask(taskPath);
+  let task = readTask(taskPath);
   if (
     ["model-completed", "committing", "committed", "delivered"].includes(
       task.metadata.git?.phase,
@@ -1430,6 +1447,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     return;
   }
 
+  task = readTask(taskPath);
   if (task.metadata.pipelineContinuation?.ready) {
     beginPipelineContinuation(taskPath, claim);
   } else {
@@ -1450,7 +1468,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     : Date.now();
   const baseExecution =
     task.metadata.execution || resolveTaskExecution(config, {});
-  const outputSchema = JSON.parse(readFileSync(pipelineResultSchema, "utf8"));
+  const outputSchema = singleBranchOutputSchema(JSON.parse(readFileSync(pipelineResultSchema, "utf8")), task);
   const stepStats = [];
   let stepSequence = 0;
   let threadTurns = 0;
@@ -1526,6 +1544,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
       threadId,
     });
     try {
+      recordSingleBranchExecutor(repoRoot, taskPath, claim, "app-server", { pid: client.pid });
       turnId = await client.startTurn(
         {
           threadId,
@@ -1551,6 +1570,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
       updateTaskCodexThread(taskPath, { state: "active", lastTurnId: turnId });
       if (entry) entry.turnId = turnId;
       const turn = await client.waitForTurn(threadId, turnId);
+      recordSingleBranchExecutor(repoRoot, taskPath, claim, "app-server", null);
       if (turn.status !== "completed") {
         const error = new Error(
           turn.error?.message || `Codex turn ended with status ${turn.status}`,
@@ -1581,6 +1601,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     let result;
     try {
       result = parsePipelineStepResult(resultPath);
+      if (result.status === "completed") recordTaskChangedFiles(repoRoot, taskPath, result);
     } catch (error) {
       error.kind = "invalid_result";
       throw error;
@@ -1613,14 +1634,18 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     const stdoutPath = path.join(directory, "stdout.log");
     const stderrPath = path.join(directory, "stderr.log");
     const receiptPath = path.join(directory, "receipt.json");
-    const cwd = path.resolve(preparedGit.worktreePath, step.cwd);
+    const cwd = executionCwd(preparedGit.worktreePath, step.cwd, task.metadata.git?.executionMode);
     log("pipeline_step_start", { task: task.id, step: step.id, type: step.type,
       repairRound: context.repairRound, command: step.command, cwd: step.cwd });
+    recordSingleBranchExecutor(repoRoot, taskPath, claim, "shell", { uncertain: true });
     const receipt = await runShellCommand({
       command: step.command, cwd, timeoutSeconds: step.timeoutSeconds,
       stdoutPath, stderrPath,
       env: { ...process.env, TODO_RUNNER_WORKER: "1", TODO_RUNNER_REPO_ROOT: repoRoot, TODO_RUNNER_TASK_FILE: taskPath },
-      onChild: child => { const entry = active.get(task.id); if (entry) entry.child = child; },
+      onChild: child => {
+        recordSingleBranchExecutor(repoRoot, taskPath, claim, "shell", child?.pid ? { pid: child.pid, group: true } : null);
+        const entry = active.get(task.id); if (entry) entry.child = child;
+      },
     });
     receipt.cwd = step.cwd;
     receipt.stdoutPath = path.relative(repoRoot, stdoutPath);
@@ -1854,6 +1879,10 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
         taskPath,
         path.relative(repoRoot, deliveryPath),
       );
+      if (finalized.reviewRequired) {
+        atomicWriteJson(deliveryPath, { status: "review-required", reason: finalized.reason });
+        return;
+      }
       atomicWriteJson(deliveryPath, {
         status: finalized.mergeQueued ? "merge-queued" : "completed",
         deliveryAttemptId: finalized.deliveryAttemptId,
@@ -1886,8 +1915,6 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
         log("task_thread_archive_error", { task: task.id, error: error.message });
       }
     }
-    releaseClaim(claim);
-    interaction.abandon(task.id); active.delete(task.id);
     const finalStatus = getTaskStatus(repoRoot, task.id);
     const attemptStatus =
       finalStatus.attemptLedger?.attempts?.find(
@@ -1919,9 +1946,12 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     } catch (error) {
       log("usage_log_error", { task: task.id, error: error.message });
     }
+    // Keep execution ownership through the final accounting receipt.
+    releaseClaim(claim);
+    interaction.abandon(task.id); active.delete(task.id);
     log("task_end", {
       task: task.id,
-      status: finalStatus.status,
+      status: getTaskStatus(repoRoot, task.id).status,
       backend: "pipeline",
       pipeline: pipeline.source,
       pipelineDigest: pipeline.digest,

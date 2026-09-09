@@ -1,0 +1,11 @@
+{
+  "workers": 1,
+  "retries": 0,
+  "executionBackend": "app-server",
+  "gitExclude": [".todo/"],
+  "git": {
+    "executionMode": "single-branch",
+    "delivery": "keep",
+    "push": false
+  }
+}

@@ -3,7 +3,8 @@
 ToDo gives Codex a durable, repository-local task queue with automatic atomic
 decomposition, Ponytail full task formation and execution, connector and Git
 preflight, atomic DAG publication, optional repository-defined execution
-pipelines, isolated worktree delivery, persistent per-task Codex threads,
+pipelines, isolated worktree delivery by default, optional single-branch
+execution, persistent per-task Codex threads,
 tier-escalating retries, a local rebase merge queue, per-attempt telemetry, and
 a live dashboard.
 
@@ -311,6 +312,133 @@ runner crash resumes completion without another delivery attempt. Failed or
 interrupted repairs retain all work, including a
 paused rebase; the runner does not abort it and discard the executor's changes.
 
+## Single-branch execution
+
+Set `git.executionMode` to `"single-branch"` in the repository's
+`.todo/config.json`. Omission (or `"worktree"`) preserves the existing isolated
+worktree workflow. See [the configuration example](examples/single-branch.config.json).
+
+```json
+{
+  "git": {
+    "executionMode": "single-branch",
+    "delivery": "keep",
+    "push": false
+  }
+}
+```
+
+This policy covers **every task in the repository**, including retries, pipeline
+repair, interactive execution and delivery-only continuation. Effective worker
+capacity is one even if `workers` is larger. Each started task records its mode,
+current branch and absolute working-copy path. Config reloads affect unstarted
+tasks; running tasks and their retries keep their recorded mode and copy. The
+runner never changes branches or creates task, retry, validation or preflight
+worktrees in this mode. It commits directly to the current branch, without the
+merge queue. `git.targetBranch` is ignored; `keep` and `merge` both mean local
+current-branch completion here. PR delivery and `git.push: true` are rejected
+explicitly. Detached HEAD and active merge/rebase operations must be resolved
+before execution.
+
+The existing task claim and token still own execution. A second, repository-wide
+reservation in the common Git directory prevents concurrent executors from
+other threads, processes or linked checkouts. It covers implementation, all
+pipeline/self-review stages, shell gates, commit and result recording. Switching
+configuration cannot bypass an unfinished reservation or relocate it. Finish
+old worktree attempts before starting new single-branch work. All participating
+runners must use a plugin version supporting this policy; a legacy running
+claim is detected and must drain before entry.
+
+The worker, app-server thread and every pipeline step use the same copy.
+Pipeline `cwd` remains relative and symlinks escaping the copy are rejected.
+Unity workers must resolve the Unity project inside that copy and verify the
+Editor reports that exact project path before using Editor commands. An Editor
+connected to another project is a blocking mismatch, not a reason to redirect
+source edits. Shell commands must likewise use project-relative paths, rather
+than an absolute path to another clone. The runner keeps the working directory,
+ignored Unity `Library` and other local caches between tasks; configure cache
+ignore rules before execution.
+
+**Dirty working copies:** tasks use the current on-disk code, including existing
+staged, unstaged and untracked changes. Dirty files, overlaps with pre-existing
+edits and unrelated edits appearing during execution do not block completion.
+Agents preserve unrelated work and return `changedFiles`, the exact
+repository-relative files they intentionally changed and reviewed (including
+deleted paths), or `[]`. In interactive execution pass this field to `task_run_finish` and obey
+`executionInstructions` returned by `task_run_start`. Pipeline agent steps
+accumulate reviewed file receipts. A generator that modifies source files needs
+a later review step reporting their final content. The runner checks content
+fingerprints and commits only the listed files through a private index,
+preserving the user's index for unrelated paths. Each listed file is committed
+with its **full current content**, including existing edits in that file: the
+runner never substitutes an older HEAD or staged version. For example, when a
+task edits an already modified API file, its commit contains the latest API plus
+the task's edits. This is file-level selection, not automatic separation of
+authors' hunks. Unlisted changes stay in the working copy/index and do not block
+completion or the next task after successful completion. Agents must report all
+intentional task changes; the runner does not infer authorship from dirty status.
+It never stashes, cleans, resets working files, deletes the working copy or
+removes caches. Concurrent edits to reviewed files or commits on the same branch
+invalidate the old review and automatically continue the same task from the
+current code. The runner repeats review and all configured pipeline gates before
+committing; it does not record this as a failed delivery or escalate the model.
+Unlisted dirty files alone do not trigger another review. Commit publication uses
+an atomic expected-HEAD check, so a concurrent commit cannot be overwritten.
+Normal Git commit hooks still run in the same working directory, using a private
+index and temporary detached Git metadata (no new branch, checkout or worktree).
+Hooks must not depend on a symbolic HEAD; the repository branch itself never switches.
+
+**Recovery:** ordinary failures and pauses preserve a checkpoint and reserve the
+copy for the same task. Existing dependency checks, retry/model escalation,
+pipeline continuation, mandatory checks and attempt/delivery accounting still
+apply. Edits made while a task is safely paused are accepted on resume. After a crash, inspect `git status`, the staged
+and unstaged diffs, and the task error. Confirm the previous executor has stopped,
+then call `task_retry` for that same task and continue through the normal runner
+or `task_run_start`. An explicit retry acknowledges that review; it neither
+cleans files nor commits them. The resumed agent must attribute the retained
+changes through `changedFiles`. Live/uncertain executor ownership blocks recovery;
+known child PIDs and shell process groups are fenced even if the daemon exited.
+Native interactive claims still require the existing exact-turn reconciliation.
+Never delete task locks or the common-directory reservation to skip recovery.
+A short registry-lock recovery interrupted by another crash reports the exact
+lock requiring operator inspection and remains closed to new executors.
+
+A commit journal records the expected tree and a unique commit marker before
+commit. A crash after committing resumes only that matching commit, without a
+second implementation run or duplicate commit. Completed history can release an
+orphaned reservation after its process exits. Cancellation is allowed only if
+the copy still matches its original baseline; otherwise finish/recover the
+retained work first. An attribution failure during finalization can be corrected
+by reviewing the diff and returning a corrected `changedFiles` list from an
+interactive delivery-only continuation.
+
+**Manual commits during an unfinished task:** the next execution or finalization
+automatically adopts the current HEAD on the same branch and schedules a fresh
+review, retaining the task, model settings and implementation. This is recorded
+as a `workspace_refresh` attempt and an automatic receipt in `git.headRecoveries`.
+A ready pipeline checkpoint is discarded so checks run against current code.
+You can still explicitly acknowledge a reviewed HEAD for a stopped task through
+the supported recovery operation:
+
+```text
+task_retry(repoPath, id, acceptCurrentHead: "<full SHA from git rev-parse HEAD>")
+```
+
+This accepts only the exact current commit in the task's original working copy
+and branch, for an already started single-branch task with no active or uncertain
+executor. A stale SHA, worktree mode, active merge/rebase, waiting input or a
+delivered task is rejected. It never switches branches, changes files/index,
+creates commits, or edits caches. Manual commits (including amendments) stay as-is.
+The task records old/new HEADs and recovery time in `git.headRecoveries`; existing
+attempt history, model settings and the task/thread identity remain intact.
+
+Recovery invalidates old file-review, result, commit and pipeline checkpoints.
+The next run inspects the retained implementation and repeats normal review and
+configured pipeline checks before completion, recorded as a `head_recovery`
+attempt. It must not recreate the implementation from scratch. Repeating the same
+accepted SHA is idempotent. Interrupted acceptance can be retried through this
+same operation; do not edit task metadata or reservation files manually.
+
 ## Configuration
 
 The default `.todo/config.json` is:
@@ -329,6 +457,7 @@ The default `.todo/config.json` is:
   "defaultModelProfile": "expert",
   "routingMode": "all-mutations",
   "git": {
+    "executionMode": "worktree",
     "delivery": "keep",
     "targetBranch": null,
     "remote": "origin",
@@ -598,7 +727,8 @@ or invalid configuration reports `update-blocked` instead of interrupting work.
   recorded as transient task failures and retried in the saved thread.
 - Preflight validates availability at creation time; it cannot guarantee that a
   connector or remote service stays available throughout execution.
-- Task workers run in isolated worktrees, but they still use the current user's
+- Task workers use isolated worktrees by default (or the shared current copy in
+  single-branch mode), but they still use the current user's
   filesystem and process permissions.
 - Worker-created follow-up tasks require explicit user authorization on the
   claimed parent; audits, findings, or complexity never imply that permission.

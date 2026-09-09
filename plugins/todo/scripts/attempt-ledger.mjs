@@ -13,6 +13,8 @@ const MODEL_TRIGGERS = new Set([
   "initial",
   "automatic_retry",
   "manual_retry",
+  "head_recovery",
+  "workspace_refresh",
   "merge_conflict",
   "merge_validation",
 ]);
@@ -126,7 +128,7 @@ function retryStats(attempts, deliveryAttempts) {
     automaticRetries: attempts.filter(
       (item) => item.trigger === "automatic_retry",
     ).length,
-    manualRetries: attempts.filter((item) => item.trigger === "manual_retry")
+    manualRetries: attempts.filter((item) => item.trigger === "manual_retry" || item.trigger === "head_recovery")
       .length,
     deliveryRetries: Math.max(0, deliveryAttempts.length - 1),
   });
@@ -231,7 +233,7 @@ export function appendModelAttempt(ledger, input) {
     throw new TypeError("only the first model attempt may use initial trigger");
   }
   const previous = attempts.at(-1) || null;
-  if (previous?.status === "completed" && !["merge_conflict", "merge_validation"].includes(trigger)) {
+  if (previous?.status === "completed" && !["merge_conflict", "merge_validation", "head_recovery", "workspace_refresh"].includes(trigger)) {
     throw new Error("cannot retry a completed model attempt");
   }
   if (["merge_conflict", "merge_validation"].includes(trigger) && attempts.length === 0) {

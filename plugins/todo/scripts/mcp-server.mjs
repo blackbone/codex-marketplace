@@ -612,12 +612,16 @@ const tools = [
   {
     name: "task_retry",
     description:
-      "Retry a failed task. Merge validation failures resume bounded repair in the original task and thread; an explicit retry after repair exhaustion permits one additional repair.",
+      "Retry a failed task. For a stopped single-branch task after manual commits, acceptCurrentHead explicitly adopts the full reviewed current commit SHA and requires fresh review and validation. Merge validation failures resume bounded repair in the original task and thread; an explicit retry after repair exhaustion permits one additional repair.",
     inputSchema: {
       type: "object",
       properties: {
         repoPath: { type: "string" },
         id: { type: "string", minLength: 1 },
+        acceptCurrentHead: {
+          type: "string", pattern: "^(?:[a-f0-9]{40}|[a-f0-9]{64})$",
+          description: "Optional full SHA from git rev-parse HEAD, after reviewing manual commits. Single-branch only; preserves files/index and models, invalidates prior review and pipeline completion. Refuses active or uncertain executors and stale SHA.",
+        },
       },
       required: ["repoPath", "id"],
       additionalProperties: false,
@@ -696,6 +700,10 @@ const tools = [
           type: "array",
           items: { type: "string" },
           default: [],
+        },
+        changedFiles: {
+          type: "array", items: { type: "string", minLength: 1 },
+          description: "Required for single-branch completion: exact repository-relative files intentionally changed by the task and reviewed, including deletions; [] for no changes. Listed files are committed with their full current content, including pre-existing edits in those files. Unlisted changes remain uncommitted.",
         },
         error: {
           type: "string",
@@ -1207,7 +1215,7 @@ function preflightPath(repoRoot, id) {
   return path.join(todoDir(repoRoot), "preflight", `${id}.json`);
 }
 
-function requiredLocalChecks(deliveries, push = false) {
+function requiredLocalChecks(deliveries, push = false, executionMode = "worktree") {
   const checks = [
     "config",
     "runtime",
@@ -1215,9 +1223,9 @@ function requiredLocalChecks(deliveries, push = false) {
     "git-target",
     "git-identity",
     "codex-command",
-    "git-worktree",
+    executionMode === "single-branch" ? "git-current-copy" : "git-worktree",
   ];
-  if (deliveries.includes("merge")) checks.push("git-merge-target");
+  if (executionMode !== "single-branch" && deliveries.includes("merge")) checks.push("git-merge-target");
   if (deliveries.includes("pr")) checks.push("github-pr");
   if (push && deliveries.some(delivery => delivery !== "pr")) checks.push("git-push-remote");
   return checks;
@@ -1234,7 +1242,7 @@ async function taskPreflight(repoRoot, args) {
         : [config.git.delivery]),
     ),
   ];
-  const targetBranch =
+  const targetBranch = config.git.executionMode === "single-branch" ? currentGitBranch(repoRoot) :
     args.targetBranch || config.git.targetBranch || currentGitBranch(repoRoot);
   let runtime;
   try {
@@ -1257,8 +1265,8 @@ async function taskPreflight(repoRoot, args) {
       {
         name: "config",
         run: () => ({
-          status: config.readError ? "failed" : "ok",
-          summary: config.readError || "configuration loaded",
+          status: config.readError || (config.git.executionMode === "single-branch" && deliveries.includes("pr")) ? "failed" : "ok",
+          summary: config.readError || (config.git.executionMode === "single-branch" && deliveries.includes("pr") ? "single-branch does not support PR delivery" : "configuration loaded"),
         }),
       },
       {
@@ -1319,8 +1327,11 @@ async function taskPreflight(repoRoot, args) {
           ),
       },
       {
-        name: "git-worktree",
+        name: config.git.executionMode === "single-branch" ? "git-current-copy" : "git-worktree",
         run: () => {
+          if (config.git.executionMode === "single-branch") {
+            return commandCheck("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], repoRoot);
+          }
           if (!targetBranch) {
             return { status: "failed", summary: "target branch is unavailable" };
           }
@@ -1357,8 +1368,9 @@ async function taskPreflight(repoRoot, args) {
       },
       {
         name: "git-merge-target",
-        required: deliveries.includes("merge"),
+        required: config.git.executionMode !== "single-branch" && deliveries.includes("merge"),
         run: () => {
+          if (config.git.executionMode === "single-branch") return { status: "ok", summary: "current-branch completion; no merge target" };
           const checkouts = branchWorktrees(repoRoot, targetBranch);
           if (checkouts.length === 0) {
             return { status: "ok", summary: "target is not checked out" };
@@ -1455,7 +1467,7 @@ function validatedPreflight(
     repoRoot,
     config: preflightBindingConfig(config, targetBranch),
     requiredCapabilities: args.requiredCapabilities || [],
-    requiredLocalChecks: requiredLocalChecks(deliveries, config.git.push),
+    requiredLocalChecks: requiredLocalChecks(deliveries, config.git.push, config.git.executionMode),
   });
   return {
     receipt,
@@ -1592,7 +1604,7 @@ async function callTool(name, args = {}, metadata = {}) {
       return clearSupervisor(activatedRepo(args));
     case "task_retry": {
       const repoRoot = activatedRepo(args);
-      const task = retryTask(repoRoot, args.id);
+      const task = retryTask(repoRoot, args.id, { acceptCurrentHead: args.acceptCurrentHead });
       if (task.execution?.mode !== "interactive") ensureDaemon(repoRoot);
       return task;
     }

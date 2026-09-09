@@ -10,6 +10,7 @@ A Git-backed Codex marketplace for plugins maintained by [blackbone](https://git
 | --- | --- | --- |
 | ToDo | Atomic repository task routing with optional YAML execution pipelines, persistent threads, deterministic gates, and telemetry. | [Documentation](plugins/todo/README.md) |
 | Docs | Search local documentation with shared indexing, project-local SQLite indexes, and a live status page. | [Documentation](plugins/docs/README.md) |
+| Unity | Open the current Unity project and run Editor actions through the official CLI, with Pipeline checks only on demand. | [Documentation](plugins/unity/README.md) |
 
 ![ToDo plugin details](plugins/todo/assets/screenshots/plugin-details.png)
 

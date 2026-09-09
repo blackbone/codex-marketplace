@@ -1,3 +1,5 @@
+import { withRepositoryExecution, reserveSingleBranch, checkpointSingleBranch, singleBranchIdentity,
+  singleBranchPlan, prepareSingleBranch, commitSingleBranch, singleBranchFiles, singleBranchInstructions, activeSingleBranchExecutors, verifySingleBranchDelivery, assertSingleBranchCancellation, recoverSingleBranchHead } from "./single-branch.mjs";
 import { DEFAULT_MODEL_PROFILES, readModelCatalog, profileDiagnostic, profileUsable, assertProfilesAvailable } from "./model-profiles.mjs";
 import { runShellCommand } from "./shell-step.mjs";
 import { recoverUsageRuns, combineUsage } from "./usage-recovery.mjs";
@@ -10,6 +12,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -68,6 +71,7 @@ export const DEFAULT_CONFIG = {
   defaultModelProfile: DEFAULT_MODEL_PROFILE,
   routingMode: DEFAULT_ROUTING_MODE,
   git: {
+    executionMode: "worktree",
     delivery: DEFAULT_GIT_DELIVERY,
     targetBranch: null,
     remote: DEFAULT_GIT_REMOTE,
@@ -485,6 +489,15 @@ export function loadConfig(repoRoot) {
     raw.git && typeof raw.git === "object" && !Array.isArray(raw.git)
       ? raw.git
       : {};
+  const executionMode = rawGit.executionMode ?? "worktree";
+  if (!["worktree", "single-branch"].includes(executionMode)) {
+    readError = "git.executionMode must be worktree or single-branch";
+    warning = warning ? `${warning}; ${readError}` : readError;
+  }
+  if (executionMode === "single-branch" && rawGit.push === true) {
+    readError = "git.push is unsupported in single-branch; completion commits locally in the current branch";
+    warning = warning ? `${warning}; ${readError}` : readError;
+  }
   const gitDelivery = CONFIG_GIT_DELIVERIES.has(rawGit.delivery)
     ? rawGit.delivery
     : DEFAULT_GIT_DELIVERY;
@@ -522,7 +535,7 @@ export function loadConfig(repoRoot) {
 
   return {
     activated: true,
-    workers: integerInRange(raw.workers, 1, 32, DEFAULT_WORKERS),
+    workers: executionMode === "single-branch" ? 1 : integerInRange(raw.workers, 1, 32, DEFAULT_WORKERS),
     pollIntervalMs: integerInRange(
       raw.pollIntervalMs,
       250,
@@ -557,7 +570,7 @@ export function loadConfig(repoRoot) {
     modelProfiles: normalizedProfiles.profiles,
     defaultModelProfile,
     routingMode,
-    git: { delivery: gitDelivery, targetBranch, remote, push: rawGit.push === true },
+    git: { executionMode, delivery: gitDelivery, targetBranch: executionMode === "single-branch" ? null : targetBranch, remote, push: rawGit.push === true },
     pipeline,
     warning,
     readError,
@@ -825,6 +838,7 @@ function storedAttemptLedger(task) {
 }
 
 function nextAttemptTrigger(task) {
+  if (["head_recovery", "workspace_refresh"].includes(task.metadata.nextAttemptTrigger)) return task.metadata.nextAttemptTrigger;
   const attempts = storedAttemptLedger(task).attempts;
   if (attempts.length === 0) return "initial";
   if (task.metadata.git?.phase === "merge-conflict") return task.metadata.git.mergeConflict?.kind === "pipeline_validation" ? "merge_validation" : "merge_conflict";
@@ -1415,7 +1429,7 @@ export function readTask(taskPath) {
   }
   if (
     metadata.nextAttemptTrigger !== undefined &&
-    !["automatic_retry", "manual_retry"].includes(
+    !["automatic_retry", "manual_retry", "head_recovery", "workspace_refresh"].includes(
       metadata.nextAttemptTrigger,
     )
   ) {
@@ -1454,7 +1468,8 @@ export function readTask(taskPath) {
       typeof git !== "object" ||
       Array.isArray(git) ||
       typeof git.branch !== "string" ||
-      !git.branch.startsWith("codex/todo-") ||
+      (git.executionMode !== "single-branch" && !git.branch.startsWith("codex/todo-")) ||
+      (git.executionMode !== undefined && !["worktree", "single-branch"].includes(git.executionMode)) ||
       typeof git.targetBranch !== "string" ||
       !git.targetBranch ||
       !TASK_GIT_DELIVERIES.has(git.delivery) ||
@@ -2766,6 +2781,7 @@ export function getTaskStatus(repoRoot, id, { recoverUsage = true } = {}) {
     codexThread: task.metadata.codexThread || null,
     interaction: task.metadata.interaction || null,
     pipelineContinuation: task.metadata.pipelineContinuation || null,
+    reviewRequired: task.metadata.nextAttemptTrigger === "workspace_refresh",
     allowWorkerTaskCreation:
       task.metadata.allowWorkerTaskCreation === true,
     parentTaskId: task.metadata.parentTaskId || null,
@@ -3079,6 +3095,7 @@ function ensureTaskGitMetadata(repoRoot, task) {
 
 function worktreePlan(repoRoot, task) {
   const git = ensureTaskGitMetadata(repoRoot, task);
+  if (git.executionMode === "single-branch") return singleBranchPlan(repoRoot, task);
   return taskWorktreePlan({
     repoRoot,
     taskId: task.id,
@@ -3091,12 +3108,41 @@ function worktreePlan(repoRoot, task) {
   });
 }
 
+function publishSingleBranchRefresh(task, receipt) {
+  const g = task.metadata.git;
+  task.metadata.git = { ...g, baseCommit: receipt.toHead, phase: "working", ownedFiles: {},
+    reviewFiles: [...new Set([...(g.reviewFiles || []), ...Object.keys(g.ownedFiles || {})])],
+    headRecoveries: [...(g.headRecoveries || []), receipt] };
+  for (const field of ["headCommit", "pendingResult", "deliveryResult", "deliveryError", "deliveryAttemptId", "noChanges"]) delete task.metadata.git[field];
+  delete task.metadata.pipelineContinuation;
+  task.metadata.error = null;
+  task.metadata.outcome = null;
+  task.metadata.nextAttemptTrigger = receipt.automatic ? "workspace_refresh" : "head_recovery";
+  writeTask(task);
+}
+function refreshSingleBranchWorkspace(repoRoot, taskPath, error) {
+  const task = readTask(taskPath);
+  if (task.metadata.git?.executionMode !== "single-branch" ||
+      !["single_branch_head_changed", "single_branch_unreviewed_changes"].includes(error.kind)) return false;
+  recoverSingleBranchHead(singleBranchPlan(repoRoot, task), task, null,
+    receipt => publishSingleBranchRefresh(task, receipt), { automatic: true, reason: error.message });
+  return true;
+}
+
 export async function prepareTaskGit(repoRoot, taskPath) {
   const task = readTask(taskPath);
   const plan = worktreePlan(repoRoot, task);
-  const prepared = await prepareTaskWorktree(plan, {
-    expectedBase: task.metadata.git?.baseCommit || null,
-  });
+  let prepared;
+  let refreshed = false;
+  try {
+    prepared = plan.executionMode === "single-branch"
+      ? prepareSingleBranch(plan, task.metadata.git?.baseCommit, task)
+      : await prepareTaskWorktree(plan, { expectedBase: task.metadata.git?.baseCommit || null });
+  } catch (error) {
+    if (!refreshSingleBranchWorkspace(repoRoot, taskPath, error)) throw error;
+    refreshed = true;
+    prepared = { head: readTask(taskPath).metadata.git.baseCommit, reused: true };
+  }
   const current = readTask(taskPath);
   const git = ensureTaskGitMetadata(repoRoot, current);
   if (git.baseCommit && git.baseCommit !== prepared.head) {
@@ -3116,7 +3162,15 @@ export async function prepareTaskGit(repoRoot, taskPath) {
     worktreePath: plan.worktreePath,
     expectedHead: current.metadata.git.baseCommit,
     reused: prepared.reused,
+    refreshed,
   };
+}
+
+export function recordTaskChangedFiles(repoRoot, taskPath, result) {
+  const task = readTask(taskPath);
+  if (task.metadata.git?.executionMode !== "single-branch") return;
+  singleBranchFiles(repoRoot, task, result.changedFiles);
+  writeTask(task);
 }
 
 export function markTaskModelCompleted(
@@ -3135,6 +3189,10 @@ export function markTaskModelCompleted(
         storedAttemptLedger(task).attempts.at(-1).attemptId !== claim.continuationOf) {
       throw new Error("Pipeline continuation claim or completed implementation no longer matches");
     }
+  }
+  if (task.metadata.git?.executionMode === "single-branch" &&
+      (result.changedFiles !== undefined || !task.metadata.git.ownedFiles)) {
+    singleBranchFiles(path.dirname(path.dirname(taskPath)), task, result.changedFiles);
   }
   task.metadata.metrics = metrics;
   task.metadata.attemptLedger = appendClaimedAttempt(
@@ -3204,12 +3262,15 @@ export async function finalizeTaskGit(repoRoot, taskPath, usagePath = null) {
     deliveryAttemptId = beginTaskDelivery(taskPath);
     task = readTask(taskPath);
     if (task.metadata.git.phase === "model-completed") {
-      await verifyTaskWorktreeHead(plan, task.metadata.git.baseCommit);
+      if (plan.executionMode === "single-branch") prepareSingleBranch(plan, task.metadata.git.baseCommit);
+      else await verifyTaskWorktreeHead(plan, task.metadata.git.baseCommit);
       task.metadata.git = { ...task.metadata.git, phase: "committing" };
       writeTask(task);
     }
     if (task.metadata.git.phase === "committing") {
-      const committed = await commitTaskWorktree(plan, {
+      const committed = plan.executionMode === "single-branch"
+        ? commitSingleBranch(plan, task)
+        : await commitTaskWorktree(plan, {
         expectedHead: task.metadata.git.baseCommit,
         recoverCommittedHead: true,
       });
@@ -3228,8 +3289,9 @@ export async function finalizeTaskGit(repoRoot, taskPath, usagePath = null) {
         `Task Git finalizer cannot run from phase ${task.metadata.git.phase}`,
       );
     }
+    if (plan.executionMode === "single-branch") verifySingleBranchDelivery(plan, task);
     const pendingResult = task.metadata.git.pendingResult;
-    if (task.metadata.git.delivery === "merge") {
+    if (plan.executionMode !== "single-branch" && task.metadata.git.delivery === "merge") {
       const queued = await queueTaskWorktreeForMerge(plan, task.metadata.git.headCommit);
       task = readTask(taskPath);
       task.metadata.git = {
@@ -3247,7 +3309,9 @@ export async function finalizeTaskGit(repoRoot, taskPath, usagePath = null) {
         mergeQueued: true,
       };
     }
-    const delivery = await deliverTaskWorktree(plan, {
+    const delivery = plan.executionMode === "single-branch"
+      ? { delivery: "current-branch", branch: plan.branch, worktreePath: plan.worktreePath, headCommit: task.metadata.git.headCommit, noChanges: task.metadata.git.noChanges }
+      : await deliverTaskWorktree(plan, {
       headCommit: task.metadata.git.headCommit,
       noChanges: task.metadata.git.noChanges === true,
       baseCommit: task.metadata.git.baseCommit,
@@ -3277,6 +3341,9 @@ export async function finalizeTaskGit(repoRoot, taskPath, usagePath = null) {
     writeTask(task);
     return { result: pendingResult, delivery, deliveryAttemptId };
   } catch (error) {
+    if (existsSync(taskPath) && refreshSingleBranchWorkspace(repoRoot, taskPath, error)) {
+      return { reviewRequired: true, reason: error.message };
+    }
     const completedAt = Date.now();
     if (existsSync(taskPath)) {
       const task = readTask(taskPath);
@@ -3574,45 +3641,61 @@ export async function finishTaskMergeConflictRepair(
 export function retryTask(
   repoRoot,
   id,
-  { trigger = "manual_retry" } = {},
+  { trigger = "manual_retry", acceptCurrentHead } = {},
 ) {
   if (!["automatic_retry", "manual_retry"].includes(trigger)) {
     throw new Error("retry trigger must be automatic_retry or manual_retry");
+  }
+  if (acceptCurrentHead !== undefined && (trigger !== "manual_retry" ||
+      typeof acceptCurrentHead !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(acceptCurrentHead))) {
+    throw new Error("acceptCurrentHead requires an explicit manual retry and a full reviewed commit SHA");
   }
   const filename = existingTaskFilename(repoRoot, id);
   const taskPath = path.join(todoDir(repoRoot), filename);
   if (!existsSync(taskPath)) throw new Error(`Task does not exist: ${id}`);
   if (existsSync(`${taskPath}.lock`)) throw new Error(`Task is running: ${id}`);
-  const reservation = claimTask(taskPath, "task-retry");
+  const reservation = claimTask(taskPath, "task-retry", { recoverSingleBranch: acceptCurrentHead !== undefined ? "head" : trigger === "manual_retry" });
   try {
     const task = readTask(taskPath);
     const modelWasUnavailable = task.metadata.error?.kind === "model_unavailable";
-    if (task.metadata.interaction?.state === "waiting-input") {
-      throw new Error("Task is waiting for user input. Answer in the dashboard or continue with $todo:run.");
+    if (acceptCurrentHead !== undefined) {
+      if (task.metadata.git?.executionMode !== "single-branch" || !task.metadata.git.baseCommit) {
+        throw new Error("acceptCurrentHead is supported only for an already started single-branch task");
+      }
+      if (task.metadata.git.phase === "delivered" || task.metadata.interaction?.dispatching || task.metadata.interaction?.state === "waiting-input") {
+        throw new Error("Cannot accept HEAD for a delivered task, waiting input, or an executor with an uncertain outcome");
+      }
+      recoverSingleBranchHead(singleBranchPlan(repoRoot, task), task, acceptCurrentHead,
+        receipt => publishSingleBranchRefresh(task, receipt));
+    } else {
+      if (task.metadata.interaction?.state === "waiting-input") {
+        throw new Error("Task is waiting for user input. Answer in the dashboard or continue with $todo:run.");
+      }
+      const repair = resumeTaskMergeRepair(repoRoot, task, { manual: trigger === "manual_retry" });
+      task.metadata.error = null;
+      const wasMergeFailed = task.metadata.git?.phase === "merge-failed";
+      const modelRetry =
+        !repair && !wasMergeFailed && !TASK_GIT_FINALIZER_PHASES.has(task.metadata.git?.phase) &&
+        !completedPipelineContinuation(task) &&
+        !(["head_recovery", "workspace_refresh"].includes(task.metadata.nextAttemptTrigger) && storedAttemptLedger(task).attempts.at(-1)?.status === "completed");
+      if (wasMergeFailed && !repair) {
+        task.metadata.git = {
+          ...task.metadata.git,
+          phase: "merge-queued",
+          mergeQueuedAt: new Date().toISOString(),
+        };
+      }
+      if (modelRetry) {
+        const config = loadConfig(repoRoot);
+        const current =
+          task.metadata.execution || resolveTaskExecution(config, {});
+        task.metadata.execution = modelWasUnavailable
+          ? resolveSavedExecution({ ...config, modelCatalog: null }, current)
+          : escalatedExecution(config, current);
+        task.metadata.nextAttemptTrigger = trigger;
+      }
+      writeTask(task);
     }
-    const repair = resumeTaskMergeRepair(repoRoot, task, { manual: trigger === "manual_retry" });
-    task.metadata.error = null;
-    const wasMergeFailed = task.metadata.git?.phase === "merge-failed";
-    const modelRetry =
-      !repair && !wasMergeFailed && !TASK_GIT_FINALIZER_PHASES.has(task.metadata.git?.phase) &&
-      !completedPipelineContinuation(task);
-    if (wasMergeFailed && !repair) {
-      task.metadata.git = {
-        ...task.metadata.git,
-        phase: "merge-queued",
-        mergeQueuedAt: new Date().toISOString(),
-      };
-    }
-    if (modelRetry) {
-      const config = loadConfig(repoRoot);
-      const current =
-        task.metadata.execution || resolveTaskExecution(config, {});
-      task.metadata.execution = modelWasUnavailable
-        ? resolveSavedExecution({ ...config, modelCatalog: null }, current)
-        : escalatedExecution(config, current);
-      task.metadata.nextAttemptTrigger = trigger;
-    }
-    writeTask(task);
   } finally { releaseClaim(reservation); }
   return getTaskStatus(repoRoot, id);
 }
@@ -3684,7 +3767,9 @@ export function reopenTask(repoRoot, id) {
     ? previousBranch
     : receipt.git?.targetBranch || loadConfig(repoRoot).git.targetBranch;
   if (!targetBranch) throw new Error("Reopened task target branch is unavailable");
-  const branch = `${previousBranch || `todo/${receipt.id}`}-reopen-${reopenCount}`;
+  const branch = receipt.git?.executionMode === "single-branch"
+    ? taskBranchName(receipt.id, receipt.title)
+    : `${previousBranch || `todo/${receipt.id}`}-reopen-${reopenCount}`;
   const task = {
     id: receipt.id,
     path: path.join(todoDir(repoRoot), `${receipt.id}.md`),
@@ -3737,7 +3822,8 @@ export async function startInteractiveTask(repoRoot, id, { owner = null } = {}) 
           prompt: buildMergeConflictPrompt(readTask(taskPath), status.git.worktreePath, saved) } } : {}),
         expectedHead: status.git.mergeConflict?.currentHeadCommit || status.git.baseCommit, deliveryOnly: TASK_GIT_FINALIZER_PHASES.has(status.git.phase),
         pipelineStage: status.pipelineContinuation?.stage || null,
-        requiresPipelineValidation: Boolean(status.pipeline), task: getTaskDetails(repoRoot, id),
+        requiresPipelineValidation: Boolean(status.pipeline),
+        executionInstructions: singleBranchInstructions(readTask(taskPath), status.git.worktreePath), task: getTaskDetails(repoRoot, id),
       };
     }
     throw new Error(`Task is running: ${id}`);
@@ -3811,6 +3897,21 @@ export async function startInteractiveTask(repoRoot, id, { owner = null } = {}) 
           expectedHead: status.git.baseCommit,
         }
       : await prepareTaskGit(repoRoot, taskPath);
+    if (prepared.refreshed) {
+      const currentClaim = readJson(claim.lockPath);
+      atomicWriteJson(claim.lockPath, { ...currentClaim, trigger: "workspace_refresh" });
+      claim.trigger = "workspace_refresh";
+      continuation = null;
+      if (status.pipeline) {
+        const pipeline = loadPipelineSnapshot(repoRoot, status.pipeline);
+        const first = pipeline.steps[0];
+        continuation = { digest: pipeline.digest, stage: first.type === "shell" ? null : first,
+          nextIndex: first.type === "shell" ? 0 : 1, repairRound: 0, executions: [] };
+        const current = readTask(taskPath);
+        current.metadata.pipelineContinuation = continuation;
+        writeTask(current);
+      }
+    }
     return {
       claimToken: claim.token,
       worktreePath: prepared.worktreePath,
@@ -3818,6 +3919,7 @@ export async function startInteractiveTask(repoRoot, id, { owner = null } = {}) 
       deliveryOnly,
       pipelineStage: continuation?.stage || null,
       requiresPipelineValidation: Boolean(status.pipeline),
+      executionInstructions: singleBranchInstructions(readTask(taskPath), prepared.worktreePath),
       task: getTaskDetails(repoRoot, id),
     };
   } catch (error) {
@@ -3866,6 +3968,7 @@ export async function finishInteractiveTask(
     status,
     summary,
     validation = [],
+    changedFiles,
     error = null,
     owner = null,
   },
@@ -3940,6 +4043,11 @@ export async function finishInteractiveTask(
   }
   try {
     if (status === "completed") {
+      if (task.metadata.git?.executionMode === "single-branch" && (!deliveryOnly || changedFiles !== undefined)) {
+        if (deliveryOnly) task.metadata.git.ownedFiles = {};
+        singleBranchFiles(repoRoot, task, changedFiles);
+        writeTask(task);
+      }
       if (task.metadata.pipeline && !deliveryOnly) {
         // The app supplies a stage result; only the runner can pass pipeline
         // gates and authorize delivery. An app completion never bypasses them.
@@ -3986,7 +4094,7 @@ export async function finishInteractiveTask(
         );
         throw finalizeError;
       }
-      if (!finalized.mergeQueued) {
+      if (!finalized.mergeQueued && !finalized.reviewRequired) {
         completeTask(
           repoRoot,
           taskPath,
@@ -4095,7 +4203,9 @@ export async function cancelTask(repoRoot, id) {
   }
   try {
     const task = readTask(taskPath);
-    if (task.metadata.git) {
+    if (task.metadata.git?.executionMode === "single-branch") {
+      assertSingleBranchCancellation(worktreePlan(repoRoot, task));
+    } else if (task.metadata.git) {
       const warnings = await cleanupTaskWorktree(worktreePlan(repoRoot, task), {
         deleteBranch: !TASK_GIT_FINALIZER_PHASES.has(task.metadata.git.phase),
       });
@@ -4144,8 +4254,49 @@ export async function cancelTask(repoRoot, id) {
 export function claimTask(
   taskPath,
   workerId,
-  { modelAttempt = false, owner = null } = {},
+  { modelAttempt = false, owner = null, recoverSingleBranch = false } = {},
 ) {
+  const repoRoot = path.dirname(path.dirname(path.resolve(taskPath)));
+  return withRepositoryExecution(repoRoot, (state, saveState) => {
+    const config = loadConfig(repoRoot);
+    if (config.readError) throw new Error(config.readError);
+    if (existsSync(path.join(todoDir(repoRoot), ".daemon-restart.json"))) {
+      const error = new Error("ToDo runtime update is pending");
+      error.code = "EEXIST";
+      error.kind = "runtime_update_pending";
+      throw error;
+    }
+    let task;
+    try { task = readTask(taskPath); }
+    catch (error) {
+      // Preserve the legacy raw claim primitive used by runtime coordination.
+      if (config.git.executionMode === "worktree" && !state.reservation) return claimTaskUnlocked(taskPath, workerId, { modelAttempt, owner });
+      throw error;
+    }
+    const administrative = ["task-update", "task-retry", "task-cancel"].includes(workerId);
+    const started = task.metadata.git?.executionMode || task.metadata.git?.worktreePath || task.metadata.git?.baseCommit || (task.metadata.git?.phase && task.metadata.git.phase !== "queued") || task.metadata.attemptLedger?.attempts?.length || task.metadata.metrics?.attempts;
+    const mode = state.reservation?.taskPath === path.join(realpathSync(repoRoot), ".todo", path.basename(taskPath))
+      ? "single-branch" : started ? task.metadata.git?.executionMode || "worktree" : config.git.executionMode;
+    if (mode === "single-branch" && (task.metadata.git?.delivery === "pr" || task.metadata.git?.push)) {
+      throw new Error("single-branch supports local current-branch completion only; PR/push delivery cannot be migrated automatically");
+    }
+    reserveSingleBranch(repoRoot, taskPath, mode, state, { administrative, recover: recoverSingleBranch });
+    saveState(state); // Reserve durably before publishing a claim or touching task metadata.
+    const claim = claimTaskUnlocked(taskPath, workerId, { modelAttempt, owner });
+    try {
+      if (!administrative && (!started || (mode === "single-branch" && !task.metadata.git?.executionMode))) {
+        const identity = mode === "single-branch" ? singleBranchIdentity(repoRoot) : null;
+        task.metadata.git = { ...ensureTaskGitMetadata(repoRoot, task), executionMode: mode,
+          ...(identity ? { branch: identity.branch, targetBranch: identity.branch, worktreePath: identity.root } : {}) };
+        writeTask(task);
+      }
+      saveState(state);
+      return claim;
+    } catch (error) { unlinkSync(claim.lockPath); throw error; }
+  });
+}
+
+function claimTaskUnlocked(taskPath, workerId, { modelAttempt, owner }) {
   const repoRoot = path.dirname(path.dirname(path.resolve(taskPath)));
   const batchGate = acquireTaskBatchGate(repoRoot, {
     purpose: "task-claim",
@@ -4157,12 +4308,6 @@ export function claimTask(
   let attemptFields = {};
   let fd;
   try {
-    if (existsSync(path.join(todoDir(repoRoot), ".daemon-restart.json"))) {
-      const error = new Error("ToDo runtime update is pending");
-      error.code = "EEXIST";
-      error.kind = "runtime_update_pending";
-      throw error;
-    }
     if (modelAttempt) {
       const task = readTask(taskPath);
       const ledger = storedAttemptLedger(task);
@@ -4240,10 +4385,23 @@ export function releaseClaim(claim) {
   } catch {
     return;
   }
-  unlinkSync(claim.lockPath);
+  const taskPath = claim.lockPath.slice(0, -5);
+  const repoRoot = path.dirname(path.dirname(taskPath));
+  withRepositoryExecution(repoRoot, (state, saveState) => {
+    // Fence release and checkpoint with the same lock used to acquire ownership.
+    if (readJson(claim.lockPath)?.token !== claim.token) return;
+    const completed = !existsSync(taskPath) && existsSync(historyPath(repoRoot, taskIdFromFilename(path.basename(taskPath))));
+    checkpointSingleBranch(repoRoot, taskPath, state, completed);
+    saveState(state);
+    unlinkSync(claim.lockPath);
+  });
 }
 
 export function cleanupStaleClaims(repoRoot) {
+  return withRepositoryExecution(repoRoot, state => activeSingleBranchExecutors(state).length ? [] : cleanupStaleClaimsUnlocked(repoRoot));
+}
+
+function cleanupStaleClaimsUnlocked(repoRoot) {
   const removed = [];
   for (const taskPath of listTaskFiles(repoRoot)) {
     const lockPath = `${taskPath}.lock`;

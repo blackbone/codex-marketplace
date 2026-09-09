@@ -1871,7 +1871,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     modelProfile: "fast",
   });
   await waitFor(
-    () => getTaskStatus(repoRoot, retrying.id).status === "completed",
+    () => getTaskStatus(repoRoot, retrying.id).status === "completed" && !existsSync(`${retrying.path}.lock`),
     "retry fixture did not complete after its automatic retry",
   );
   const retriedReceipt = getTaskStatus(repoRoot, retrying.id);
@@ -1958,7 +1958,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       retriedReceipt.retryStats?.automaticRetries === 1 &&
       retriedReceipt.retryStats?.deliveryRetries === 0 &&
       retriedRunnerLog.includes("event=task_auto_retry"),
-    "automatic retry did not accumulate time and token usage",
+    "automatic retry did not accumulate time and token usage: " + JSON.stringify({ metrics: retriedReceipt.metrics, execution: retriedReceipt.execution, attempts: retriedReceipt.attemptLedger, usage: retryUsageFiles, prompts: retryPrompts.map(prompt => ({ continuation: prompt.includes("Continue ToDo task"), fullContour: prompt.includes(TODO_PONYTAIL_FULL_CONTOUR), implementationBrief: prompt.includes(retryImplementationBrief) })) }),
   );
   const mergeBatchId = "smoke-merge-order-batch";
   const mergeOrderSlow = createTask(repoRoot, {
@@ -2257,6 +2257,22 @@ for await (const line of createInterface({ input: process.stdin })) {
     `${JSON.stringify(baseRuntimeConfig)}\n`,
     "utf8",
   );
+
+  // Single-branch preflight must not create even a disposable validation worktree.
+  writeFileSync(configFile, JSON.stringify({ ...baseRuntimeConfig,
+    git: { ...baseRuntimeConfig.git, executionMode: "single-branch", delivery: "merge", push: false },
+  }));
+  const singleTrace = path.join(repoRoot, ".todo", "single-preflight.trace");
+  const singlePreflight = await callMcpTool("task_preflight", {
+    repoPath: repoRoot, gitDeliveries: ["merge"], capabilityReports: [],
+  }, { GIT_TRACE: singleTrace });
+  assert(singlePreflight?.isError !== true && singlePreflight?.structuredContent?.preflightId,
+    `single-branch preflight failed: ${JSON.stringify(singlePreflight)}`);
+  assert(singlePreflight.structuredContent.localChecks.includes("git-current-copy"),
+    "single-branch preflight did not validate the current copy");
+  assert(!/worktree (?:add|remove)/.test(readFileSync(singleTrace, "utf8")),
+    "single-branch preflight created a worktree");
+  writeFileSync(configFile, JSON.stringify(baseRuntimeConfig));
 
   const authorizedPreflight = await callMcpTool("task_preflight", {
     repoPath: repoRoot,

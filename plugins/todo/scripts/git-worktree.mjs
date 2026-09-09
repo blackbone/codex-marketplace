@@ -1081,6 +1081,32 @@ export function taskWorktreePlan({
   });
 }
 
+// Short synchronous registry transactions share the existing token-owned file lock.
+export function withExecutionRegistryLock(commonDir, operation) {
+  const lockPath = path.join(commonDir, "todo-execution.lock");
+  const deadline = Date.now() + GIT_LOCK_WAIT_MS;
+  let lock;
+  while (!(lock = tryCreateLock(lockPath))) {
+    const owner = readLockOwner(lockPath);
+    if (owner && !processIsAlive(owner.pid)) {
+      const recovery = tryCreateLock(`${lockPath}.recovery`);
+      if (!recovery) throw new Error(`Execution lock recovery is busy or stale; inspect ${lockPath}.recovery`);
+      try {
+        const current = readLockOwner(lockPath);
+        if (current && !processIsAlive(current.pid)) unlinkSync(lockPath);
+      } finally { releaseLock(recovery); }
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      const error = new Error(`Repository execution registry is busy: ${lockPath}`);
+      error.code = "EEXIST";
+      throw error;
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, GIT_LOCK_POLL_MS);
+  }
+  try { return operation(); } finally { releaseLock(lock); }
+}
+
 export function withGitLock(repoRoot, operation) {
   const key = realpathSync(path.resolve(repoRoot));
   const previous = gitQueues.get(key) || Promise.resolve();
