@@ -37,7 +37,7 @@ function descriptor(root, fields = {}) {
     lastHeartbeat: new Date().toISOString(), evalToken: 'fixture-secret-token', ...fields }));
   return file;
 }
-function deps(root) { return { inspect: () => [{ pid: 42, project: root }], probe: async () => ({ state: 'ownership_unverified' }) }; }
+function deps(root) { return { waitSeconds:0, idle:async()=>({state:'ready',reason:'ready',facts:{compiling:false,updating:false}}), inspect: () => [{ pid: 42, project: root }], probe: async () => ({ state: 'ownership_unverified' }) }; }
 function checkPipeline(project, run) {
   descriptor(project.root);
   return checkPipelineReal(project, run, deps(project.root));
@@ -335,7 +335,7 @@ function fakeEnvironment(t) {
     if(args[0]==='open') fs.writeFileSync(process.env.FAKE_PROCESSES,JSON.stringify([{pid:765432,project:args[1]}]));
     console.log(JSON.stringify({success:true,data:{instances:[]}}));`);
   const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, UNITY_CLI: unity,
-    PLUGIN_DATA: path.join(f.base, 'plugin-data'), FAKE_PROCESSES: state, FAKE_CALLS: log };
+    UNITY_READY_TIMEOUT_SECONDS:'0', PLUGIN_DATA: path.join(f.base, 'plugin-data'), FAKE_PROCESSES: state, FAKE_CALLS: log };
   delete env.PLUGIN_ROOT;
   const hook = path.join(copy, 'scripts/session-context.mjs');
   function invoke(cwd, source = 'startup') {
@@ -660,4 +660,101 @@ test('wrapper rejects FIFO input without hanging or invoking Unity', t => {
     {env:f.env,encoding:'utf8',timeout:2000});
   assert.equal(child.status,1); assert.equal(JSON.parse(child.stdout).error,'INVALID_ACTION');
   assert.deepEqual(f.calls(),[]);
+});
+
+test('blocking call survives compilation and imports, dispatches the requested mutation exactly once', async t => {
+  const f=fixture(t), root=f.project(), p=readProject(root); descriptor(root);
+  let clock=0, probes=0, commands=0; const calls=[];
+  const run=async(b,args)=>{
+    calls.push(args.slice(0,2));
+    if(args[0]==='status') return ready(root);
+    if(args[1]==='editor_status') {
+      probes++;
+      return {ok:true,data:{success:true,data:{success:true,result:{projectPath:root,status:probes===1?'compiling':probes===2?'reloading':'ready',
+        compiling:probes===1,domainReloadInProgress:probes===2}}}};
+    }
+    commands++;return {ok:true,data:{success:true,data:{success:true,result:{}}}};
+  };
+  const {editorIdle}=await import('./readiness.mjs');
+  const result=await performReal('run',p,{command:'mutation',args:[]},run,
+    {...deps(root),waitSeconds:10,now:()=>clock,pause:async ms=>{clock+=ms;},idle:editorIdle});
+  assert.equal(result.ok,true);assert.equal(probes,3);assert.equal(commands,1);assert.equal(result.wait.attempts,3);
+  assert.equal(clock,2000);assert.equal(operationOwner(root),null);
+  assert.equal(calls.at(-1)[1],'mutation');
+});
+
+test('temporary missing descriptor and process timeout recover within the same call', async t => {
+  const f=fixture(t),root=f.project();let clock=0,inspections=0,mutations=0;
+  const {UnityError}=await import('./project.mjs');
+  const result=await performReal('run',readProject(root),{command:'mutation',args:[]},async(b,args)=>{
+    if(args[0]==='status') return ready(root);
+    mutations++;return {ok:true,data:{success:true,data:{success:true,result:{}}}};
+  },{...deps(root),waitSeconds:10,now:()=>clock,inspect:()=>{
+    inspections++;if(inspections===1) throw new UnityError('PROCESS_INSPECTION_TIMEOUT','fixture');
+    return [{pid:42,project:root}];
+  },pause:async ms=>{clock+=ms;if(clock>=2000) descriptor(root);}});
+  assert.equal(result.ok,true);assert.equal(mutations,1);assert.equal(result.wait.attempts,3);
+});
+
+test('process permission denial is actionable, permanent, redacted and never treated as import', async t => {
+  const {inspectionError}=await import('./processes.mjs');
+  const f=fixture(t),root=f.project();descriptor(root);let calls=0;
+  const result=await performReal('run',readProject(root),{command:'mutation',args:[]},()=>{calls++;},
+    {...deps(root),waitSeconds:10,inspect:()=>{throw inspectionError({code:'EPERM',stderr:'fixture-secret-token'});},pause:()=>assert.fail('must not wait on permissions')});
+  assert.equal(calls,0);assert.equal(result.reason,'process_inspection_denied');assert.equal(result.requiresInteractive,true);
+  assert.equal(result.facts.processError,'EPERM');assert.equal(result.outcome,'not_sent');assert.equal(operationOwner(root),null);
+  assert.ok(!JSON.stringify(result).includes('fixture-secret-token'));
+});
+
+test('readiness timeout and cancellation release the unsent command lease', async t => {
+  const f=fixture(t),root=f.project();descriptor(root);let clock=0;
+  const run=async()=>status([{pid:42,project:root,state:'compiling'}]);
+  const opts={...deps(root),waitSeconds:2,now:()=>clock,pause:async ms=>{clock+=ms;}};
+  const result=await performReal('run',readProject(root),{command:'mutation',args:[]},run,opts);
+  assert.equal(result.reason,'readiness_timeout');assert.equal(result.facts.lastReason,'compiling');assert.equal(result.executed,false);
+  assert.equal(clock,2000);assert.equal(operationOwner(root),null);
+  const abort=new AbortController();clock=0;
+  const cancel=await performReal('run',readProject(root),{command:'mutation',args:[]},run,
+    {...opts,signal:abort.signal,pause:async()=>abort.abort()});
+  assert.equal(cancel.reason,'readiness_cancelled');assert.equal(cancel.outcome,'not_sent');assert.equal(operationOwner(root),null);
+});
+
+test('unexpected diagnostic exception is not mislabeled as process inspection failure', async t => {
+  const f=fixture(t),root=f.project();descriptor(root);
+  const r=await diagnose(readProject(root),async()=>{throw new Error('private fixture');},deps(root));
+  assert.equal(r.reason,'diagnostic_failed');assert.ok(!JSON.stringify(r).includes('private fixture'));
+});
+
+test('waiting caller survives another live command but never waits out an unknown outcome', async t => {
+  const {acquireOperation,releaseOperation,retainUnknown}=await import('./operations.mjs');
+  const f=fixture(t),root=f.project();descriptor(root);let clock=0,pauses=0;
+  const owner=acquireOperation(root,'command');
+  const r=await performReal('list',readProject(root),{},async(b,args)=>args[0]==='status'?ready(root):{ok:true,data:{success:true,data:{commands:[]}}},
+    {...deps(root),waitSeconds:10,now:()=>clock,pause:async ms=>{clock+=ms;pauses++;releaseOperation(root,owner.id);}});
+  assert.equal(r.ok,true);assert.equal(pauses,1);
+  const unknown=acquireOperation(root,'command');retainUnknown(root,unknown.id);
+  const blocked=await performReal('list',readProject(root),{},()=>assert.fail('no CLI'),{...deps(root),waitSeconds:10,pause:()=>assert.fail('no wait')});
+  assert.equal(blocked.state,'operation_busy');assert.equal(operationOwner(root).kind,'command_outcome_unknown');
+});
+
+test('read-only state probe timeout is bounded and never sends the requested mutation', async t => {
+  const f=fixture(t),root=f.project();descriptor(root);const {editorIdle}=await import('./readiness.mjs');
+  const start=Date.now();let mutations=0;
+  const r=await performReal('run',readProject(root),{command:'mutation',args:[]},async(b,args,options)=>{
+    if(args[0]==='status') return ready(root);
+    if(args[1]==='editor_status') return execute(process.execPath,['-e','setInterval(()=>{},1000)'],options);
+    mutations++;assert.fail('mutation must not be sent');
+  },{...deps(root),waitSeconds:1,idle:editorIdle});
+  assert.equal(r.reason,'readiness_timeout');assert.equal(mutations,0);assert.ok(Date.now()-start<2500);
+  assert.equal(operationOwner(root),null);
+});
+
+test('cancellation after dispatch is an unknown mutation, never a safe retry', async t => {
+  const f=fixture(t),root=f.project();descriptor(root);const abort=new AbortController();
+  const result=await performReal('run',readProject(root),{command:'mutation',args:[]},async(b,args,options)=>{
+    if(args[0]==='status') return ready(root);
+    setTimeout(()=>abort.abort(),40);
+    return execute(process.execPath,['-e','setInterval(()=>{},1000)'],options);
+  },{...deps(root),signal:abort.signal});
+  assert.equal(result.outcome,'unknown');assert.equal(result.error,'CANCELLED');assert.equal(operationOwner(root).kind,'command_outcome_unknown');
 });

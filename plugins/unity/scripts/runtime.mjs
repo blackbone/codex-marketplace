@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { readProject, resolveProject, UnityError, assertTodoCompatible } from './project.mjs';
 import { diagnose, localDiagnosis, report, safeCode, globalArgs } from './diagnostics.mjs';
 import { remaining, withinBudget, outsideBudget } from './budget.mjs';
+import { waitForReady, waitSeconds, cancelled, expired, pause } from './readiness.mjs';
 import { acquireOperation, operationOwner, releaseOperation, retainUnknown, operationBlocked } from './operations.mjs';
 
 const scripts = path.dirname(fileURLToPath(import.meta.url));
@@ -13,19 +14,20 @@ export const PROBE_MS = 2500;
 const COOLDOWN_MS = 30000;
 
 
-export function execute(binary, args, { cwd, timeout = PROBE_MS, acceptExitCode = false } = {}) {
+export function execute(binary, args, { cwd, timeout = PROBE_MS, acceptExitCode = false, signal } = {}) {
   assertTodoCompatible(cwd);
   timeout = remaining(timeout);
   return new Promise(resolve => {
     const env = { ...process.env, UNITY_PROJECT_PATH: cwd };
     delete env.UNITY_LOG_PROXY;
     const child = spawn(binary, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    let stdout = '', bytes = 0, reason = null, done = false, started = false;
+    let stdout = '', bytes = 0, reason = null, done = false, started = Boolean(child.pid);
     child.on('spawn', () => { started = true; });
     function finish(code) {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       let data;
       try { data = JSON.parse(stdout); } catch { /* Only open accepts a plain-text success. */ }
       resolve({ started, ok: code === 0 && (data?.success === true || (acceptExitCode && !data)) && !reason, code, data,
@@ -37,7 +39,10 @@ export function execute(binary, args, { cwd, timeout = PROBE_MS, acceptExitCode 
       child.stdout.destroy(); child.stderr.destroy();
       finish(null); // A descendant retaining stdout must not defeat the time bound.
     }
+    const onAbort = () => abort('CANCELLED');
     const timer = setTimeout(() => abort('TIMEOUT'), timeout);
+    signal?.addEventListener('abort', onAbort, {once:true});
+    if (signal?.aborted) onAbort();
     child.stdout.on('data', chunk => {
       bytes += chunk.length;
       if (bytes > 8 * 1024 * 1024) abort('OUTPUT_LIMIT');
@@ -156,13 +161,14 @@ const forbidden = new Set(['--project-path', '--runtime', '--runtime-path', '--i
   '--format', '--json', '--non-interactive', '--proxy', '--proxy-disable', '--log-proxy', '--no-log-proxy', '--no-banner', '--no-pager']);
 export function validateAction(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input) ||
-      Object.keys(input).some(key => !['command', 'args', 'timeoutSeconds'].includes(key)) ||
+      Object.keys(input).some(key => !['command', 'args', 'timeoutSeconds', 'waitSeconds'].includes(key)) ||
       !/^[A-Za-z][A-Za-z0-9_./-]*$/.test(input.command || '') ||
       !Array.isArray(input.args) || input.args.some(arg => typeof arg !== 'string' || arg.includes('\0') || arg === '--' || forbidden.has(arg.split('=')[0]))) {
     throw new UnityError('INVALID_ACTION', 'Use {command, args: string[], timeoutSeconds?}; target overrides and detached jobs are not allowed.');
   }
   const timeout = input.timeoutSeconds ?? 30;
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 120) throw new UnityError('INVALID_ACTION', 'timeoutSeconds must be an integer from 1 to 120.');
+  if (input.waitSeconds !== undefined) waitSeconds(input.waitSeconds);
   return { ...input, timeoutSeconds: timeout };
 }
 
@@ -188,35 +194,53 @@ export function commandOutcome(result, action) {
 }
 
 export async function perform(action, project, input, run = execute, deps = {}) {
-  return withinBudget(() => performInner(action, project, input, run, deps));
+  return outsideBudget(() => performInner(action, project, input, run, deps));
 }
 async function performInner(action, project, input, run, deps) {
   const request = action === 'run' ? validateAction(input) : null;
-  assertTodoCompatible(project.root);
-  if (operationOwner(project.root)) return operationBlocked(project);
-  const lease = acquireOperation(project.root, 'command');
-  if (!lease) return operationBlocked(project);
+  const secondsToWait = waitSeconds(deps.waitSeconds ?? request?.waitSeconds);
+  const now = deps.now || Date.now, startedAt = now();
+  const deadline = deps.deadline ?? startedAt + (secondsToWait === 0 ? 16000 : secondsToWait * 1000);
+  const call = (binary,args,options) => run(binary,args,{...options,signal:deps.signal});
+  let lease;
+  while (!lease) {
+    if (deps.signal?.aborted) return cancelled(project);
+    if (now() >= deadline) return expired(project,operationBlocked(project),now()-startedAt);
+    withinBudget(() => assertTodoCompatible(project.root),Math.max(1,deadline-now()));
+    const owner = operationOwner(project.root);
+    if (owner) {
+      let active = false;
+      if (owner.kind === 'command' && Number.isInteger(owner.pid) && owner.pid > 0) {
+        try { process.kill(owner.pid,0); active = true; } catch(e) { active = e.code === 'EPERM'; }
+      }
+      if (!active || secondsToWait === 0) return operationBlocked(project);
+      deps.onProgress?.({reason:'operation_in_progress',elapsedMs:now()-startedAt});
+      await (deps.pause || pause)(Math.max(0,Math.min(1000,deadline-now())),deps.signal);
+    } else lease = acquireOperation(project.root, 'command');
+  }
   let sent = false, unknown = false;
   try {
-    const status = await checkPipeline(project, run, deps);
+    const status = await waitForReady(project, call, {...deps,waitSeconds:secondsToWait,deadline});
     if (status.state !== 'ready') return { ok: false, ...status, executed: false, outcome: 'not_sent' };
     const args = action === 'run' ? [request.command, ...request.args] :
       ['--detail', input?.detail || 'compact', '--limit', '20', ...(input?.query ? ['--query', input.query] : [])];
     const seconds = request?.timeoutSeconds || 3;
     assertTodoCompatible(project.root);
     // Recheck local identity immediately before dispatch; no second network readiness call.
-    const local = localDiagnosis(project, deps);
+    const local = withinBudget(() => localDiagnosis(project, deps),Math.max(1,deadline-now()));
     if (local.reason !== 'locally_matched' || local.editor.pid !== status.pid) return { ok: false,
       ...report(project, local.reason === 'locally_matched' ? 'descriptor_pid_mismatch' : local.reason, local.facts), executed: false, outcome: 'not_sent' };
+    if (deps.signal?.aborted) return cancelled(project);
+    if (now() >= deadline) return expired(project,status,now()-startedAt);
     sent = true;
-    const result = await outsideBudget(() => run(process.env.UNITY_CLI || 'unity',
+    const result = await outsideBudget(() => call(process.env.UNITY_CLI || 'unity',
       ['command', ...args, '--project-path', project.root, '--timeout', String(seconds), ...globalArgs],
       { cwd: project.root, timeout: seconds * 1000 + 1000 }));
     const outcome = commandOutcome(result, action);
     unknown = outcome === 'unknown' && action === 'run';
     const ok = outcome === 'succeeded';
     return { ok, project, state: ok ? 'completed' : 'command_failed', reason: ok ? 'command_succeeded' : `command_${outcome}`,
-      outcome, executed: action === 'run' ? (ok ? true : outcome === 'unknown' ? 'unknown' : false) : false,
+      outcome, wait:status.wait, executed: action === 'run' ? (ok ? true : outcome === 'unknown' ? 'unknown' : false) : false,
       ...(ok ? { result: safeResult(result.data, local.descriptor.token) } : { error: safeCode(result.error), nextAction: { code: 'inspect_result', instruction: 'Do not resend automatically. Reconcile possible side effects before a new attempt.' } }),
       ...(unknown ? { operationId: lease.id } : {}) };
   } catch (e) {
@@ -283,4 +307,4 @@ export async function initialize(project, run = execute) {
 
 export { resolveProject };
 
-export { localDiagnosis, report, withinBudget, outsideBudget };
+export { localDiagnosis, report, withinBudget, outsideBudget, waitForReady };

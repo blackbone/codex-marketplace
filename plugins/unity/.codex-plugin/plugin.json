@@ -1,6 +1,6 @@
 {
   "name": "unity",
-  "version": "0.1.0+codex.20260909194252",
+  "version": "0.1.0+codex.20260909225412",
   "description": "Open the current Unity project and run Editor actions through the official CLI, with Pipeline checks only on demand.",
   "author": {
     "name": "blackbone"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Unity",
     "shortDescription": "Open Unity and check Pipeline only on demand",
-    "longDescription": "Recognize the current Unity project, open or reuse its Editor at session startup, and use the official Unity CLI for Editor actions. Pipeline is checked once per action, without polling, queued work or automatic retries. Includes explicit Pipeline initialization.",
+    "longDescription": "Recognize the current Unity project, open or reuse its Editor at session startup, and use the official Unity CLI for Editor actions. Calls wait for Pipeline readiness, compilation and import completion before dispatching once. Includes bounded diagnostics and explicit connection recovery.",
     "developerName": "blackbone",
     "category": "Productivity",
     "capabilities": [

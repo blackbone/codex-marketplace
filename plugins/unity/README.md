@@ -2,8 +2,9 @@
 
 A Codex plugin using the official Unity CLI → `com.unity.pipeline` → Unity Editor.
 Session startup resolves the task's project and opens or reuses its Editor.
-Pipeline readiness is checked on demand; there is no readiness polling, sleep,
-queue, background retry or automatic command replay.
+Requested calls wait for Pipeline readiness and idle Editor state before sending
+the command once. Waiting happens inside that tool call, with no background queue
+or automatic command replay.
 
 ## Installation and configuration
 
@@ -49,8 +50,8 @@ node "<PLUGIN_ROOT>/scripts/cli.mjs" list --cwd "<task-folder>" --query editor_s
 node "<PLUGIN_ROOT>/scripts/cli.mjs" run --cwd "<task-folder>" --input "<absolute-request.json>"
 ```
 
-`doctor` and `status` share the same one-shot read-only diagnosis. `list` and `run`
-already perform it; do not prepend another status call. `open` launches only if
+`doctor` is an immediate read-only diagnosis. `status`, `list` and `run` wait
+for readiness by default; do not prepend another status call to list/run. `open` launches only if
 process inspection finds no target Editor and no unidentified owner. Startup,
 open and the launch worker use the same local diagnosis as command preflight.
 Startup does not make a network probe; compaction restores context without opening.
@@ -61,7 +62,8 @@ CLI status. Unknown ownership blocks even when one known target Editor exists.
 Existing `state`, `project`, `pid`, `ok` and `executed` fields remain. Diagnostics
 add `reason` (machine code), `facts` (allowlisted observations), `nextAction` and
 `requiresInteractive`. Descriptor/transport failures retain `state: pipeline_unavailable`;
-confirmed busy states retain `pipeline_not_ready`. Consumers must use `reason`
+one-shot busy states retain `pipeline_not_ready`. A wait that expires returns
+`readiness_timeout`, `outcome: not_sent`, and `facts.lastReason`. Consumers must use `reason`
 and `nextAction`, not infer that `pipeline_unavailable` means the Editor is closed.
 Raw CLI failures are no longer returned as result envelopes. Successful payloads
 omit parameters, logs, warnings, error details and authentication fields.
@@ -77,15 +79,16 @@ omit parameters, logs, warnings, error details and authentication fields.
 | descriptor_stale | CLI reported unreachable and heartbeat is older than the diagnostic 30-second threshold; age alone never proves a dead server. |
 | server_unreachable | One bounded request to the verified target socket failed. |
 | authentication_failed | CLI authentication error or HTTP 401/403; never bypass auth. |
-| compiling / domain_reload / settling | Current structured state; return without waiting. Settling does not prove compiler errors. |
+| compiling / domain_reload / settling | Current structured state; calls wait for readiness. Settling does not prove compiler errors. |
 | blocked_by_dialog | Current structured status confirms a modal; deliberate UI inspection. |
 | protocol_incompatible | Explicit compatibility error or unsupported response shape, not a guessed version conflict. |
 | pipeline_unavailable | CLI did not discover the exact Editor; cause still unknown. |
-| ready | Process, descriptor PID/project and CLI ready instance agree. |
+| process_inspection_denied | EPERM/EACCES from the worker environment; requires authorized access configuration, not an Editor reopen. |
+| ready | Doctor checks process, descriptor and CLI; waiting calls additionally require a live idle Editor status. |
 
-The diagnostic budget is shared across process inspection, ToDo checks, one CLI
+Each diagnostic probe shares a budget across process inspection, ToDo checks, one CLI
 status (maximum 2.5 seconds) and optional fallback GET (maximum 800 ms): 6 seconds.
-Wrapper project resolution and pre-dispatch identity checks share that same deadline. No log scanning is used to label
+The waiting call uses a separate overall deadline; no individual probe may exceed its remaining time. No log scanning is used to label
 current compilation, domain reload or Safe Mode. The fallback only contacts a
 loopback socket whose listener PID was verified by the OS; it uses the real
 descriptor token in memory. A successful fallback does not replace CLI readiness
@@ -100,6 +103,46 @@ of CLI overhead. `outcome` is `not_sent`, `succeeded`, `rejected`, or `unknown`.
 Success requires both the CLI envelope and nested Pipeline success. Only explicit
 pre-execution rejection codes are classified as rejected; failed custom code may
 already have changed the project. Unknown results are never replayed automatically.
+
+## Blocking readiness for ToDo workers
+
+`status`, `list` and `run` stay inside one cancellable tool call for up to **600 seconds**
+by default. Set `--wait-seconds <0..3600>` or `UNITY_READY_TIMEOUT_SECONDS`; run requests
+also accept `waitSeconds`. Explicit CLI options take precedence over the request,
+then the environment, then the default. Zero performs one attempt. `doctor`, startup,
+open, init and explicit recovery verification remain short operations.
+
+Only readiness probes repeat, at one-second intervals. After basic CLI readiness,
+the known read-only official `editor_status` command must report `compiling: false`
+and `domainReloadInProgress: false`; Pipeline uses the latter name for Unity's
+`EditorApplication.isUpdating`, which includes asset import. Thus server `ready`
+alone cannot trigger a mutation while the detailed Editor state still says busy.
+Read-only status requests may wait on the Editor main thread and have their own
+bounded timeout. Temporary process timeouts, connection loss/descriptor rewrites
+and compilation/import busy states can recover within the same call. Permanent
+ownership, authentication, permission and protocol failures return immediately.
+The loop does not claim that a missing descriptor proves import is in progress.
+
+The total readiness deadline also covers contention with another live wrapper
+command. It does not automatically release a dead/unknown command or UI recovery
+lease. SIGINT/SIGTERM cancels pre-dispatch waiting and releases that unsent lease;
+a cancellation after dispatch has an unknown outcome and keeps the lease. No
+requested mutation is automatically replayed. Client readiness checks cannot stop
+a new external source edit from starting another import immediately after a check.
+
+ToDo workers must keep waiting on the shell tool's returned session ID, never mark
+the task failed because the wrapper is still running. Give the shell at least
+readiness timeout + command timeout + 30 seconds. Progress is a short allowlisted
+stderr line; stdout remains the final JSON response.
+
+The reported incident's original low-level error was not retained by the old
+wrapper. A Codex workspace sandbox independently reproduces `ps` failing with EPERM
+on this machine. ToDo defaults to `codexSandbox: "workspace-write"`, overriding a
+global full-access app setting. The new reason is `process_inspection_denied`, with
+a safe OS error code and an access-configuration action. Import waits cannot fix
+that policy. The plugin never weakens or bypasses sandbox policy automatically.
+An authorized project-specific worker configuration must provide process inspection
+and local Pipeline access. See the [official permissions guide](https://learn.chatgpt.com/docs/permissions).
 
 ## Explicit connection recovery
 

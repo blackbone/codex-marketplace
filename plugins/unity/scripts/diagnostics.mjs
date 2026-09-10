@@ -37,19 +37,23 @@ const reasons = {
   pipeline_not_ready: ['new_request', 'Pipeline did not report readiness. Return now without dispatch.'],
   diagnostic_timeout: ['new_request', 'The shared diagnostic budget expired; nothing was dispatched.'],
   cli_missing: ['install_cli', 'The configured official Unity CLI executable was not found.'],
+  process_inspection_denied: ['configure_worker_access', 'The worker environment blocks OS process inspection. Waiting for import cannot grant access. Use an explicitly authorized worker permission configuration; never bypass the sandbox.'],
+  process_inspection_timeout: ['wait', 'Process inspection timed out; retry only readiness within the bounded call.'],
+  diagnostic_failed: ['inspect_diagnostic', 'An unexpected diagnostic failure occurred. No user command was dispatched.'],
   process_inspection_failed: ['identify_editor', 'Process ownership could not be inspected; do not launch or dispatch.'],
 };
 export function report(project, reason, facts = {}, state) {
   const next = reasons[reason] || reasons.pipeline_unavailable;
-  const legacy = state || (reason.startsWith('descriptor_') || ['server_unreachable','authentication_failed','protocol_incompatible','diagnostic_timeout','cli_missing','process_inspection_failed'].includes(reason)
+  const legacy = state || (reason.startsWith('descriptor_') || ['server_unreachable','authentication_failed','protocol_incompatible','diagnostic_timeout','cli_missing','process_inspection_failed','process_inspection_denied','process_inspection_timeout','diagnostic_failed'].includes(reason)
     ? 'pipeline_unavailable' : ['compiling','domain_reload','settling','blocked_by_dialog'].includes(reason) ? 'pipeline_not_ready' : reason);
   return { project, state: legacy, reason, facts, nextAction: { code: next[0], instruction: next[1] },
-    requiresInteractive: reason === 'blocked_by_dialog', ...(reason === 'blocked_by_dialog' ? { interactiveReason: 'A live status response confirms a modal dialog; this wrapper cannot select UI buttons.' } : {}),
+    requiresInteractive: ['blocked_by_dialog','process_inspection_denied'].includes(reason), ...(reason === 'blocked_by_dialog' ? { interactiveReason: 'A live status response confirms a modal dialog; this wrapper cannot select UI buttons.' } : {}),
+    ...(reason === 'process_inspection_denied' ? { interactiveReason: 'The current worker cannot inspect OS processes. An authorized permission change is required, not opening another Unity Editor.' } : {}),
     ...(Number.isInteger(facts.editorPid) ? { pid: facts.editorPid } : {}) };
 }
 export function safeCode(value) {
   // Arbitrary error messages/codes from extensions are not safe diagnostics.
-  return new Set(['TIMEOUT','OUTPUT_LIMIT','CLI_MISSING','CLI_FAILED','INVALID_RESPONSE','STATUS_NO_INSTANCES','STATUS_ALL_UNREACHABLE',
+  return new Set(['TIMEOUT','CANCELLED','OUTPUT_LIMIT','CLI_MISSING','CLI_FAILED','INVALID_RESPONSE','STATUS_NO_INSTANCES','STATUS_ALL_UNREACHABLE',
     'UNAUTHORIZED','AUTHENTICATION_FAILED','PROTOCOL_MISMATCH','VERSION_MISMATCH','COMMAND_NOT_FOUND','INVALID_ARGUMENTS',
     'EDITOR_BUSY','BLOCKED_BY_DIALOG','DIAGNOSTIC_TIMEOUT']).has(value) ? value : 'UNCLASSIFIED_ERROR';
 }
@@ -182,7 +186,10 @@ export async function diagnose(project, run, deps = {}) {
       return report(project, 'pipeline_unavailable', facts);
     } catch (e) {
       if (e.code?.startsWith('TODO_')) throw e;
-      return report(project, e.code === 'DIAGNOSTIC_TIMEOUT' ? 'diagnostic_timeout' : 'process_inspection_failed', facts);
+      const reason = { DIAGNOSTIC_TIMEOUT: 'diagnostic_timeout', PROCESS_INSPECTION_TIMEOUT: 'process_inspection_timeout',
+        PROCESS_INSPECTION_DENIED: 'process_inspection_denied', PROCESS_INSPECTION_FAILED: 'process_inspection_failed' }[e.code] || 'diagnostic_failed';
+      if (e.details?.systemCode) facts.processError = e.details.systemCode;
+      return report(project, reason, facts);
     }
   });
 }

@@ -25,13 +25,22 @@ export function isAssetImportWorker(value) {
   return args.some((arg, index) => /^-name$/i.test(arg) && /^AssetImportWorker(?:HW)?\d+$/.test(args[index + 1] || ''));
 }
 
+export function inspectionError(error) {
+  if (error.code === 'DIAGNOSTIC_TIMEOUT') return error;
+  const denied = ['EPERM','EACCES'].includes(error.code) || /operation not permitted|permission denied/i.test(String(error.stderr || ''));
+  const timeout = error.code === 'ETIMEDOUT' || error.signal === 'SIGTERM';
+  return new UnityError(denied ? 'PROCESS_INSPECTION_DENIED' : timeout ? 'PROCESS_INSPECTION_TIMEOUT' : 'PROCESS_INSPECTION_FAILED',
+    denied ? 'The execution environment denies process inspection.' : timeout ? 'Process inspection timed out.' : 'Could not inspect Unity processes.',
+    { systemCode: ['EPERM','EACCES','ETIMEDOUT','ENOENT','ENOBUFS'].includes(error.code) ? error.code : 'UNKNOWN' });
+}
+
 export function inspectEditors(root) {
   if (!['darwin', 'linux'].includes(process.platform)) {
     throw new UnityError('UNSUPPORTED_PLATFORM', 'Automatic Editor detection currently supports macOS and Linux.');
   }
   let output;
   try { output = execFileSync('ps', ['-axo', 'pid=,stat=,comm='], { encoding: 'utf8', timeout: remaining(1500), maxBuffer: 4 * 1024 * 1024 }); }
-  catch { throw new UnityError('PROCESS_INSPECTION_FAILED', 'Could not inspect Unity processes; no Editor was launched.'); }
+  catch (error) { throw inspectionError(error); }
   const editors = [];
   const deadline = Date.now() + remaining(3000);
   for (const line of output.split('\n')) {
@@ -57,7 +66,10 @@ export function inspectEditors(root) {
           if (locks.split('\n').includes(`p${pid}`)) project = root;
         } catch { /* Unknown ownership must not trigger another Editor. */ }
       }
-    } catch { /* Exited or inaccessible processes remain conservatively unknown. */ }
+    } catch (error) {
+      if (['EPERM','EACCES','ETIMEDOUT','DIAGNOSTIC_TIMEOUT'].includes(error.code)) throw inspectionError(error);
+      // Exited or inaccessible processes remain conservatively unknown.
+    }
     remaining();
     editors.push({ pid, project });
   }
@@ -69,6 +81,5 @@ export function editorState(root, editors) {
   if (matching.length > 1) return { state: 'multiple_editors', pids: matching.map(editor => editor.pid) };
   if (editors.some(editor => !editor.project)) return { state: 'editor_unidentified' };
   if (matching.length === 1) return { state: 'editor_running', pid: matching[0].pid };
-  if (editors.some(editor => !editor.project)) return { state: 'editor_unidentified' };
   return { state: 'editor_closed' };
 }

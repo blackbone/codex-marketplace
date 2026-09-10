@@ -23,3 +23,15 @@ removal. UI Stop/Start recovery is regression-tested as a lease/protocol flow in
 fixtures; the historical live recovery is user-reported and was not reproduced
 against the working project. Linux live behavior, arbitrary custom commands and
 Codex's native hook invocation lifecycle remain outside this live proof.
+
+
+## Blocking calls — 2026-09-10
+
+Added fixture coverage for one call crossing compilation, asset updating, a missing
+descriptor and process-inspection timeouts before a single user-command dispatch.
+Also covered bounded timeout, cancelled waiting, cancelled dispatched commands,
+waiting behind a live caller, retained unknown outcomes and permanent EPERM denial.
+The Codex workspace permission profile reproduced an OS process-inspection EPERM
+in a read-only diagnostic. The original worker receipt did not retain its low-level
+exception, so the reproduction establishes the configuration blocker, not a recovered
+incident trace. Worker permissions are not changed by the plugin itself.

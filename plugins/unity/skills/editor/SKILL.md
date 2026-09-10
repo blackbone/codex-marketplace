@@ -18,7 +18,7 @@ without ToDo keep the usual workflow. Source-only work needs no Editor commands.
 
 The session hook recognizes the task's Unity project and opens or reuses its
 Editor. It performs local descriptor/process diagnosis without a network readiness probe. Use the bundled wrapper for
-Editor operations; it checks readiness once before each call and pins the target.
+Editor operations; it waits for readiness, compilation and import completion before dispatch, and pins the target.
 
 `<PLUGIN_ROOT>` is two directories above this skill folder. Expand it to an
 absolute path from this skill's supplied location; do not depend on a shell
@@ -40,7 +40,7 @@ node "<PLUGIN_ROOT>/scripts/cli.mjs" list --cwd "<task-folder>" --query "<select
 
 Use `open` when the user requests opening/reopening Unity or after they choose a
 project that the hook could not select. `launch_requested` only means a launch
-was submitted. `status` is for diagnosis; `list` and `run` already perform their
+was submitted. `doctor` is for immediate diagnosis; `status` waits for readiness; `list` and `run` already perform their
 own readiness check, so they do not need a preceding status call.
 
 Discover relevant commands and then their argument contracts from this project's
@@ -76,8 +76,8 @@ read-back command. Follow the target repository's existing change workflow.
 
 ## Diagnose and recover explicitly
 
-`status` or `doctor` returns one bounded read-only diagnosis. Do not run it before
-`list`/`run`, which already check once. Read `reason`, `facts` and `nextAction`;
+`doctor` returns one bounded read-only diagnosis; `status`, `list` and `run` wait for readiness by default. Do not run it before
+`list`/`run`, which already wait before sending their command. Read `reason`, `facts` and `nextAction`;
 `state: pipeline_unavailable` does not mean Editor is closed. Missing/invalid/stale
 or mismatched descriptor, authentication, transport and protocol failures are
 separate reasons. Do not infer compilation or Safe Mode from old logs. Unknown
@@ -119,15 +119,38 @@ not auto-unlocked and a live command owner cannot be cancelled. Use a deliberate
 inspection if read-back commands are blocked by this lease. Do not remove lock files.
 
 - `editor_closed`: explicit open for the exact project.
-- `launch_requested` / `launching`: no second launch and no readiness wait.
+- `launch_requested` / `launching`: do not open again; the requested wrapper call waits within its deadline.
 - `launch_stale`: explicit open can recover a dead launch lease after 30 seconds.
 - `pipeline_missing`: init only for requested installation.
-- `compiling`, `domain_reload`, `settling`: return now with the observed state.
+- `compiling`, `domain_reload`, `settling`: the wrapper waits inside this call, then continues.
 - `blocked_by_dialog`: inspect the confirmed modal; do not guess a button.
 - `protocol_incompatible` / `cli_missing`: resolve the prerequisite explicitly.
 - `editor_unidentified` / `multiple_editors`: establish ownership; never kill users' processes.
 
-No waiting, sleep, polling, queues, wakeups or automatic retries. A new check is
-allowed only for a new requested action or after a distinct recovery action.
+## ToDo worker execution
+
+Keep the same wrapper tool call alive while it waits. If the shell tool returns a
+running session ID, continue waiting for **that session**; do not report a failed
+ToDo attempt or start another command just because the first call is still running.
+Allow at least readiness timeout + command timeout + 30 seconds for the surrounding
+shell execution. The default readiness limit is 600 seconds, overridable with
+`--wait-seconds <0..3600>` or `UNITY_READY_TIMEOUT_SECONDS`; zero makes one attempt.
+This is separate from the command's JSON `timeoutSeconds` (1..120 seconds).
+
+Only process/connection checks and the known read-only `editor_status` probe are
+repeated. Both `compiling` and `domainReloadInProgress` (Pipeline's name for Unity
+`isUpdating`, including asset import) must be false. A live command from another
+plugin caller is waited out within the same deadline. Recovery/unknown-outcome
+leases are never automatically released. A pending call is cancellable. No daemon
+queue, task restart, scheduled wakeup or replay of a dispatched operation is used.
+
+`readiness_timeout` means that the requested operation was not sent; preserve the
+implementation and report its last observed reason separately from code correctness.
+`process_inspection_denied` with EPERM/EACCES is a worker permission problem, not
+compilation. Waiting cannot fix it. Report the exact required permission change;
+do not change sandbox policy without authorization or bypass it via another tool.
+In ToDo, `codexSandbox` can override the app's global setting; check the actual worker
+configuration. Do not ask to open an Editor already detected for this project.
+
 Source-only work can continue independently. See README for diagnostic evidence
 and the still-unestablished root cause of the historical missing descriptor.

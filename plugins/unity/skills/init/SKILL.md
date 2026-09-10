@@ -31,7 +31,7 @@ After successful setup, call the wrapper's `open` operation once if opening the
 project is part of the request. Report `pipeline_installed` or `pipeline_present`
 separately from Editor readiness. Do not wait for package import, compilation,
 or Pipeline startup and do not repeatedly check status. The next requested
-Editor action checks readiness itself.
+Editor action waits for readiness, compilation and import completion itself.
 
 Requirements: Node.js 22+, official `unity` CLI on PATH (or `UNITY_CLI` pointing
 to its executable), and Unity 6+. If missing, report the prerequisite. Do not
