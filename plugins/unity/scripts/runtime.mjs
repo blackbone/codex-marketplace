@@ -4,10 +4,14 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readProject, resolveProject, UnityError, assertTodoCompatible } from './project.mjs';
-import { diagnose, localDiagnosis, report, safeCode, globalArgs } from './diagnostics.mjs';
+import { diagnose, diagnoseFull, localDiagnosis, report, safeCode, globalArgs } from './diagnostics.mjs';
 import { remaining, withinBudget, outsideBudget } from './budget.mjs';
-import { waitForReady, waitSeconds, cancelled, expired, pause } from './readiness.mjs';
-import { acquireOperation, operationOwner, releaseOperation, retainUnknown, operationBlocked } from './operations.mjs';
+import { waitForReady, waitSeconds, cancelled, expired, pause, temporaryReasons } from './readiness.mjs';
+import { acquireOperation, operationOwner, releaseOperation, retainUnknown, operationBlocked, updateOperation, lockPath } from './operations.mjs';
+
+import { safeResult, resultPayload } from './results.mjs';
+export { safeResult };
+import { completionReference, waitCompletion, completionSeconds, inspectionCommands, validReference, packageMutations } from './completion.mjs';
 
 const scripts = path.dirname(fileURLToPath(import.meta.url));
 export const PROBE_MS = 2500;
@@ -31,7 +35,7 @@ export function execute(binary, args, { cwd, timeout = PROBE_MS, acceptExitCode 
       let data;
       try { data = JSON.parse(stdout); } catch { /* Only open accepts a plain-text success. */ }
       resolve({ started, ok: code === 0 && (data?.success === true || (acceptExitCode && !data)) && !reason, code, data,
-        error: reason || (data?.errors?.[0]?.code ? safeCode(data.errors[0].code) : null) || (code === 0 ? 'INVALID_RESPONSE' : 'CLI_FAILED') });
+        error: reason || (data?.errors?.[0]?.code ? safeCode(data.errors[0].code) : null) || (code === 0 ? (data?.success === true ? null : 'INVALID_RESPONSE') : 'CLI_FAILED') });
     }
     function abort(error) {
       reason = error;
@@ -154,14 +158,14 @@ export function ensureEditor(project, deps = {}) {
 }
 
 export async function checkPipeline(project, run = execute, deps = {}) {
-  return diagnose(project, run, deps);
+  return deps.detail==='full'?diagnoseFull(project,run,deps):diagnose(project,run,deps);
 }
 
 const forbidden = new Set(['--project-path', '--runtime', '--runtime-path', '--instance', '--port', '--detach', '--timeout',
   '--format', '--json', '--non-interactive', '--proxy', '--proxy-disable', '--log-proxy', '--no-log-proxy', '--no-banner', '--no-pager']);
 export function validateAction(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input) ||
-      Object.keys(input).some(key => !['command', 'args', 'timeoutSeconds', 'waitSeconds'].includes(key)) ||
+      Object.keys(input).some(key => !['command', 'args', 'timeoutSeconds', 'waitSeconds', 'job', 'completionTimeoutSeconds'].includes(key)) ||
       !/^[A-Za-z][A-Za-z0-9_./-]*$/.test(input.command || '') ||
       !Array.isArray(input.args) || input.args.some(arg => typeof arg !== 'string' || arg.includes('\0') || arg === '--' || forbidden.has(arg.split('=')[0]))) {
     throw new UnityError('INVALID_ACTION', 'Use {command, args: string[], timeoutSeconds?}; target overrides and detached jobs are not allowed.');
@@ -169,16 +173,10 @@ export function validateAction(input) {
   const timeout = input.timeoutSeconds ?? 30;
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 120) throw new UnityError('INVALID_ACTION', 'timeoutSeconds must be an integer from 1 to 120.');
   if (input.waitSeconds !== undefined) waitSeconds(input.waitSeconds);
+  if (input.job !== undefined && typeof input.job !== 'boolean') throw new UnityError('INVALID_ACTION','job must be a boolean.');
+  if (input.job && (['recompile','run_tests','package_resolve'].includes(input.command) || packageMutations.has(input.command))) throw new UnityError('INVALID_ACTION','Use native completion tracking for compilation, tests and packages; jobs do not survive domain reload.');
+  if (input.completionTimeoutSeconds !== undefined) completionSeconds(input.completionTimeoutSeconds);
   return { ...input, timeoutSeconds: timeout };
-}
-
-export function safeResult(value, token) {
-  if (typeof value === 'string') return token ? value.replaceAll(token, '[redacted]') : value;
-  if (Array.isArray(value)) return value.map(item => safeResult(item, token));
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value).filter(([key,item]) =>
-    !(key === 'parameters' && !Array.isArray(item)) && !/^(?:.*token|authorization|password|secret|credentials|logs?|stackTrace|errors|warnings)$/i.test(key))
-    .map(([key,item]) => [key, safeResult(item, token)]));
 }
 
 export function commandOutcome(result, action) {
@@ -189,7 +187,7 @@ export function commandOutcome(result, action) {
   // A failed custom command can have changed state before failing, so it is unknown.
   const rejectedCodes = new Set(['COMMAND_NOT_FOUND','INVALID_ARGUMENTS','UNAUTHORIZED','AUTHENTICATION_FAILED','EDITOR_BUSY','BLOCKED_BY_DIALOG']);
   if (rejectedCodes.has(result.error) || (envelope?.success === false && rejectedCodes.has(envelope.errors?.[0]?.code))) return 'rejected';
-  if (result.ok && envelope?.success === true && (action === 'list' ? Array.isArray(nested?.commands) : nested?.success === true) && nested?.result?.success !== false) return 'succeeded';
+  if (result.ok && envelope?.success === true && (action === 'list' ? Array.isArray(nested?.commands) : nested?.success === true) && resultPayload(result)?.success !== false) return 'succeeded';
   return 'unknown';
 }
 
@@ -202,7 +200,13 @@ async function performInner(action, project, input, run, deps) {
   const now = deps.now || Date.now, startedAt = now();
   const deadline = deps.deadline ?? startedAt + (secondsToWait === 0 ? 16000 : secondsToWait * 1000);
   const call = (binary,args,options) => run(binary,args,{...options,signal:deps.signal});
-  let lease;
+  const readOnly = request && !request.job && request.args.length === 0 && inspectionCommands.has(request.command);
+  let lease, publicationWaitStarted, borrowed = false;
+  if (deps.observationId) {
+    const owner=operationOwner(project.root);
+    if (!readOnly || owner?.id!==deps.observationId || owner.kind!=='command_outcome_unknown') throw new UnityError('INVALID_OPERATION','Inspection requires the pending operation ID and a known status command without arguments.');
+    lease=owner; borrowed=true;
+  }
   while (!lease) {
     if (deps.signal?.aborted) return cancelled(project);
     if (now() >= deadline) return expired(project,operationBlocked(project),now()-startedAt);
@@ -213,6 +217,12 @@ async function performInner(action, project, input, run, deps) {
       if (owner.kind === 'command' && Number.isInteger(owner.pid) && owner.pid > 0) {
         try { process.kill(owner.pid,0); active = true; } catch(e) { active = e.code === 'EPERM'; }
       }
+      // A concurrent mkdir winner has not necessarily published owner.json yet.
+      // Wait briefly; never remove or claim an unidentified/dead owner's lease.
+      if (owner.kind === 'unidentified' && secondsToWait > 0) {
+        publicationWaitStarted ??= now();
+        if (now()-publicationWaitStarted < 2000) active = true;
+      }
       if (!active || secondsToWait === 0) return operationBlocked(project);
       deps.onProgress?.({reason:'operation_in_progress',elapsedMs:now()-startedAt});
       await (deps.pause || pause)(Math.max(0,Math.min(1000,deadline-now())),deps.signal);
@@ -220,38 +230,100 @@ async function performInner(action, project, input, run, deps) {
   }
   let sent = false, unknown = false;
   try {
-    const status = await waitForReady(project, call, {...deps,waitSeconds:secondsToWait,deadline});
-    if (status.state !== 'ready') return { ok: false, ...status, executed: false, outcome: 'not_sent' };
-    const args = action === 'run' ? [request.command, ...request.args] :
-      ['--detail', input?.detail || 'compact', '--limit', '20', ...(input?.query ? ['--query', input.query] : [])];
+    let status, local;
+    if (borrowed) {
+      // Diagnostic-only observation must work while the pending operation is busy.
+      // It has fixed command names/no args and cannot release the original lease.
+      local=withinBudget(()=>localDiagnosis(project,deps));
+      if(local.reason!=='locally_matched') return {ok:false,...report(project,local.reason,local.facts),executed:false,outcome:'not_sent'};
+      status={pid:local.editor.pid,wait:{attempts:0,elapsedMs:now()-startedAt}};
+    }
+    while (!borrowed) {
+      status = await waitForReady(project, call, {...deps,waitSeconds:secondsToWait,deadline});
+      if (status.state !== 'ready') return { ok:false,...status,executed:false,outcome:'not_sent' };
+      assertTodoCompatible(project.root);
+      try { local = withinBudget(() => localDiagnosis(project,deps),Math.max(1,deadline-now())); }
+      catch(e) {
+        const reason={DIAGNOSTIC_TIMEOUT:'diagnostic_timeout',PROCESS_INSPECTION_TIMEOUT:'process_inspection_timeout',PROCESS_INSPECTION_DENIED:'process_inspection_denied'}[e.code];
+        if(!reason) throw e;
+        local={reason,facts:e.details?.systemCode?{processError:e.details.systemCode}:{}};
+      }
+      if (local.reason === 'locally_matched' && local.editor.pid === status.pid) break;
+      const reason = local.reason === 'locally_matched' ? 'descriptor_pid_mismatch' : local.reason;
+      const last = report(project,reason,local.facts);
+      if (secondsToWait === 0 || !temporaryReasons.has(reason)) return {ok:false,...last,executed:false,outcome:'not_sent'};
+      if (deps.signal?.aborted) return cancelled(project);
+      if (now() >= deadline) return expired(project,last,now()-startedAt);
+      deps.onProgress?.({reason,elapsedMs:now()-startedAt});
+      await (deps.pause || pause)(Math.max(0,Math.min(1000,deadline-now())),deps.signal);
+    }
+    const args = action === 'run' ? [request.command,...request.args,...(request.job ? ['--detach'] : [])] :
+      ['--detail',input?.detail || 'compact','--limit','20',...(input?.query ? ['--query',input.query] : [])];
     const seconds = request?.timeoutSeconds || 3;
-    assertTodoCompatible(project.root);
-    // Recheck local identity immediately before dispatch; no second network readiness call.
-    const local = withinBudget(() => localDiagnosis(project, deps),Math.max(1,deadline-now()));
-    if (local.reason !== 'locally_matched' || local.editor.pid !== status.pid) return { ok: false,
-      ...report(project, local.reason === 'locally_matched' ? 'descriptor_pid_mismatch' : local.reason, local.facts), executed: false, outcome: 'not_sent' };
     if (deps.signal?.aborted) return cancelled(project);
     if (now() >= deadline) return expired(project,status,now()-startedAt);
+    if (borrowed && operationOwner(project.root)?.id!==lease.id) throw new UnityError('OPERATION_CHANGED','The pending operation changed before inspection.');
     sent = true;
     const result = await outsideBudget(() => call(process.env.UNITY_CLI || 'unity',
       ['command', ...args, '--project-path', project.root, '--timeout', String(seconds), ...globalArgs],
       { cwd: project.root, timeout: seconds * 1000 + 1000 }));
-    const outcome = commandOutcome(result, action);
-    unknown = outcome === 'unknown' && action === 'run';
+    const acceptedJob = request?.job ? completionReference(request,result) : null;
+    const outcome = acceptedJob ? 'succeeded' : commandOutcome(result, action);
+    unknown = outcome === 'unknown' && action === 'run' && !readOnly;
+    const reference = outcome === 'succeeded' && request ? completionReference(request,result) : null;
+    if (reference) {
+      reference.pid = status.pid;
+      if (!updateOperation(project.root,lease.id,{completion:reference})) throw new UnityError('OPERATION_CHANGED','Operation ownership changed.');
+      const completed = await waitCompletion(project,reference,call,{...deps,completionTimeoutSeconds:request.completionTimeoutSeconds});
+      unknown = !completed.ok;
+      return {...completed,project,wait:status.wait,executed:completed.ok ? true : 'unknown',
+        ...(unknown ? {operationId:lease.id} : {})};
+    }
+    // An unrecognized async acceptance must not be reported as completed.
+    if ((request?.job || (packageMutations.has(request?.command) && resultPayload(result)?.status==='in_progress')) && !reference && outcome === 'succeeded') {
+      unknown = true;
+      return {ok:false,project,state:'command_failed',reason:request.job?'unsupported_job_response':'unsupported_package_response',outcome:'unknown',executed:'unknown',operationId:lease.id};
+    }
     const ok = outcome === 'succeeded';
     return { ok, project, state: ok ? 'completed' : 'command_failed', reason: ok ? 'command_succeeded' : `command_${outcome}`,
       outcome, wait:status.wait, executed: action === 'run' ? (ok ? true : outcome === 'unknown' ? 'unknown' : false) : false,
-      ...(ok ? { result: safeResult(result.data, local.descriptor.token) } : { error: safeCode(result.error), nextAction: { code: 'inspect_result', instruction: 'Do not resend automatically. Reconcile possible side effects before a new attempt.' } }),
+      ...(ok ? { result: safeResult(result.data, local.descriptor.token) } : { error: result.error ? safeCode(result.error) : 'COMMAND_FAILED', diagnostics:safeResult(result.data,local.descriptor.token), nextAction: { code: 'inspect_result', instruction: 'Do not resend automatically. Reconcile possible side effects before a new attempt.' } }),
       ...(unknown ? { operationId: lease.id } : {}) };
   } catch (e) {
-    unknown = sent && action === 'run';
+    unknown = sent && action === 'run' && !readOnly;
     if (unknown) return { ok: false, project, state: 'command_failed', reason: 'command_unknown', outcome: 'unknown', executed: 'unknown', operationId: lease.id,
       nextAction: { code: 'inspect_result', instruction: 'Command outcome is unknown. Reconcile side effects; never retry automatically.' } };
     throw e;
   } finally {
-    if (unknown) retainUnknown(project.root, lease.id);
-    else releaseOperation(project.root, lease.id);
+    if (!borrowed) {
+      if (unknown) retainUnknown(project.root, lease.id);
+      else releaseOperation(project.root, lease.id);
+    }
   }
+}
+
+export async function inspectOperation(project,command,id,run=execute,deps={}) {
+  if (!inspectionCommands.has(command)) throw new UnityError('INVALID_ACTION','Inspect supports only editor_status, recompile_status, test_status or package_status.');
+  return perform('run',project,{command,args:[]},run,{...deps,observationId:id});
+}
+
+export async function resumeOperation(project,id,run=execute,deps={}) {
+  return outsideBudget(async()=>{
+    assertTodoCompatible(project.root);
+    const owner=operationOwner(project.root);
+    if (!id || owner?.id!==id || !['command','command_outcome_unknown'].includes(owner.kind) || !validReference(owner.completion)) throw new UnityError('INVALID_OPERATION','No resumable completion reference for this pending operation ID. Use inspect to reconcile it.');
+    if (owner.kind==='command' && alive(owner.pid)) return operationBlocked(project);
+    const marker=path.join(lockPath(project.root),'resume.lock');
+    try { fs.mkdirSync(marker); } catch(e) { if(e.code==='EEXIST') return operationBlocked(project); throw e; }
+    try {
+      fs.writeFileSync(path.join(marker,'owner.json'),JSON.stringify({pid:process.pid}),{mode:0o600});
+      if(operationOwner(project.root)?.id!==id) throw new UnityError('OPERATION_CHANGED','Operation changed before resume.');
+      if (!updateOperation(project.root,id,{kind:'command_outcome_unknown'})) throw new UnityError('OPERATION_CHANGED','Operation changed before resume.');
+      const result=await waitCompletion(project,owner.completion,run,deps);
+      if(result.ok) releaseOperation(project.root,id);
+      return {...result,project,executed:result.ok?true:'unknown',...(result.ok?{}:{operationId:id})};
+    } finally { if (operationOwner(project.root)?.id===id) fs.rmSync(marker,{recursive:true,force:true}); }
+  });
 }
 
 export async function recover(project, phase, id, run = execute, deps = {}) {
@@ -278,6 +350,9 @@ async function recoverInner(project, phase, id, run, deps) {
   const owner = operationOwner(project.root);
   if (!id || owner?.id !== id) throw new UnityError('INVALID_RECOVERY', 'Recovery/operation ID does not match the current lease.');
   if (phase === 'cancel') {
+    const resumeMarker=path.join(lockPath(project.root),'resume.lock');
+    const resumer=load(path.join(resumeMarker,'owner.json'));
+    if (fs.existsSync(resumeMarker) && (!Number.isInteger(resumer?.pid) || resumer.pid<1 || alive(resumer.pid))) throw new UnityError('OPERATION_ACTIVE','A caller is still waiting for this operation result.');
     // No force-unlock of an active command from a different caller.
     if (owner.kind === 'command') {
       try { process.kill(owner.pid, 0); throw new UnityError('OPERATION_ACTIVE', 'The command owner is still alive.'); }

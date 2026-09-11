@@ -5,6 +5,9 @@ description: Set up the official Unity Pipeline package in the Unity project bel
 
 # Initialize Unity
 
+For ordinary UPM dependencies, upgrades or removals, use [the packages skill](../packages/SKILL.md).
+This skill only sets up the Pipeline connection package.
+
 In a repository initialized with ToDo, Unity setup also requires
 `git.executionMode: "single-branch"` in `.todo/config.json`. The wrapper blocks
 installation in worktree mode (including an omitted mode). Report its `TODO_*`

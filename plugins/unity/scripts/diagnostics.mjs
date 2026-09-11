@@ -5,15 +5,15 @@ import { execFileSync } from 'node:child_process';
 import { canonical, assertTodoCompatible } from './project.mjs';
 import { inspectEditors, editorState } from './processes.mjs';
 import { operationOwner } from './operations.mjs';
-import { remaining, withinBudget, DIAGNOSTIC_MS } from './budget.mjs';
+import { remaining, withinBudget, outsideBudget, DIAGNOSTIC_MS } from './budget.mjs';
 
 export const globalArgs = ['--format', 'json', '--non-interactive', '--no-banner', '--no-pager', '--no-log-proxy'];
 const reasons = {
   locally_matched: ['status', 'Editor and descriptor match locally; list/run check CLI readiness once before dispatch.'],
   ready: ['execute', 'Run the requested command once.'],
   editor_closed: ['open', 'Use open for this exact project.'],
-  launching: ['new_request', 'A launch is already in progress; do not launch again or wait.'],
-  launch_requested: ['new_request', 'A launch was submitted; check only on a new request.'],
+  launching: ['new_request', 'A launch is already in progress; action calls wait within their deadline. Do not launch again.'],
+  launch_requested: ['new_request', 'A launch was submitted; action calls wait for this Editor within their deadline.'],
   launch_stale: ['open', 'Explicit open can recover the dead launch lease; do not remove it manually.'],
   launch_failed: ['inspect_launch', 'The last launch failed; inspect the prerequisite before an explicit open.'],
   editor_unidentified: ['identify_editor', 'Establish ownership of the unidentified Editor before opening or dispatching.'],
@@ -29,12 +29,12 @@ const reasons = {
   server_unreachable: ['recover', 'The target server did not accept the bounded status request. Use recover --phase begin.'],
   authentication_failed: ['recover', 'Pipeline rejected authentication. Never copy tokens or disable authentication; use recover --phase begin.'],
   protocol_incompatible: ['check_versions', 'The response/CLI contract is unsupported. Compare CLI and Pipeline versions; do not upgrade blindly.'],
-  compiling: ['new_request', 'Compilation is currently reported. Return now; check only on a new request.'],
-  domain_reload: ['new_request', 'Domain reload is currently reported. Return now; check only on a new request.'],
-  settling: ['new_request', 'Pipeline reports startup settling, without proving a specific compiler error. Return now.'],
+  compiling: ['new_request', 'Compilation is currently reported. Action calls wait within their readiness deadline.'],
+  domain_reload: ['new_request', 'Import/domain reload is currently reported. Action calls wait within their readiness deadline.'],
+  settling: ['new_request', 'Pipeline reports startup settling. Action calls wait; this does not prove a compiler error.'],
   blocked_by_dialog: ['inspect_dialog', 'Inspect the modal dialog in this exact Editor and resolve it deliberately; no button choice is inferred.'],
   pipeline_unavailable: ['inspect_pipeline_ui', 'CLI did not discover this Editor. Inspect Window/Pipeline in the already open Editor; do not open another.'],
-  pipeline_not_ready: ['new_request', 'Pipeline did not report readiness. Return now without dispatch.'],
+  pipeline_not_ready: ['new_request', 'Pipeline did not report readiness. Action calls wait before dispatch within their deadline.'],
   diagnostic_timeout: ['new_request', 'The shared diagnostic budget expired; nothing was dispatched.'],
   cli_missing: ['install_cli', 'The configured official Unity CLI executable was not found.'],
   process_inspection_denied: ['configure_worker_access', 'The worker environment blocks OS process inspection. Waiting for import cannot grant access. Use an explicitly authorized worker permission configuration; never bypass the sandbox.'],
@@ -55,7 +55,7 @@ export function safeCode(value) {
   // Arbitrary error messages/codes from extensions are not safe diagnostics.
   return new Set(['TIMEOUT','CANCELLED','OUTPUT_LIMIT','CLI_MISSING','CLI_FAILED','INVALID_RESPONSE','STATUS_NO_INSTANCES','STATUS_ALL_UNREACHABLE',
     'UNAUTHORIZED','AUTHENTICATION_FAILED','PROTOCOL_MISMATCH','VERSION_MISMATCH','COMMAND_NOT_FOUND','INVALID_ARGUMENTS',
-    'EDITOR_BUSY','BLOCKED_BY_DIALOG','DIAGNOSTIC_TIMEOUT']).has(value) ? value : 'UNCLASSIFIED_ERROR';
+    'EDITOR_BUSY','BLOCKED_BY_DIALOG','DIAGNOSTIC_TIMEOUT','COMMAND_FAILED','JOB_NOT_FOUND']).has(value) ? value : 'UNCLASSIFIED_ERROR';
 }
 export function readDescriptor(root) {
   let fd;
@@ -114,6 +114,39 @@ export function localDiagnosis(project, deps = {}) {
     else reason = 'locally_matched';
   }
   return { editor, descriptor, facts, reason };
+}
+
+// Opt-in evidence only. Never feed CLI Safe Mode heuristics into readiness/recovery.
+export async function diagnoseFull(project, run, deps={}) {
+  return outsideBudget(()=>withinBudget(async()=>{
+    const base=await diagnose(project,run,deps);
+    if(base.facts.editor!=='editor_running' || !Number.isInteger(base.pid)) return base;
+    const evidence={source:'unity pipeline list',state:'unavailable'};
+    try {
+      const result=await run(process.env.UNITY_CLI||'unity',['pipeline','list',...globalArgs],
+        {cwd:project.root,timeout:remaining(8000),signal:deps.signal});
+      const current=localDiagnosis(project,deps);
+      const rows=result.data?.data?.instances;
+      if(current.editor.pid!==base.pid || current.editor.state!=='editor_running') evidence.state='editor_changed';
+      else if(!result.ok) evidence.error=safeCode(result.error);
+      else if(!Array.isArray(rows)) evidence.state='protocol_incompatible';
+      else {
+        const matches=rows.filter(row=>typeof row.projectPath==='string' && canonical(row.projectPath)===project.root && row.pid===base.pid);
+        if(matches.length!==1) evidence.state='target_not_identified';
+        else {
+          evidence.state='observed';
+          const value=matches[0].safeMode;
+          evidence.safeModeReported=typeof value?.detected==='boolean'?value.detected:null;
+          // Omit paths, logs, tokens, aggregate counts and unrelated instances.
+        }
+      }
+    } catch(e) {
+      if(e.code?.startsWith('TODO_')) throw e;
+      evidence.state='diagnostic_failed';
+    }
+    return {...base,facts:{...base.facts,pipelineList:evidence},
+      ...(evidence.safeModeReported===true?{diagnosticHint:'The official CLI reports Safe Mode for this project/PID. This can be log-derived; confirm the current Editor UI and compiler errors before deciding recovery.'}:{})};
+  },16000));
 }
 function ownsPort(pid, port) {
   try {

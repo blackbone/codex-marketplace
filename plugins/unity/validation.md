@@ -35,3 +35,36 @@ The Codex workspace permission profile reproduced an OS process-inspection EPERM
 in a read-only diagnostic. The original worker receipt did not retain its low-level
 exception, so the reproduction establishes the configuration blocker, not a recovered
 incident trace. Worker permissions are not changed by the plugin itself.
+
+## Core operation lifecycle — 2026-09-10
+
+Regressions cover nested diagnostic preservation/redaction, pre-dispatch reload,
+unpublished owner grace, status inspection while an unknown mutation remains locked,
+compiler/test terminal failures, reload-surviving completion, job IDs, cancellation,
+exclusive resume, lost jobs and project/PID mismatches. Existing regressions remain.
+A source-copy live read-only `editor_status` job on Exohell verified the shipped CLI's
+flat detached acknowledgement and matching terminal `job status` result. The first
+smoke exposed an envelope mismatch; the same issued job was read by ID and confirmed
+complete before its test-owned lease was explicitly reconciled. The parser was
+corrected and the exact flat response added to regression coverage. The next smoke
+completed through the wrapper and released its lease automatically.
+No live compilation/test fault was injected and no game source or ToDo task changed.
+Compiler/test failure and reload recovery evidence is fixture-based. Jobs are not
+persistent across Editor domain reload and never authorize automatic resubmission.
+
+## Native workflows — 2026-09-10
+
+Compared upstream unity-agent-plugin commit 673d9c45ceeb0ef46044cd68bcd90fa0254b248f
+with CLI 1.0.0-beta.8 help/output and resolved Pipeline 0.6.0-exp.1 source. Native
+package_add/remove/status already implement the Client API; the upstream standalone
+installer is unnecessary here. Package resolve is fire-and-forget; status recovery
+across reload can synthesize completion, so the recipe requires installed-version
+read-back. Script dry-run and async timeout semantics are grounded in RunScriptCommand.
+
+74 Unity regressions pass, including package reload/import waiting, hashed saved
+correlation, non-replaying resume, mismatched status/PID rejection, failed/malformed
+responses, native preview pass-through, URL credential filtering, serialized failures
+and full-doctor evidence isolation. No live package mutation, custom command or
+builder was installed in a user's game. These new execution branches have fixture
+coverage, not live installation/build proof. The official read-only pipeline list
+was checked against the running Editor's actual structured response.

@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { resolveProject, ensureEditor, checkPipeline, perform, initialize, recover, withinBudget, outsideBudget, waitForReady, execute } from './runtime.mjs';
+import { resolveProject, ensureEditor, checkPipeline, perform, initialize, recover, inspectOperation, resumeOperation, withinBudget, outsideBudget, waitForReady, execute } from './runtime.mjs';
 import { waitSeconds } from './readiness.mjs';
 import { UnityError } from './project.mjs';
 
@@ -10,19 +10,19 @@ let lastProgress = '', lastProgressAt = 0;
 try {
   await withinBudget(async () => {
   const [action, ...args] = process.argv.slice(2);
-  if (!['open', 'status', 'doctor', 'recover', 'init', 'list', 'run'].includes(action)) throw new UnityError('INVALID_ACTION', 'Choose open, status, doctor, recover, init, list, or run.');
+  if (!['open', 'status', 'doctor', 'recover', 'init', 'list', 'run', 'inspect', 'resume'].includes(action)) throw new UnityError('INVALID_ACTION', 'Choose open, status, doctor, recover, init, list, run, inspect or resume.');
   const options = {};
   for (let i = 0; i < args.length; i += 2) {
-    if (!['--cwd', '--project', '--input', '--query', '--detail', '--phase', '--recovery-id', '--wait-seconds'].includes(args[i]) || !args[i + 1] || options[args[i]]) {
+    if (!['--cwd', '--project', '--input', '--query', '--detail', '--phase', '--recovery-id', '--wait-seconds', '--completion-seconds'].includes(args[i]) || !args[i + 1] || options[args[i]]) {
       throw new UnityError('INVALID_OPTIONS', 'Pass --cwd, optionally --project, and --input for run or --query for list.');
     }
     options[args[i]] = args[i + 1];
   }
   const project = withinBudget(() => resolveProject(options['--cwd'], options['--project']));
-  const deps = { signal:controller.signal, ...(options['--wait-seconds'] !== undefined ? {waitSeconds:waitSeconds(options['--wait-seconds'])} : {}),
+  const deps = { signal:controller.signal, ...(options['--completion-seconds'] !== undefined ? {completionTimeoutSeconds:Number(options['--completion-seconds'])} : {}), ...(options['--wait-seconds'] !== undefined ? {waitSeconds:waitSeconds(options['--wait-seconds'])} : {}),
     onProgress: ({reason,elapsedMs}) => {
       if (reason !== lastProgress || Date.now()-lastProgressAt >= 15000) {
-        process.stderr.write(`Unity readiness: ${reason}; elapsed ${Math.floor(elapsedMs/1000)}s. Requested command not sent.\n`);
+        process.stderr.write(`Unity ${reason==='completion_pending'?'operation':'readiness'}: ${reason}; elapsed ${Math.floor(elapsedMs/1000)}s. ${reason==='completion_pending'?'Waiting for the submitted operation; no replay.':'Requested command not sent.'}\n`);
         lastProgress=reason; lastProgressAt=Date.now();
       }
     } };
@@ -31,9 +31,14 @@ try {
     result = withinBudget(() => ensureEditor(project, { recover: true }));
     result.ok = ['editor_running', 'launch_requested', 'launching'].includes(result.state);
   }
-  if (action === 'doctor') { result = await checkPipeline(project); result.ok = result.state === 'ready'; }
+  if (action === 'doctor') {
+    if (options['--detail'] && !['compact','full'].includes(options['--detail'])) throw new UnityError('INVALID_OPTIONS','--detail is compact or full.');
+    result = await checkPipeline(project,execute,{...deps,detail:options['--detail']}); result.ok = result.state === 'ready';
+  }
   if (action === 'status') { result = await waitForReady(project,(b,a,o)=>execute(b,a,{...o,signal:controller.signal}),deps); result.ok=result.state==='ready'; }
   if (action === 'recover') result = await recover(project, options['--phase'] || 'begin', options['--recovery-id']);
+  if (action === 'inspect') result = await inspectOperation(project,options['--query'],options['--recovery-id'],execute,deps);
+  if (action === 'resume') result = await resumeOperation(project,options['--recovery-id'],execute,deps);
   if (action === 'init') result = await outsideBudget(() => initialize(project));
   if (action === 'list') {
     if (options['--detail'] && !['compact', 'full'].includes(options['--detail'])) throw new UnityError('INVALID_OPTIONS', '--detail is compact or full.');

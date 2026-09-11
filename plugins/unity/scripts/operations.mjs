@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-const lockPath = root => path.join(root, 'Library/CodexUnity/operation.lock');
+export const lockPath = root => path.join(root, 'Library/CodexUnity/operation.lock');
 export function operationOwner(root) {
   const lock = lockPath(root);
   try { return JSON.parse(fs.readFileSync(path.join(lock, 'owner.json'), 'utf8')); }
@@ -21,10 +21,22 @@ export function releaseOperation(root, id) {
   fs.rmSync(lockPath(root), { recursive: true });
   return true;
 }
-export function retainUnknown(root, id) {
+export function updateOperation(root, id, fields) {
   const owner = operationOwner(root);
-  if (owner?.id === id) fs.writeFileSync(path.join(lockPath(root), 'owner.json'), JSON.stringify({ ...owner, kind: 'command_outcome_unknown' }), { mode: 0o600 });
+  if (owner?.id !== id) return false;
+  const file = path.join(lockPath(root), 'owner.json');
+  const temp = `${file}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temp, JSON.stringify({ ...owner, ...fields, id:owner.id }), { mode:0o600 });
+    if (operationOwner(root)?.id !== id) return false;
+    fs.renameSync(temp,file);
+    return true;
+  } finally { fs.rmSync(temp,{force:true}); }
 }
+export function retainUnknown(root, id) {
+  return updateOperation(root,id,{kind:'command_outcome_unknown'});
+}
+
 export function operationBlocked(project) {
   const owner = operationOwner(project.root);
   return { ok: false, project, state: 'operation_busy', reason: owner?.kind === 'recovery' ? 'recovery_in_progress' : 'operation_in_progress',

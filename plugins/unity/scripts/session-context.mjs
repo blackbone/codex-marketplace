@@ -20,7 +20,8 @@ try {
     `Editor: ${result.state}. Pipeline: ${project.pipeline ? 'declared, readiness not checked' : 'not installed'}.`,
     ...(result.reason ? [`Diagnostic: ${JSON.stringify({ reason: result.reason, facts: result.facts, nextAction: result.nextAction })}.`] : []),
     'Use $unity:editor for actions inside this Unity project. Its wrapper waits for readiness and idle Editor state before dispatching each requested action once.',
-    'Keep a running wrapper tool call alive while it waits (default 600 seconds). Do not start another wrapper or fail the task while that process is running. Only readiness probes repeat; never replay a dispatched command. doctor remains one-shot.',
+    'The editor skill includes native script builders, targeted verification, diagnostics and project-command recipes; use $unity:packages for UPM dependencies.',
+    'Keep a running wrapper tool call alive while it waits (default 600 seconds). Do not start another wrapper or fail the task while that process is running. Only read-only readiness/completion probes repeat; never replay a dispatched command. Resume a pending operation ID to read its result. doctor remains one-shot.',
     ...(!project.pipeline ? ['Use $unity:init when asked to set up the Pipeline package.'] : []),
   ].join('\n');
   console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context } }));

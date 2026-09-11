@@ -19,9 +19,10 @@ try {
   fs.mkdirSync(path.join(root, 'Library/Pipeline'), { recursive: true });
   fs.writeFileSync(path.join(root, 'Library/Pipeline/.unity-pipeline-port'), JSON.stringify({pid:4242,port:7800,projectPath:root,lastHeartbeat:new Date().toISOString(),evalToken:'fixture-only-token'}));
   let calls = 0, mutations = 0, clock = 0;
-  const action = await perform('run', project, { command: 'create_gameobject', args: ['--name', 'Cube'] }, async (binary,args) => {
+  const action = await perform('run', project, { command: 'recompile', args: [] }, async (binary,args) => {
     if(args[0] === 'status') { calls++; return {ok:true,data:{success:true,data:{instances:[{project:root,pid:4242,state:calls===1?'compiling':'ready'}]}}}; }
-    mutations++; return {ok:true,data:{success:true,data:{success:true,result:{}}}};
+    if(args[1]==='recompile_status') return {ok:true,data:{success:true,data:{success:true,result:JSON.stringify({status:'completed',failed:false,errors:[]})}}};
+    mutations++; return {ok:true,data:{success:true,data:{success:true,result:{status:'compiling'}}}};
   }, { inspect: () => [{pid:4242,project:root}],waitSeconds:10,now:()=>clock,pause:async ms=>{clock+=ms;},
     idle:async()=>({state:'ready',reason:'ready',facts:{compiling:false,updating:false}}) });
   fs.mkdirSync(path.join(root, '.todo'));
@@ -38,8 +39,8 @@ try {
   for (const item of [
     { name: 'startup', title: 'Open a task. Reuse Unity.', sub: 'The session hook finds the project and its Editor.',
       value: {state:startup.state,reason:startup.reason,facts:startup.facts,nextAction:startup.nextAction}, checks: ['Exact project: /workspace/MyGame', 'Existing Editor reused', 'Missing descriptor identified locally'] },
-    { name: 'action', title: 'Wait in the same tool call.', sub: 'Compilation finishes, then the command is sent once.',
-      value: {state:action.state,reason:action.reason,outcome:action.outcome,executed:action.executed,wait:action.wait}, checks: [`Readiness checks: ${calls}`, `Requested command dispatches: ${mutations}`, 'No task restart. No mutation replay.'] },
+    { name: 'action', title: 'Wait through the whole operation.', sub: 'Ready, submit once, then read the final compiler result.',
+      value: {state:action.state,reason:action.reason,outcome:action.outcome,executed:action.executed,wait:action.wait,completion:action.result}, checks: [`Readiness checks: ${calls}`, `Requested command dispatches: ${mutations}`, 'No task restart. No mutation replay.'] },
     { name: 'todo-guard', title: 'ToDo requires a single branch.', sub: 'Unity commands are blocked in ToDo worktree mode.',
       value: blocked, checks: ['Set git.executionMode to single-branch', 'No Unity CLI call or Editor launch', 'Keep running tasks in their current copy'] },
   ]) {

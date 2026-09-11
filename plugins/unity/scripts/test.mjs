@@ -11,10 +11,12 @@ import { withinBudget } from './budget.mjs';
 import { recover, commandOutcome } from './runtime.mjs';
 import { operationOwner } from './operations.mjs';
 import http from 'node:http';
+import { completionReference, waitCompletion } from './completion.mjs';
 import { projectFromArguments, editorState, isAssetImportWorker } from './processes.mjs';
 import { checkPipeline as checkPipelineReal, perform as performReal, initialize, validateAction, acquireLaunch, execute, stateDirectory, ensureEditor, launchWorker } from './runtime.mjs';
 
 const plugin = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const commandResponse=result=>({ok:true,data:{success:true,data:{success:true,result:JSON.stringify(result)}}});
 function fixture(t) {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'unity-plugin-test-')));
   t.after(() => fs.rmSync(base, { recursive: true, force: true }));
@@ -88,7 +90,8 @@ test('single-branch permits hook, open, probe, commands and init in the same pro
   const f = fakeEnvironment(t);
   todoConfig(f.root, { git: { executionMode: 'single-branch' } });
   fs.writeFileSync(f.state, JSON.stringify([{ pid: 765430, project: f.root }]));
-  assert.equal(wrapperOpen(f).state, 'editor_running');
+  const opened=wrapperOpen(f);
+  assert.equal(opened.state, 'editor_running', JSON.stringify(opened));
   assert.match(await f.invoke(f.root), /Editor: editor_running/);
   const calls = [];
   const run = async (binary, args, options) => {
@@ -757,4 +760,302 @@ test('cancellation after dispatch is an unknown mutation, never a safe retry', a
     return execute(process.execPath,['-e','setInterval(()=>{},1000)'],options);
   },{...deps(root),signal:abort.signal});
   assert.equal(result.outcome,'unknown');assert.equal(result.error,'CANCELLED');assert.equal(operationOwner(root).kind,'command_outcome_unknown');
+});
+
+test('reload just before dispatch returns to readiness under the original deadline', async t => {
+  const f=fixture(t),root=f.project(),p=readProject(root);const file=descriptor(root);
+  let clock=0,checks=0,pauses=0,commands=0;
+  const r=await performReal('run',p,{command:'mutation',args:[]},async(b,args)=>{
+    if(args[0]==='status') return ready(root);
+    commands++;return {ok:true,data:{success:true,data:{success:true,result:{}}}};
+  },{...deps(root),waitSeconds:10,now:()=>clock,inspect:()=>{
+    if(++checks===2) fs.unlinkSync(file);
+    return [{pid:42,project:root}];
+  },pause:async ms=>{clock+=ms;pauses++;descriptor(root);}});
+  assert.equal(r.ok,true);assert.equal(commands,1);assert.equal(pauses,1);assert.equal(operationOwner(root),null);
+});
+
+test('unpublished lock owner receives bounded grace, but is never force-unlocked', async t => {
+  const {releaseOperation}=await import('./operations.mjs');
+  const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);
+  const lock=path.join(root,'Library/CodexUnity/operation.lock');fs.mkdirSync(lock,{recursive:true});
+  let clock=0,pauses=0;
+  const r=await performReal('run',p,{command:'mutation',args:[]},async(b,args)=>args[0]==='status'?ready(root):({ok:true,data:{success:true,data:{success:true,result:{}}}}),
+    {...deps(root),waitSeconds:10,now:()=>clock,pause:async ms=>{
+      clock+=ms;pauses++;
+      if(pauses===1) fs.writeFileSync(path.join(lock,'owner.json'),JSON.stringify({id:'publisher',kind:'command',pid:process.pid}));
+      else releaseOperation(root,'publisher');
+    }});
+  assert.equal(r.ok,true);assert.equal(pauses,2);
+  fs.mkdirSync(lock);clock=0;
+  const blocked=await performReal('run',p,{command:'mutation',args:[]},()=>assert.fail('no dispatch'),
+    {...deps(root),waitSeconds:10,now:()=>clock,pause:async ms=>{clock+=ms;}});
+  assert.equal(blocked.state,'operation_busy');assert.equal(clock,2000);assert.ok(fs.existsSync(lock));
+});
+
+test('nested failure preserves redacted diagnostic detail and known status timeout cannot strand a lease', async t => {
+  const {safeResult}=await import('./runtime.mjs');
+  const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);
+  const failed=await performReal('run',p,{command:'mutation',args:[]},async(b,args,opts)=>args[0]==='status'?ready(root):
+    execute(process.execPath,['-e','process.stdout.write(JSON.stringify({success:true,data:{success:false,error:"Fixture exception line 7",evalToken:"fixture-secret-token",errorDetails:"fixture-secret-token"}}))'],opts),deps(root));
+  assert.equal(failed.error,'COMMAND_FAILED');assert.equal(failed.diagnostics.data.error,'Fixture exception line 7');
+  assert.ok(!JSON.stringify(failed).includes('fixture-secret-token'));assert.equal(operationOwner(root).kind,'command_outcome_unknown');
+  const clean=safeResult({result:JSON.stringify({failed:true,errors:['CS0001 fixture-secret-token'],password:'nested-secret',warnings:['nested-secret']}),logs:['Bearer abcde'],evalToken:'fixture-secret-token'});
+  assert.equal(JSON.parse(clean.result).errors[0],'CS0001 [redacted]');assert.ok(!JSON.stringify(clean).includes('nested-secret'));
+  assert.equal(clean.logs[0],'Bearer [redacted]');
+  const root2=f.project('read-only');descriptor(root2);
+  const status=await performReal('run',readProject(root2),{command:'test_status',args:[]},async(b,args)=>args[0]==='status'?ready(root2):({ok:false,error:'TIMEOUT'}),deps(root2));
+  assert.equal(status.ok,false);assert.equal(operationOwner(root2),null);
+});
+
+test('pending mutation permits only known status inspection and preserves the original lease', async t => {
+  const {inspectOperation}=await import('./runtime.mjs');
+  const {acquireOperation,retainUnknown}=await import('./operations.mjs');
+  const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);
+  const lease=acquireOperation(root,'command');retainUnknown(root,lease.id);
+  const r=await inspectOperation(p,'test_status',lease.id,async(b,args)=>{
+    assert.deepEqual(args.slice(0,2),['command','test_status']);
+    return {ok:true,data:{success:true,data:{success:true,result:{status:'completed'}}}};
+  },{...deps(root),idle:()=>assert.fail('diagnostic status must not wait for the pending operation to become idle')});
+  assert.equal(r.ok,true);assert.equal(operationOwner(root).id,lease.id);
+  await assert.rejects(inspectOperation(p,'eval_file',lease.id),{code:'INVALID_ACTION'});
+  await assert.rejects(inspectOperation(p,'test_status','wrong-id',()=>assert.fail('no dispatch'),deps(root)),{code:'INVALID_OPERATION'});
+  assert.equal((await performReal('run',p,{command:'mutation',args:[]},()=>assert.fail('no dispatch'),deps(root))).state,'operation_busy');
+});
+
+test('recompile waits through reload and returns the completed compiler result without replay', async t => {
+  const f=fixture(t),root=f.project(),p=readProject(root);const file=descriptor(root);
+  let clock=0,triggers=0,polls=0;
+  const r=await performReal('run',p,{command:'recompile',args:[]},async(b,args)=>{
+    if(args[0]==='status') return ready(root);
+    if(args[1]==='recompile') {triggers++;fs.unlinkSync(file);return {ok:true,data:{success:true,data:{success:true,result:{status:'compiling'}}}};}
+    assert.equal(args[1],'recompile_status');polls++;
+    return {ok:true,data:{success:true,data:{success:true,result:JSON.stringify({status:'completed',failed:false,errors:[]})}}};
+  },{...deps(root),now:()=>clock,pause:async ms=>{clock+=ms;descriptor(root);}});
+  assert.equal(r.state,'completed');assert.equal(r.result.status,'completed');assert.equal(triggers,1);assert.equal(polls,1);assert.equal(operationOwner(root),null);
+});
+
+test('compiler/test failures preserve details and require reconciliation, never repeat the trigger', async t => {
+  for(const type of ['recompile','run_tests']) {
+    const f=fixture(t),root=f.project(type),p=readProject(root);descriptor(root);let triggers=0;
+    const r=await performReal('run',p,{command:type,args:[]},async(b,args)=>{
+      if(args[0]==='status') return ready(root);
+      if(args[1]===type) {triggers++;return {ok:true,data:{success:true,data:{success:true,result:type==='recompile'?{status:'compiling'}:{statusPath:'Temp/test-status.json',result:'playmode_running'}}}};}
+      const result=type==='recompile'?{status:'completed',failed:true,errors:['CS0001 Fixture compile error']}:{status:'completed',summary:{failed:1},results:[{message:'Fixture assertion'}]};
+      return {ok:true,data:{success:true,data:{success:true,result:JSON.stringify(result)}}};
+    },deps(root));
+    assert.equal(r.state,'operation_failed');assert.equal(triggers,1);assert.equal(operationOwner(root).kind,'command_outcome_unknown');
+    assert.match(JSON.stringify(r.result),type==='recompile'?/CS0001/:/Fixture assertion/);
+  }
+});
+
+test('job waits by ID, survives connection timeout, and submits exactly once', async t => {
+  const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);let clock=0,submits=0,polls=0;
+  const r=await performReal('run',p,{command:'long_probe',args:[],job:true},async(b,args)=>{
+    if(args[0]==='status') return ready(root);
+    if(args[0]==='command') {assert.ok(args.includes('--detach'));submits++;return {ok:true,data:{success:true,data:{success:true,result:{jobId:'fixture-job',state:'queued'}}}};}
+    assert.deepEqual(args.slice(0,3),['job','status','fixture-job']);polls++;
+    if(polls===1)return {ok:false,error:'TIMEOUT'};
+    return {ok:true,data:{success:true,data:{jobId:'fixture-job',state:'completed',result:{answer:42}}}};
+  },{...deps(root),now:()=>clock,pause:async ms=>{clock+=ms;}});
+  assert.equal(r.ok,true);assert.equal(r.result.result.answer,42);assert.equal(submits,1);assert.equal(polls,2);assert.equal(operationOwner(root),null);
+});
+
+test('completion timeout is resumable by ID; resume neither resubmits nor unlocks a missing job', async t => {
+  const {resumeOperation}=await import('./runtime.mjs');
+  const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);let clock=0,submits=0;
+  const r=await performReal('run',p,{command:'long_probe',args:[],job:true,completionTimeoutSeconds:1},async(b,args)=>{
+    if(args[0]==='status')return ready(root);
+    if(args[0]==='command'){submits++;return {ok:true,data:{success:true,data:{success:true,result:{jobId:'job-1',state:'queued'}}}};}
+    return {ok:true,data:{success:true,data:{jobId:'job-1',state:'running'}}};
+  },{...deps(root),now:()=>clock,pause:async ms=>{clock+=ms;}});
+  assert.equal(r.reason,'completion_timeout');assert.equal(submits,1);
+  const missing=await resumeOperation(p,r.operationId,async(b,args)=>{assert.equal(args[0],'job');return {ok:false,error:'JOB_NOT_FOUND'};},deps(root));
+  assert.equal(missing.reason,'completion_unavailable');assert.equal(operationOwner(root).id,r.operationId);
+  const completed=await resumeOperation(p,r.operationId,async(b,args)=>{
+    assert.deepEqual(args.slice(0,3),['job','status','job-1']);return {ok:true,data:{success:true,data:{jobId:'job-1',state:'completed',result:{value:1}}}};
+  },deps(root));
+  assert.equal(completed.ok,true);assert.equal(operationOwner(root),null);assert.equal(submits,1);
+});
+
+test('job observations cannot follow a different Editor PID or a different job ID', async t => {
+  const {waitCompletion}=await import('./completion.mjs');
+  const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);
+  const changed=await waitCompletion(p,{kind:'job',jobId:'job-1',pid:99},()=>assert.fail('no dispatch'),deps(root));
+  assert.equal(changed.reason,'editor_changed');
+  const wrong=await waitCompletion(p,{kind:'job',jobId:'job-1',pid:42},async()=>({ok:true,data:{success:true,data:{jobId:'job-2',state:'completed'}}}),deps(root));
+  assert.equal(wrong.reason,'completion_protocol_incompatible');
+  assert.throws(()=>validateAction({command:'recompile',args:[],job:true}),{code:'INVALID_ACTION'});
+  assert.throws(()=>validateAction({command:'long_probe',args:[],completionTimeoutSeconds:0}),{code:'INVALID_ACTION'});
+});
+
+test('published CLI detached acknowledgement is flat, followed by job status with a matching ID', async t => {
+  const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);let submits=0;
+  const r=await performReal('run',p,{command:'editor_status',args:[],job:true},async(b,args)=>{
+    if(args[0]==='status')return ready(root);
+    if(args[0]==='command'){submits++;return {ok:true,data:{success:true,command:'command editor_status',data:{command:'editor_status',jobId:'flat-job',state:'queued',detached:true},errors:[],warnings:[]}};}
+    return {ok:true,data:{success:true,command:'job status',data:{jobId:'flat-job',state:'completed',result:{compiling:false}}}};
+  },deps(root));
+  assert.equal(r.ok,true);assert.equal(submits,1);assert.equal(r.result.result.compiling,false);assert.equal(operationOwner(root),null);
+});
+
+test('cancelled completion can resume; concurrent resume and unlock are blocked', async t => {
+  const {resumeOperation}=await import('./runtime.mjs');
+  const {acquireOperation,updateOperation,retainUnknown}=await import('./operations.mjs');
+  const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);
+  const lease=acquireOperation(root,'command');updateOperation(root,lease.id,{completion:{kind:'job',jobId:'pending-job',pid:42}});retainUnknown(root,lease.id);
+  const abort=new AbortController();let finish;
+  const pending=resumeOperation(p,lease.id,async()=>{await new Promise(resolve=>{finish=resolve;});return {ok:true,data:{success:true,data:{jobId:'pending-job',state:'running'}}};},{...deps(root),signal:abort.signal});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal((await resumeOperation(p,lease.id,()=>assert.fail('no concurrent poll'),deps(root))).state,'operation_busy');
+  await assert.rejects(recover(p,'cancel',lease.id),{code:'OPERATION_ACTIVE'});
+  abort.abort();finish();const result=await pending;
+  assert.equal(result.reason,'completion_cancelled');assert.equal(operationOwner(root).id,lease.id);
+  assert.equal(fs.existsSync(path.join(root,'Library/CodexUnity/operation.lock/resume.lock')),false);
+});
+
+test('cancelled pre-dispatch reload wait sends nothing and retains no new lock', async t => {
+  const f=fixture(t),root=f.project(),p=readProject(root);const file=descriptor(root);let checks=0;
+  const abort=new AbortController();
+  const r=await performReal('run',p,{command:'mutation',args:[]},async(b,args)=>{assert.equal(args[0],'status');return ready(root);},
+    {...deps(root),waitSeconds:10,signal:abort.signal,inspect:()=>{if(++checks===2)fs.unlinkSync(file);return [{pid:42,project:root}];},pause:async()=>abort.abort()});
+  assert.equal(r.reason,'readiness_cancelled');assert.equal(operationOwner(root),null);
+});
+
+test('saved completion from a crashed owner can be resumed, but a live owner cannot', async t => {
+  const {resumeOperation}=await import('./runtime.mjs');
+  const {acquireOperation,updateOperation}=await import('./operations.mjs');
+  const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);
+  const lease=acquireOperation(root,'command');updateOperation(root,lease.id,{completion:{kind:'job',jobId:'saved-job',pid:42}});
+  assert.equal((await resumeOperation(p,lease.id,()=>assert.fail('no poll'),deps(root))).state,'operation_busy');
+  updateOperation(root,lease.id,{pid:2147483647});
+  const result=await resumeOperation(p,lease.id,async()=>({ok:true,data:{success:true,data:{jobId:'saved-job',state:'completed',result:{value:1}}}}),deps(root));
+  assert.equal(result.ok,true);assert.equal(operationOwner(root),null);
+});
+
+test('unpublished resume owner blocks lease cancellation until its identity is known', async t => {
+  const {acquireOperation,retainUnknown}=await import('./operations.mjs');
+  const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);
+  const lease=acquireOperation(root,'command');retainUnknown(root,lease.id);
+  fs.mkdirSync(path.join(root,'Library/CodexUnity/operation.lock/resume.lock'));
+  await assert.rejects(recover(p,'cancel',lease.id),{code:'OPERATION_ACTIVE'});
+  assert.equal(operationOwner(root).id,lease.id);
+});
+
+test('native package add survives reload, awaits import idle and submits once', async t => {
+  const f=fixture(t),root=f.project(),p=readProject(root),file=descriptor(root);
+  let clock=0,submits=0,polls=0,idleChecks=0;
+  const value={operation:'add',argument:'com.example.fixture@1.0.0',success:true};
+  const result=await performReal('run',p,{command:'package_add',args:['--identifier',value.argument,'--confirm','true','--wait','false']},async(b,args)=>{
+    if(args[0]==='status') return ready(root);
+    if(args[1]==='package_add') {submits++;fs.unlinkSync(file);return commandResponse({...value,status:'in_progress'});}
+    assert.equal(args[1],'package_status');polls++;
+    assert.equal(operationOwner(root).kind,'command');
+    return commandResponse({...value,status:polls===1?'in_progress':'completed',requiresRecompile:true});
+  },{...deps(root),now:()=>clock,pause:async ms=>{clock+=ms;descriptor(root);},idle:async()=>{
+    idleChecks++;
+    return idleChecks===2?{state:'pipeline_not_ready',reason:'domain_reload'}:{state:'ready',reason:'ready'};
+  }});
+  assert.equal(result.ok,true);assert.equal(submits,1);assert.equal(polls,2);assert.equal(idleChecks,3);
+  assert.equal(result.result.requiresRecompile,true);assert.equal(operationOwner(root),null);
+});
+
+test('package timeout persists only hashed correlation; resume follows native status without replay', async t => {
+  const {resumeOperation,inspectOperation}=await import('./runtime.mjs');
+  const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);let clock=0,submits=0;
+  const value={operation:'add',argument:'https://user:fixture-password@example.test/repo.git?token=fixture-query-secret',success:true};
+  const result=await performReal('run',p,{command:'package_add',args:[],completionTimeoutSeconds:1},async(b,args)=>{
+    if(args[0]==='status') return ready(root);
+    if(args[1]==='package_add') submits++;
+    return commandResponse({...value,status:'in_progress'});
+  },{...deps(root),now:()=>clock,pause:async ms=>{clock+=ms;}});
+  assert.equal(result.reason,'completion_timeout');assert.equal(submits,1);
+  const owner=operationOwner(root);
+  assert.equal(owner.completion.kind,'package');assert.match(owner.completion.argumentHash,/^[a-f0-9]{64}$/);
+  assert.doesNotMatch(JSON.stringify([owner,result]),/fixture-password|fixture-query-secret|example\.test/);
+  const observed=await inspectOperation(p,'package_status',owner.id,async(b,args)=>{
+    assert.equal(args[1],'package_status');return commandResponse({...value,status:'completed'});
+  },deps(root));
+  assert.equal(observed.ok,true);assert.equal(operationOwner(root).id,owner.id);
+  assert.doesNotMatch(JSON.stringify(observed),/fixture-password|fixture-query-secret/);
+  const resumed=await resumeOperation(p,owner.id,async(b,args)=>{
+    if(args[0]==='status') return ready(root);
+    assert.equal(args[1],'package_status');return commandResponse({...value,status:'completed'});
+  },deps(root));
+  assert.equal(resumed.ok,true);assert.equal(operationOwner(root),null);
+  assert.doesNotMatch(JSON.stringify(resumed),/fixture-password|fixture-query-secret/);
+});
+
+test('package status cannot complete another operation, argument or Editor', async t => {
+  const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);
+  const value={operation:'remove',argument:'com.example.fixture',status:'in_progress',success:true};
+  const ref={...completionReference({command:'package_remove'},commandResponse(value)),pid:42};
+  for(const change of [{operation:'add'},{argument:'com.example.other'},{operation:null},{success:undefined}]) {
+    const result=await waitCompletion(p,ref,async()=>commandResponse({...value,status:'completed',...change}),deps(root));
+    assert.equal(result.reason,'completion_protocol_incompatible');
+  }
+  const result=await waitCompletion(p,{...ref,pid:99},()=>assert.fail('no other Editor dispatch'),deps(root));
+  assert.equal(result.reason,'editor_changed');
+  for(const command of ['package_add','package_remove','package_resolve']) assert.throws(()=>validateAction({command,args:[],job:true}),{code:'INVALID_ACTION'});
+});
+
+test('native package failure retains its lease and diagnostics; malformed acceptance cannot pass', async t => {
+  for(const malformed of [false,true]) {
+    const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);let submits=0;
+    const value={operation:'remove',argument:'com.example.fixture',success:true};
+    const result=await performReal('run',p,{command:'package_remove',args:[]},async(b,args)=>{
+      if(args[0]==='status') return ready(root);
+      if(args[1]==='package_remove') {submits++;return commandResponse({...value,status:'in_progress',...(malformed?{argument:null}:{})});}
+      return commandResponse({...value,status:'failed',success:false,error:'Fixture UPM failure'});
+    },deps(root));
+    assert.equal(result.ok,false);assert.equal(submits,1);assert.equal(operationOwner(root).kind,'command_outcome_unknown');
+    assert.equal(result.reason,malformed?'unsupported_package_response':'operation_failed');
+    if(!malformed) assert.equal(result.result.error,'Fixture UPM failure');
+  }
+});
+
+test('native previews stay synchronous and serialized negative results cannot be called success', async t => {
+  for(const command of ['run_script','package_add']) {
+    const f=fixture(t),root=f.project(),p=readProject(root);descriptor(root);let submits=0;
+    const input={command,args:command==='run_script'?['--file','AgentScripts/Fixture.cs','--entry','Fixture.Read','--dry_run','true']:['--identifier','com.example.fixture','--dry_run','true']};
+    const result=await performReal('run',p,input,async(b,args)=>{
+      if(args[0]==='status') return ready(root);
+      assert.deepEqual(args.slice(1,2+input.args.length),[command,...input.args]);submits++;
+      return commandResponse({success:true,status:'dry_run'});
+    },deps(root));
+    assert.equal(result.ok,true);assert.equal(submits,1);assert.equal(operationOwner(root),null);
+  }
+  assert.equal(commandOutcome(commandResponse({success:false,status:'failed'}),'run'),'unknown');
+});
+
+test('full doctor filters native Safe Mode evidence to exact project and PID, preserving diagnosis and lease', async t => {
+  const {acquireOperation,retainUnknown}=await import('./operations.mjs');
+  const f=fixture(t),root=f.project(),p=readProject(root);
+  const lease=acquireOperation(root,'command');retainUnknown(root,lease.id);let calls=0;
+  const result=await checkPipelineReal(p,async(b,args,options)=>{
+    calls++;assert.deepEqual(args.slice(0,2),['pipeline','list']);assert.ok(options.timeout<=8000);
+    return {ok:true,data:{success:true,data:{summary:{instancesInSafeMode:99},instances:[
+      {projectPath:f.base,pid:42,safeMode:{detected:false},secret:'other-project'},
+      {projectPath:root,pid:999,safeMode:{detected:false}},
+      {projectPath:root,pid:42,safeMode:{detected:true,logPath:'private-log',message:'fixture-secret-token'}}
+    ]}}};
+  },{...deps(root),detail:'full'});
+  assert.equal(calls,1);assert.equal(result.reason,'descriptor_missing');
+  assert.equal(result.facts.pipelineList.safeModeReported,true);
+  assert.equal(result.requiresInteractive,false);assert.equal(operationOwner(root).id,lease.id);
+  assert.doesNotMatch(JSON.stringify(result),/other-project|private-log|fixture-secret-token|instancesInSafeMode/);
+});
+
+test('full doctor does not infer Safe Mode from other instances or alter fast preflight', async t => {
+  const f=fixture(t),root=f.project(),p=readProject(root);let inspections=0;
+  await checkPipelineReal(p,()=>assert.fail('ordinary local doctor requires no CLI'),deps(root));
+  for(const rows of [[],[{projectPath:root,pid:99,safeMode:{detected:true}}],[{projectPath:root,pid:42,safeMode:null}]]) {
+    const result=await checkPipelineReal(p,async()=>({ok:true,data:{success:true,data:{instances:rows}}}),{...deps(root),detail:'full'});
+    assert.notEqual(result.facts.pipelineList.safeModeReported,true);assert.equal(result.reason,'descriptor_missing');
+  }
+  const changed=await checkPipelineReal(p,async()=>({ok:true,data:{success:true,data:{instances:[{projectPath:root,pid:42,safeMode:{detected:true}}]}}}),
+    {...deps(root),detail:'full',inspect:()=>[{pid:++inspections===1?42:99,project:root}]});
+  assert.equal(changed.facts.pipelineList.state,'editor_changed');
+  const unknown=await checkPipelineReal(p,()=>assert.fail('no query with unidentified owner'),{...deps(root),detail:'full',inspect:()=>[{pid:42,project:null}]});
+  assert.equal(unknown.reason,'editor_unidentified');assert.equal(unknown.facts.pipelineList,undefined);
 });
