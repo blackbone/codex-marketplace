@@ -543,3 +543,170 @@ steps:
   assert.equal(pending.attemptLedger.attempts.at(-1).trigger, "workspace_refresh");
   assert.equal(readTask(task.path).metadata.pipelineContinuation.nextIndex, 1);
 });
+
+function submoduleFixture(t) {
+  const root = fixture(t), source = fixture(t);
+  git(root, '-c', 'protocol.file.allow=always', 'submodule', 'add', source, 'server');
+  git(root, 'commit', '-am', 'register server');
+  const server = path.join(root, 'server');
+  git(server, 'config', 'user.name', 'Test'); git(server, 'config', 'user.email', 'test@example.invalid');
+  return { root, server };
+}
+
+test('submodule snapshot detects dirty files, staging and HEAD even with ignore=all', async t => {
+  const { workspaceSnapshot } = await import('./single-branch.mjs');
+  const { root, server } = submoduleFixture(t);
+  git(root, 'config', 'submodule.server.ignore', 'all');
+  const clean = workspaceSnapshot(root);
+  writeFileSync(path.join(server, 'foreign.txt'), 'dirty');
+  const dirty = workspaceSnapshot(root);
+  assert.notDeepEqual(clean, dirty); assert(dirty.files['server/foreign.txt']);
+  git(server, 'add', 'foreign.txt'); assert.notDeepEqual(workspaceSnapshot(root), dirty);
+  git(server, 'commit', '-m', 'outside');
+  assert.notEqual(workspaceSnapshot(root).repositories.server.head, clean.repositories.server.head);
+  const task = make(root, 'Dirty claim'), run = await startInteractiveTask(root, task.id);
+  await done(root, task, run, []);
+});
+
+test('submodule and parent delivery preserve foreign staged, unstaged and untracked files', async t => {
+  const { root, server } = submoduleFixture(t);
+  git(server, 'checkout', '--detach'); // Normal initialized submodules can be detached.
+  const indexes = [];
+  for (const repo of [root, server]) {
+    writeFileSync(path.join(repo, 'foreign.txt'), 'foreign staged'); git(repo, 'add', 'foreign.txt');
+    writeFileSync(path.join(repo, 'foreign.txt'), 'foreign unstaged');
+    writeFileSync(path.join(repo, 'personal.txt'), 'foreign untracked');
+    indexes.push(git(repo, 'ls-files', '--stage', 'foreign.txt'));
+  }
+  const task = make(root, 'Both repos'), run = await startInteractiveTask(root, task.id);
+  writeFileSync(path.join(root, 'client.txt'), 'client'); writeFileSync(path.join(server, 'api.txt'), 'server');
+  const result = await done(root, task, run, ['client.txt', 'server/api.txt']);
+  assert.equal(result.status, 'completed');
+  assert.equal(git(root, 'rev-parse', 'HEAD:server'), git(server, 'rev-parse', 'HEAD'));
+  assert.equal(git(server, 'show', 'HEAD:api.txt'), 'server');
+  assert.equal(git(root, 'diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD'), 'client.txt\nserver');
+  [root, server].forEach((repo, i) => {
+    assert.equal(git(repo, 'ls-files', '--stage', 'foreign.txt'), indexes[i]);
+    assert.equal(readFileSync(path.join(repo, 'foreign.txt'), 'utf8'), 'foreign unstaged');
+    assert.equal(readFileSync(path.join(repo, 'personal.txt'), 'utf8'), 'foreign untracked');
+  });
+});
+
+for (const drift of ['file', 'head']) test(`submodule concurrent ${drift} invalidates review on the same task`, async t => {
+  const { root, server } = submoduleFixture(t), task = make(root, 'Concurrent server');
+  await startInteractiveTask(root, task.id);
+  const claim = { ...JSON.parse(readFileSync(`${task.path}.lock`)), lockPath: `${task.path}.lock` };
+  writeFileSync(path.join(server, 'api.txt'), 'reviewed');
+  markTaskModelCompleted(task.path, claim, { status: 'completed', summary: 'done', changedFiles: ['server/api.txt'] }, cumulativeTaskMetrics(null, taskMetrics(Date.now()-1, Date.now(), emptyTokenUsage())), null);
+  if (drift === 'file') writeFileSync(path.join(server, 'api.txt'), 'concurrent');
+  else { writeFileSync(path.join(server, 'manual.txt'), 'outside'); git(server, 'add', 'manual.txt'); git(server, 'commit', '-m', 'outside'); }
+  const head = git(root, 'rev-parse', 'HEAD');
+  assert.equal((await finalizeTaskGit(root, task.path)).reviewRequired, true);
+  assert.equal(git(root, 'rev-parse', 'HEAD'), head);
+  releaseClaim(claim);
+  const run = await startInteractiveTask(root, task.id);
+  assert.equal((await done(root, task, run, ['server/api.txt'])).status, 'completed');
+});
+
+test('partial submodule commit retries finalization once without losing either repository or foreign staging', async t => {
+  const { root, server } = submoduleFixture(t), task = make(root, 'Partial delivery');
+  const run = await startInteractiveTask(root, task.id);
+  writeFileSync(path.join(root, 'client.txt'), 'client'); writeFileSync(path.join(server, 'api.txt'), 'server');
+  const hook = path.join(root, '.git/hooks/pre-commit');
+  writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  const base = git(root, 'rev-parse', 'HEAD'), count = Number(git(server, 'rev-list', '--count', 'HEAD'));
+  await assert.rejects(done(root, task, run, ['client.txt', 'server/api.txt']));
+  assert.equal(getTaskStatus(root, task.id).status, 'failed'); assert.equal(existsSync(`${task.path}.lock`), false);
+  const committed = git(server, 'rev-parse', 'HEAD');
+  assert.equal(Number(git(server, 'rev-list', '--count', 'HEAD')), count + 1);
+  assert.equal(git(root, 'rev-parse', 'HEAD'), base);
+  rmSync(hook);
+  retryTask(root, task.id);
+  const resumed = await startInteractiveTask(root, task.id); assert(resumed.deliveryOnly);
+  assert.equal((await done(root, task, resumed, undefined)).status, 'completed');
+  assert.equal(git(server, 'rev-parse', 'HEAD'), committed);
+  assert.equal(git(root, 'rev-parse', 'HEAD:server'), committed);
+});
+
+test('legacy nested ownedFiles retry and claim succeed then require fresh review', async t => {
+  const { root, server } = submoduleFixture(t), task = make(root, 'Legacy 1283');
+  await startInteractiveTask(root, task.id);
+  const claim = { ...JSON.parse(readFileSync(`${task.path}.lock`)), lockPath: `${task.path}.lock` };
+  writeFileSync(path.join(server, 'api.txt'), 'retained');
+  markTaskModelCompleted(task.path, claim, { status: 'completed', summary: 'done', changedFiles: ['server/api.txt'] }, cumulativeTaskMetrics(null, taskMetrics(Date.now()-1, Date.now(), emptyTokenUsage())), null);
+  const old = readTask(task.path); delete old.metadata.git.reviewedRepositories; old.metadata.git.phase = 'committing'; writeTask(old);
+  releaseClaim(claim);
+  retryTask(root, task.id);
+  const run = await startInteractiveTask(root, task.id);
+  const pending = await done(root, task, run, undefined);
+  assert.notEqual(pending.status, 'completed');
+  assert(readTask(task.path).metadata.git.reviewFiles.includes('server/api.txt'));
+  const resumed = await startInteractiveTask(root, task.id);
+  assert.equal((await done(root, task, resumed, ['server/api.txt'])).status, 'completed');
+});
+
+test('snapshot failure releases finished claim and keeps reservation recoverable', async t => {
+  const root = fixture(t), task = make(root, 'Snapshot failure');
+  const run = await startInteractiveTask(root, task.id);
+  // An unregistered nested repository is still forbidden, not silently ignored.
+  const nested = path.join(root, 'unknown'); mkdirSync(nested); git(nested, 'init', '-b', 'main');
+  writeFileSync(path.join(nested, 'file'), 'retained'); git(nested, 'add', 'file');
+  await finishInteractiveTask(root, task.id, { claimToken: run.claimToken, status: 'failed', summary: 'stopped' });
+  assert.equal(existsSync(`${task.path}.lock`), false);
+  assert.equal(getTaskStatus(root, task.id).status, 'failed');
+  withRepositoryExecution(root, state => { assert.equal(state.reservation.checkpoint, null); assert(state.reservation.checkpointError); });
+});
+
+test('submodule HEAD changed during execution is detected before delivery', async t => {
+  const { root, server } = submoduleFixture(t), task = make(root, 'Server drift during work');
+  const run = await startInteractiveTask(root, task.id);
+  writeFileSync(path.join(server, 'manual.txt'), 'outside'); git(server, 'add', 'manual.txt'); git(server, 'commit', '-m', 'outside');
+  writeFileSync(path.join(server, 'api.txt'), 'task');
+  assert.notEqual((await done(root, task, run, ['server/api.txt'])).status, 'completed');
+  assert.equal(readTask(task.path).metadata.nextAttemptTrigger, 'workspace_refresh');
+});
+
+test('foreign staged gitlink is preserved and blocks implicit gitlink delivery', async t => {
+  const { root, server } = submoduleFixture(t);
+  const original = git(server, 'rev-parse', 'HEAD');
+  git(server, 'commit', '--allow-empty', '-m', 'foreign staged head');
+  git(root, 'add', 'server'); const staged = git(root, 'ls-files', '--stage', 'server');
+  git(server, 'checkout', '--detach', original);
+  const task = make(root, 'Foreign gitlink'), run = await startInteractiveTask(root, task.id);
+  writeFileSync(path.join(server, 'api.txt'), 'task');
+  assert.notEqual((await done(root, task, run, ['server/api.txt'])).status, 'completed');
+  assert.equal(git(root, 'ls-files', '--stage', 'server'), staged);
+  assert.equal(git(server, 'rev-parse', 'HEAD'), original);
+});
+
+test('concurrent submodule commit from a hook is preserved without publishing stale tree', async t => {
+  const { root, server } = submoduleFixture(t), task = make(root, 'Server hook race');
+  const run = await startInteractiveTask(root, task.id);
+  writeFileSync(path.join(server, 'api.txt'), 'task');
+  const hook = path.resolve(server, git(server, 'rev-parse', '--git-path', 'hooks/pre-commit'));
+  writeFileSync(hook, `#!/bin/sh
+printf outside > manual.txt
+env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE git add manual.txt
+env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE git -c core.hooksPath=/dev/null commit --only manual.txt -m outside
+`, { mode: 0o755 });
+  assert.notEqual((await done(root, task, run, ['server/api.txt'])).status, 'completed');
+  assert.equal(git(server, 'log', '-1', '--format=%s'), 'outside');
+  assert.equal(git(server, 'show', 'HEAD:manual.txt'), 'outside');
+  assert.equal(readFileSync(path.join(server, 'api.txt'), 'utf8'), 'task');
+});
+
+test('finalizer snapshot failure records failed delivery and releases claim without caller error fallback', async t => {
+  const root = fixture(t), task = make(root, 'Finalizer snapshot error');
+  await startInteractiveTask(root, task.id);
+  const claim = { ...JSON.parse(readFileSync(`${task.path}.lock`)), lockPath: `${task.path}.lock` };
+  writeFileSync(path.join(root, 'owned.txt'), 'reviewed');
+  markTaskModelCompleted(task.path, claim, { status: 'completed', summary: 'done', changedFiles: ['owned.txt'] }, cumulativeTaskMetrics(null, taskMetrics(Date.now()-1, Date.now(), emptyTokenUsage())), null);
+  writeFileSync(path.join(root, 'owned.txt'), 'concurrent');
+  const nested = path.join(root, 'unknown'); mkdirSync(nested); git(nested, 'init', '-b', 'main');
+  writeFileSync(path.join(nested, 'file'), 'retained'); git(nested, 'add', 'file');
+  await assert.rejects(finalizeTaskGit(root, task.path));
+  releaseClaim(claim);
+  assert.equal(getTaskStatus(root, task.id).status, 'failed');
+  assert.equal(existsSync(`${task.path}.lock`), false);
+  assert(readTask(task.path).metadata.git.deliveryError);
+});

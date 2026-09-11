@@ -340,6 +340,22 @@ current-branch completion here. PR delivery and `git.push: true` are rejected
 explicitly. Detached HEAD and active merge/rebase operations must be resolved
 before execution.
 
+Registered, initialized Git submodules are included in workspace snapshots, including
+HEAD, index entries and dirty files even when Git is configured to hide submodule
+changes. Report reviewed files as parent-relative paths such as `server/src/api.cs`.
+The runner uses a private index in each repository, commits the deepest submodules
+first, then commits their gitlinks in the parent. Initialized submodules may have
+a detached HEAD; the parent still requires a local branch. Uninitialized modules,
+unregistered nested repositories and directory ownership are rejected for delivery.
+
+Each repository commit has a durable tree/base/message journal. A retry recognizes
+an already published submodule commit and finishes the remaining parent delivery.
+Concurrent changes invalidate review without discarding commits or unrelated
+staging. Old saved nested `ownedFiles` remain recoverable but require fresh review
+because they lack submodule HEAD receipts. A checkpoint error releases the finished
+worker claim while retaining the reservation and an explicit recovery requirement.
+These are local commits only; this mode does not push submodules or the parent.
+
 The existing task claim and token still own execution. A second, repository-wide
 reservation in the common Git directory prevents concurrent executors from
 other threads, processes or linked checkouts. It covers implementation, all

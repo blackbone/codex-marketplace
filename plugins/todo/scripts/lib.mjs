@@ -3110,7 +3110,7 @@ function worktreePlan(repoRoot, task) {
 
 function publishSingleBranchRefresh(task, receipt) {
   const g = task.metadata.git;
-  task.metadata.git = { ...g, baseCommit: receipt.toHead, phase: "working", ownedFiles: {},
+  task.metadata.git = { ...g, baseCommit: receipt.toHead, phase: "working", ownedFiles: {}, reviewedRepositories: receipt.repositories,
     reviewFiles: [...new Set([...(g.reviewFiles || []), ...Object.keys(g.ownedFiles || {})])],
     headRecoveries: [...(g.headRecoveries || []), receipt] };
   for (const field of ["headCommit", "pendingResult", "deliveryResult", "deliveryError", "deliveryAttemptId", "noChanges"]) delete task.metadata.git[field];
@@ -3153,6 +3153,7 @@ export async function prepareTaskGit(repoRoot, taskPath) {
   current.metadata.git = {
     ...git,
     phase: "working",
+    ...(prepared.repositories && !git.reviewedRepositories ? { reviewedRepositories: prepared.repositories } : {}),
     worktreePath: plan.worktreePath,
     baseCommit: git.baseCommit || prepared.head,
   };
@@ -3341,8 +3342,14 @@ export async function finalizeTaskGit(repoRoot, taskPath, usagePath = null) {
     writeTask(task);
     return { result: pendingResult, delivery, deliveryAttemptId };
   } catch (error) {
-    if (existsSync(taskPath) && refreshSingleBranchWorkspace(repoRoot, taskPath, error)) {
-      return { reviewRequired: true, reason: error.message };
+    try {
+      if (existsSync(taskPath) && refreshSingleBranchWorkspace(repoRoot, taskPath, error)) {
+        return { reviewRequired: true, reason: error.message };
+      }
+    } catch (recoveryError) {
+      // Recovery may itself fail to snapshot a damaged checkout. Still record
+      // delivery failure and let the caller release the finished executor claim.
+      error = recoveryError;
     }
     const completedAt = Date.now();
     if (existsSync(taskPath)) {
@@ -3369,6 +3376,8 @@ export async function finalizeTaskGit(repoRoot, taskPath, usagePath = null) {
         ...failedGit,
         deliveryError: String(error.message).slice(0, 4000),
       };
+      task.metadata.error = { at: new Date(completedAt).toISOString(), kind: failure.errorKind,
+        exit_code: Number.isInteger(error.code) ? error.code : null, message: String(error.message).slice(0, 4000) };
       writeTask(task);
       error.taskFailure = failure;
     }
