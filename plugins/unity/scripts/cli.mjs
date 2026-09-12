@@ -39,7 +39,7 @@ try {
   if (action === 'recover') result = await recover(project, options['--phase'] || 'begin', options['--recovery-id']);
   if (action === 'inspect') result = await inspectOperation(project,options['--query'],options['--recovery-id'],execute,deps);
   if (action === 'resume') result = await resumeOperation(project,options['--recovery-id'],execute,deps);
-  if (action === 'init') result = await outsideBudget(() => initialize(project));
+  if (action === 'init') result = await outsideBudget(() => initialize(project,execute,deps));
   if (action === 'list') {
     if (options['--detail'] && !['compact', 'full'].includes(options['--detail'])) throw new UnityError('INVALID_OPTIONS', '--detail is compact or full.');
     result = await perform(action, project, { query: options['--query'], detail: options['--detail'] },execute,deps);

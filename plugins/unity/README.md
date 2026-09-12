@@ -16,10 +16,21 @@ CLI `1.0.0-beta.8` / Pipeline `0.6.0-exp.1` are the inspected contracts.
 See the [official CLI installation documentation](https://docs.unity.com/en-us/unity-cli/use-unity-cli).
 Windows, runtime Players and remote hosts are unsupported.
 
-`$unity:init` explicitly installs a missing Pipeline package, preserving existing
-versions. `$unity:editor` handles discovery and Editor commands. `$unity:packages`
+`$unity:init` explicitly installs or updates Pipeline to the latest registry version.
+It delegates to official `pipeline install` / `pipeline upgrade`, without a bundled
+version pin, `--force` or custom version comparison. Other dependencies are preserved;
+already-current Pipeline remains unchanged. Startup and ordinary Editor actions never
+upgrade it automatically. `$unity:editor` handles discovery and Editor commands. `$unity:packages`
 uses the project's existing native UPM commands for package dependencies. No custom MCP,
 third-party console, additional Unity scripts, or persistent daemon is installed.
+
+For a requested Pipeline update, run the same `init --cwd <absolute-task-folder>`
+wrapper action. It holds the shared operation lease and reports `pipeline_installed`,
+`pipeline_upgraded` or `pipeline_present` after reading back the manifest. An uncertain
+failure retains the lease and must be reconciled before retrying. These results do
+not claim Editor import/compile completion; the next Editor action waits for readiness.
+An explicit exact-version/custom-source request uses package management instead of
+latest-mode init. Versions in the validation record describe tested contracts, not pins.
 
 Every operation requires `--cwd <absolute-task-folder>`. Ambiguous selection
 returns candidates; add `--project <exact-absolute-root>` only after selection.

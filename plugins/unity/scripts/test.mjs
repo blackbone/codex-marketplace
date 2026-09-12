@@ -255,15 +255,19 @@ test('request cannot switch project, runtime, output protocol, timeout or queue 
   assert.throws(() => validateAction({ command: 'test', args: [], timeoutSeconds: 121 }), { code: 'INVALID_ACTION' });
 });
 
-test('init preserves an existing package and never invokes refresh or open', async t => {
+test('init checks the registry through native upgrade, preserving an already-current package', async t => {
   const f = fixture(t), root = f.project();
   const before = fs.readFileSync(path.join(root, 'Packages/manifest.json'), 'utf8');
-  const result = await initialize(readProject(root), () => { throw new Error('must not install'); });
+  const calls=[];
+  const result = await initialize(readProject(root), async (binary,args) => {calls.push(args);return {ok:true};});
   assert.equal(result.state, 'pipeline_present');
+  assert.equal(result.versionPolicy,'latest');assert.equal(calls.length,1);
+  assert.deepEqual(calls[0].slice(0,4),['pipeline','upgrade','--project-path',root]);
+  assert.equal(operationOwner(root),null);
   assert.equal(fs.readFileSync(path.join(root, 'Packages/manifest.json'), 'utf8'), before);
 });
 
-test('init installs only the missing package and returns without a readiness probe', async t => {
+test('init delegates missing-package latest resolution to the CLI without a version pin or readiness probe', async t => {
   const f = fixture(t), root = f.project('new', false); const calls = [];
   const result = await initialize(readProject(root), async (binary, args) => {
     calls.push(args);
@@ -272,6 +276,40 @@ test('init installs only the missing package and returns without a readiness pro
   });
   assert.equal(result.state, 'pipeline_installed'); assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].slice(0, 4), ['pipeline', 'install', '--project-path', root]);
+  assert.equal(calls[0].includes('--package-version'),false);assert.equal(calls[0].includes('--force'),false);
+});
+
+test('init upgrades an older package once under a lease, preserving unrelated dependencies', async t => {
+  const f=fixture(t),root=f.project(),p=readProject(root),manifest=path.join(root,'Packages/manifest.json');
+  const contents={dependencies:{'com.unity.pipeline':p.pipeline,'com.example.keep':'file:../keep'}};
+  fs.writeFileSync(manifest,JSON.stringify(contents));let calls=0;
+  const result=await initialize(p,async(binary,args)=>{
+    calls++;assert.deepEqual(args.slice(0,4),['pipeline','upgrade','--project-path',root]);
+    assert.equal((await initialize(p,()=>assert.fail('concurrent init'))).state,'operation_busy');
+    assert.equal((await performReal('list',p,{},()=>assert.fail('concurrent dispatch'),deps(root))).state,'operation_busy');
+    contents.dependencies['com.unity.pipeline']='0.7.0-exp.1';fs.writeFileSync(manifest,JSON.stringify(contents));
+    return {ok:true};
+  });
+  assert.equal(result.state,'pipeline_upgraded');assert.equal(result.project.pipeline,'0.7.0-exp.1');
+  assert.equal(calls,1);assert.equal(operationOwner(root),null);
+  assert.equal(JSON.parse(fs.readFileSync(manifest)).dependencies['com.example.keep'],'file:../keep');
+});
+
+test('failed init cannot report latest from an old entry or repeat an uncertain upgrade', async t => {
+  const f=fixture(t),root=f.project(),p=readProject(root);let calls=0;
+  const result=await initialize(p,async()=>{calls++;return {ok:false,error:'TIMEOUT',started:true};});
+  assert.equal(result.ok,false);assert.equal(result.outcome,'unknown');assert.equal(result.error,'TIMEOUT');
+  assert.equal(operationOwner(root).id,result.operationId);
+  assert.equal((await initialize(p,()=>assert.fail('no replay'))).state,'operation_busy');assert.equal(calls,1);
+});
+
+test('unstarted or cancelled init releases its lease without changing the package', async t => {
+  const f=fixture(t),root=f.project(),p=readProject(root),abort=new AbortController();
+  const result=await initialize(p,async()=>({ok:false,error:'CLI_MISSING',started:false}));
+  assert.equal(result.outcome,'not_sent');assert.equal(operationOwner(root),null);
+  abort.abort();const cancelled=await initialize(p,()=>assert.fail('no dispatch'),{signal:abort.signal});
+  assert.equal(cancelled.outcome,'not_sent');assert.equal(operationOwner(root),null);
+  assert.equal(readProject(root).pipeline,p.pipeline);
 });
 
 test('probe subprocess has a hard bound and missing CLI is distinct', async t => {

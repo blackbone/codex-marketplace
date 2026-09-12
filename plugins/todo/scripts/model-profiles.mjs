@@ -5,16 +5,22 @@ import { AppServerClient } from "./app-server-client.mjs";
 
 // Task roles, not a benchmark ranking. Keep original profile names stable.
 export const DEFAULT_MODEL_PROFILES = [
-  { name: "mini", model: "gpt-5.4-mini", reasoningEffort: "medium", description: "Simple, bounded coding tasks on the previous small model; check retirement before use." },
+  { name: "mini", model: "gpt-5.6-luna", reasoningEffort: "low", description: "Small, mechanical edits and simple bounded fixes." },
   { name: "fast", model: "gpt-5.6-luna", reasoningEffort: "medium", description: "Mechanical edits, straightforward fixes, and cost-sensitive routine work." },
-  { name: "standard", model: "gpt-5.4", reasoningEffort: "medium", description: "Everyday coding on the previous generation; check retirement before use." },
+  { name: "standard", model: "gpt-5.6-terra", reasoningEffort: "low", description: "Straightforward everyday implementation with clear requirements." },
   { name: "medium", model: "gpt-5.6-terra", reasoningEffort: "medium", description: "Bounded implementation across several files; balanced everyday coding." },
-  { name: "proven", model: "gpt-5.5", reasoningEffort: "high", description: "Established previous-generation coding and general work requiring deeper reasoning." },
+  { name: "proven", model: "gpt-5.6-sol", reasoningEffort: "medium", description: "Multi-step engineering and debugging with moderate reasoning." },
   { name: "advanced", model: "gpt-5.6-sol", reasoningEffort: "high", description: "Multi-step implementation, debugging, and substantial everyday engineering." },
   { name: "expert", model: "gpt-6-astra", reasoningEffort: "xhigh", description: "Most capable model for complex implementation work." },
   { name: "ultra", model: "gpt-6-astra", reasoningEffort: "max", description: "Most capable model for very complex, high-risk, cross-cutting work." },
 ];
 const excludedModel = model => model === "gpt-5.3-codex-spark";
+const legacyBuiltinModels = { mini: "gpt-5.4-mini", standard: "gpt-5.4", proven: "gpt-5.5", expert: "gpt-5.6-sol", ultra: "gpt-5.6-sol" };
+// Keep intentional custom profiles, but do not automatically add pre-5.6 GPT models.
+const legacyGeneration = model => {
+  const version = /^gpt-(\d+)(?:\.(\d+))?(?:-|$)/.exec(model);
+  return version && (Number(version[1]) < 5 || (Number(version[1]) === 5 && Number(version[2] || 0) < 6));
+};
 const visibleModels = catalog => catalog.models.filter(m => !excludedModel(m.model));
 const CATALOG_TTL_MS = 5 * 60 * 1000;
 const catalogPath = root => path.join(root, ".todo", "model-catalog.json");
@@ -79,7 +85,7 @@ export function profileDiagnostic(profile, catalog) {
   if (excludedModel(profile.model) || profile.name === "spark") return { name: profile.name, model: profile.model, status: "excluded", message: `Profile '${profile.name}' is excluded: Spark has been removed from ToDo. Use model_profiles to remove the outdated profile.` };
   if (!catalog) return { name: profile.name, model: profile.model, status: "unverified", message: "Executor availability has not been checked. Use model_profiles to refresh." };
   const model = catalog.models.find(m => m.model === profile.model);
-  if (!model) return { name: profile.name, model: profile.model, status: "unsupported", message: `Custom profile '${profile.name}' is outdated or unavailable: model '${profile.model}' is not listed as supported by this executor. Review model_profiles before updating.` };
+  if (!model) return { name: profile.name, model: profile.model, status: "unsupported", message: `Profile '${profile.name}' is outdated or unavailable: model '${profile.model}' is not listed as supported by this executor. Review model_profiles before updating.` };
   if (model.retirementAt && model.retirementAt * 1000 <= Date.now()) return { name: profile.name, model: profile.model, status: "retired", replacement: model.upgrade, message: `Profile '${profile.name}' uses retired model '${profile.model}'. Suggested replacement: ${model.upgrade || "choose an available model"}.` };
   if (!model.efforts.includes(profile.reasoningEffort)) return { name: profile.name, model: profile.model, status: "unsupported-effort", message: `Profile '${profile.name}': '${profile.reasoningEffort}' is not supported by '${profile.model}'. Supported: ${model.efforts.join(", ")}.` };
   return { name: profile.name, model: profile.model, status: model.upgrade ? "deprecated" : "available", replacement: model.upgrade, message: model.upgrade ? `Suggested model update: ${model.upgrade}.` : null };
@@ -114,6 +120,7 @@ export function modelProfilePlan(root, catalog) {
     return { ...p, reasoningEffort: model.efforts.includes(p.reasoningEffort) ? p.reasoningEffort : model.defaultEffort };
   });
   for (const model of supported) {
+    if (legacyGeneration(model.model)) continue;
     if (recommended.some(p => p.model === model.model) || current.some(p =>
       p?.model === model.model && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(p.name || "") && profileUsable(profileDiagnostic(p, catalog)))) continue;
     let name = `model-${model.model.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/-+$/, "")}`;
@@ -127,7 +134,7 @@ export function modelProfilePlan(root, catalog) {
     if (!profile || typeof profile !== "object" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(profile.name || "")) continue;
     if (excludedModel(profile.model) || profile.name === "spark") continue;
     const builtin = DEFAULT_MODEL_PROFILES.find(p => p.name === profile.name);
-    const legacyBuiltin = (profile.name === "expert" || profile.name === "ultra") && profile.model === "gpt-5.6-sol";
+    const legacyBuiltin = legacyBuiltinModels[profile.name] === profile.model;
     if (builtin?.model === profile.model) {
       // A familiar profile name can still carry an intentional custom effort.
       if (profileUsable(profileDiagnostic(profile, catalog))) {

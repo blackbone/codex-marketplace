@@ -1652,7 +1652,7 @@ async function callTool(name, args = {}, metadata = {}) {
     case "runner_start": {
       const repoRoot = activatedRepo(args);
       return ensureDaemon(repoRoot, {
-        dashboardThreadId: args.dashboardThreadId || null,
+        dashboardThreadId: args.dashboardThreadId || executionOwner(metadata, {})?.threadId || null,
       });
     }
     case "runner_stop":

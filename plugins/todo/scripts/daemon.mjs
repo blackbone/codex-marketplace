@@ -74,6 +74,7 @@ import {
   parseAppServerExecutionStats,
 } from "./execution-stats.mjs";
 import { AppServerClient } from "./app-server-client.mjs";
+import { DesktopTitleClient } from "./desktop-title.mjs";
 import { combineUsage } from "./usage-recovery.mjs";
 import { createTaskInteraction } from "./task-interaction.mjs";
 import { classifyFailure } from "./attempt-ledger.mjs";
@@ -116,6 +117,8 @@ let appServerStartPromise = null;
 let dashboardSyncPromise = null;
 let supervisorTitleSyncPromise = null;
 let supervisorTitleSyncQueued = false;
+let supervisorTitleRetryTimer = null;
+const desktopTitleClient = process.env.CODEX_APP_TOOLS_PIPE_PATH ? new DesktopTitleClient() : null;
 let lastSupervisorTitleSuccessKey = null;
 let lastSupervisorTitleAttemptKey = null;
 let lastSupervisorTitleAttemptAt = 0;
@@ -722,7 +725,7 @@ const handleAgentInputRequest = interaction.onServerRequest;
 
 async function syncSupervisorThreadTitle(config) {
   const supervisor = getSupervisorStatus(repoRoot);
-  const threadId = supervisor.automation?.targetThreadId || null;
+  const threadId = readDashboardThreadRequest(repoRoot)?.threadId || dashboard?.threadId || supervisor.automation?.targetThreadId || null;
   const title = supervisor.threadTitle;
   if (!threadId) {
     lastSupervisorTitleSuccessKey = null;
@@ -758,17 +761,22 @@ async function syncSupervisorThreadTitle(config) {
   };
 
   try {
-    const client = await ensureAppServer(config);
+    const client = desktopTitleClient || await ensureAppServer(config);
+    // A timed-out rename may have applied. Do not retain an older success key.
+    lastSupervisorTitleSuccessKey = null;
     await client.setThreadName(threadId, title);
     lastSupervisorTitleSuccessKey = key;
+    clearTimeout(supervisorTitleRetryTimer);
     supervisorThreadTitleState = {
       status: "synced",
       threadId,
       title,
       updatedAt: new Date().toISOString(),
       error: null,
+      transport: desktopTitleClient ? "desktop" : "app-server",
     };
     log("supervisor_thread_title_updated", { threadId, title });
+    writeState();
     return true;
   } catch (error) {
     supervisorThreadTitleState = {
@@ -783,6 +791,11 @@ async function syncSupervisorThreadTitle(config) {
       title,
       error: error.message,
     });
+    writeState();
+    clearTimeout(supervisorTitleRetryTimer);
+    supervisorTitleRetryTimer = setTimeout(() => {
+      if (!stopping) scheduleSupervisorThreadTitleSync(runtimeConfig);
+    }, SUPERVISOR_TITLE_RETRY_MS);
     return false;
   }
 }
@@ -2386,6 +2399,8 @@ function consumeAuthorizedStopRequest() {
 async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
+  desktopTitleClient?.close();
+  clearTimeout(supervisorTitleRetryTimer);
   log("daemon_stop", { signal });
   try {
     writeState("stopping");
@@ -2467,6 +2482,8 @@ async function shutdown(signal) {
 async function shutdownForRuntimeUpdate() {
   if (stopping) return;
   stopping = true;
+  desktopTitleClient?.close();
+  clearTimeout(supervisorTitleRetryTimer);
   log("runtime_update_ready", {
     requestId: runtimeUpdateRequest?.requestId,
     target: runtimeUpdateRequest?.target,
@@ -2535,16 +2552,17 @@ cleanupStaleClaims(repoRoot);
 let titleChangeTimer = null;
 const taskChanges = watch(todoDir(repoRoot), (_event, filename) => {
   const name = String(filename || "");
-  if (name && !/^[0-9].*\.md(?:\.lock)?$/.test(name) && name !== "supervisor.json") return;
-  clearTimeout(titleChangeTimer);
+  if (name && !/^[0-9].*\.md(?:\.lock)?$/.test(name) && name !== "supervisor.json" && name !== "dashboard-thread.json") return;
+  if (titleChangeTimer) return;
   titleChangeTimer = setTimeout(() => {
+    titleChangeTimer = null;
     if (!stopping) {
       scheduleSupervisorThreadTitleSync(runtimeConfig);
     }
   }, 25);
 });
 taskChanges.on("error", error => log("task_watch_error", { error: error.message }));
-process.once("exit", () => { clearTimeout(titleChangeTimer); taskChanges.close(); });
+process.once("exit", () => { clearTimeout(titleChangeTimer); clearTimeout(supervisorTitleRetryTimer); desktopTitleClient?.close(); taskChanges.close(); });
 process.on("SIGUSR2", () => {
   scheduleDashboardThreadSync().catch((error) => {
     log("dashboard_thread_reload_error", { error: error.message });

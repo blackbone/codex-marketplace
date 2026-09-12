@@ -57,8 +57,13 @@ import { DEFAULT_MODEL_PROFILES, profileDiagnostic, modelProfilePlan, applyModel
   assertProfilesAvailable, refreshModelCatalog } from "./model-profiles.mjs";
 import { chmodSync, readFileSync } from "node:fs";
 
-test("seven eligible executor models have task roles; invalid config never selects a fallback", () => {
-  assert.equal(new Set(DEFAULT_MODEL_PROFILES.map(p => p.model)).size, 7);
+test("eight profiles use four current executor models; invalid config never selects a fallback", () => {
+  assert.deepEqual(DEFAULT_MODEL_PROFILES.map(({ name, model, reasoningEffort }) => [name, model, reasoningEffort]), [
+    ["mini", "gpt-5.6-luna", "low"], ["fast", "gpt-5.6-luna", "medium"],
+    ["standard", "gpt-5.6-terra", "low"], ["medium", "gpt-5.6-terra", "medium"],
+    ["proven", "gpt-5.6-sol", "medium"], ["advanced", "gpt-5.6-sol", "high"],
+    ["expert", "gpt-6-astra", "xhigh"], ["ultra", "gpt-6-astra", "max"],
+  ]);
   assert.ok(DEFAULT_MODEL_PROFILES.every(p => p.name !== "spark" && p.model !== "gpt-5.3-codex-spark"));
   const root = mkdtempSync(path.join(os.tmpdir(), "todo-invalid-models-"));
   try {
@@ -69,6 +74,38 @@ test("seven eligible executor models have task roles; invalid config never selec
       assert.ok(loaded.readError);
       assert.throws(() => resolveTaskExecution(loaded), /custom|Custom/);
     }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("legacy builtin copies migrate while custom profiles and pipeline references survive", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "todo-legacy-profiles-"));
+  try {
+    mkdirSync(path.join(root, ".todo"));
+    const file = path.join(root, ".todo/config.json");
+    const oldModels = { mini: "gpt-5.4-mini", standard: "gpt-5.4", proven: "gpt-5.5", expert: "gpt-5.6-sol", ultra: "gpt-5.6-sol" };
+    const custom = { name: "custom", model: "gpt-5.5", reasoningEffort: "high", description: "Intentional override" };
+    const original = { workers: 3, defaultModelProfile: "mini", pipeline: { file: "quality.yaml" },
+      models: [...DEFAULT_MODEL_PROFILES.map(p => oldModels[p.name] ? { ...p, model: oldModels[p.name], reasoningEffort: "high" } : p), custom] };
+    writeFileSync(file, JSON.stringify(original));
+    // The executor still offers 5.5 but has removed both 5.4 models.
+    const catalog = { command: "codex", checkedAt: new Date().toISOString(), models:
+      [...new Set([...DEFAULT_MODEL_PROFILES.map(p => p.model), "gpt-5.5", "gpt-5", "gpt-4.1"])].map(model => ({
+        model, efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium",
+      })) };
+    const plan = modelProfilePlan(root, catalog);
+    for (const name of Object.keys(oldModels)) {
+      assert.deepEqual(plan.proposed.models.find(p => p.name === name), DEFAULT_MODEL_PROFILES.find(p => p.name === name));
+    }
+    assert.deepEqual(plan.proposed.models.find(p => p.name === "custom"), custom);
+    assert.equal(plan.proposed.models.length, 9, "do not automatically rediscover older GPT generations");
+    assertProfilesAvailable(plan.proposed.models, catalog);
+    applyModelProfilePlan(root, catalog, plan.planId);
+    const saved = JSON.parse(readFileSync(file, "utf8"));
+    assert.deepEqual({ ...saved, models: original.models }, original);
+    assert.equal(modelProfilePlan(root, catalog).changed, false);
+    // Discovery also must not add 5.5 when no intentional custom profile uses it.
+    writeFileSync(file, JSON.stringify({ ...saved, models: saved.models.filter(p => p.name !== "custom") }));
+    assert.equal(modelProfilePlan(root, catalog).changed, false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -167,6 +204,15 @@ test("omitted models remain inherited and old task models resolve through the sa
     const raw = JSON.parse(readFileSync(file, "utf8"));
     assert.equal(Object.hasOwn(raw, "models"), false);
     const config = loadConfig(root);
+    for (const [name, oldModel] of Object.entries({ mini: "gpt-5.4-mini", standard: "gpt-5.4", proven: "gpt-5.5" })) {
+      const profile = DEFAULT_MODEL_PROFILES.find(p => p.name === name);
+      const execution = resolveSavedExecution(config, { modelProfile: name, model: oldModel, reasoningEffort: "high" });
+      assert.equal(execution.model, profile.model);
+      assert.equal(execution.reasoningEffort, profile.reasoningEffort);
+      const pipeline = resolvePipelineProfiles(config, { steps: [{ id: "work", type: "codex-thread", modelProfile: name, model: oldModel }], repair: null }, execution);
+      assert.equal(pipeline.steps[0].model, profile.model);
+      assert.equal(pipeline.steps[0].reasoningEffort, profile.reasoningEffort);
+    }
     const previous = { backend: "exec", modelProfile: "expert", model: "obsolete-model", reasoningEffort: "low", ephemeral: true, mode: "background" };
     const current = resolveSavedExecution(config, previous);
     assert.equal(current.modelProfile, "expert");

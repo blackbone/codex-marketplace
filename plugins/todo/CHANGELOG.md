@@ -1,5 +1,24 @@
 # Changelog
 
+## Current model profile audit
+
+- Map mini/fast to GPT-5.6 Luna, standard/medium to Terra, proven/advanced to Sol,
+  and expert/ultra to GPT-6 Astra, with two reasoning levels per model.
+- Keep all eight profile names and resolve saved tasks/pipelines through the new
+  mappings on their next attempt; preserve the configured default profile.
+- Migrate explicit copies of old built-in mappings through model_profiles and
+  stop automatically adding pre-5.6 GPT models; preserve supported custom profiles.
+
+## Live dashboard task counters
+
+- Publish counter changes through the bundled desktop MCP so the Codex UI receives
+  title updates, using the host runtime and its native peer authorization.
+- Prefer the current dashboard owner over legacy supervisor metadata; bind explicit
+  runner starts from executor metadata and preserve ownership across other runner calls.
+- Recompute on task/claim events independently of worker polling, coalesce in-flight
+  changes, prevent event starvation, and retry failed updates after five seconds.
+- Cover live status transitions, ownership changes, failed calls, timeouts and reconnects.
+
 ## Merge validation recovery
 
 - Continue post-rebase gate failures through the original task, worktree and Codex thread, with bounded repair context and fresh mandatory checks.

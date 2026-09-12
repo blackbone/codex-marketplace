@@ -1,5 +1,19 @@
 # Validation record — 2026-09-09
 
+## Latest Pipeline setup — 2026-09-11
+
+Official `unity pipeline list-versions` reported latest `0.7.0-exp.1`. A disposable
+Unity-shaped project exercised the real CLI through the source wrapper: missing
+package installation selected 0.7.0-exp.1, upgrading a 0.6.0-exp.1 manifest selected
+0.7.0-exp.1, and a second init reported the unchanged current version. An unrelated
+dependency survived all three calls and their leases were released. No user project
+was changed and no Editor was opened; this proves registry/manifest installation,
+not 0.7 Editor import or command compatibility. The older observations below remain
+historical evidence, not version pins.
+
+77 Unity regressions pass, including latest install/upgrade dispatch, already-current
+behavior, setup/action exclusion, uncertain-result retention and cancellation.
+
 The regression suite uses disposable projects, fake process/CLI executables and
 loopback HTTP fixtures. No fault injection targets a user's Unity project.
 It exercises descriptor/process identity, hook/wrapper/launcher parity, ToDo guards,

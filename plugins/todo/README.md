@@ -184,9 +184,11 @@ shell checks. An answer is never treated as a passed stage or permission to
 skip validation. The original task worktree and runner-owned Git delivery remain
 in use.
 
-All session management uses app-server JSON-RPC. ToDo does not load a desktop
-application adapter, connect to an application pipe, navigate the application,
-or create and mutate host automations. The dashboard has no application-open
+Worker session management uses app-server JSON-RPC. Dashboard counter titles use
+the bundled `codex-app-tools` MCP's `set_thread_title` when the host provides its
+desktop connection and Node runtime. This notifies the application immediately;
+the adapter only renames the bound dashboard task and never navigates, starts
+model turns, or creates host automations. The dashboard has no application-open
 button. Worker sessions are named and archived through app-server. An unavailable
 runtime capability remains an explicit waiting-input condition; answering does
 not grant tools, permissions, or access that the worker lacks.
@@ -211,8 +213,9 @@ For a live preview, configure merge delivery to the working branch (for example
 `$todo:start` starts the detached runner and returns its current dashboard URL.
 `$todo:stop` leaves active tasks alone unless interruption is explicitly requested.
 `$todo:supervise` performs a single health and failure inspection; it does not
-schedule host heartbeats. Existing legacy supervisor metadata is retained for
-compatibility, and any already-bound title is updated only through app-server.
+schedule host heartbeats. `runner_start` binds the dashboard to the executor's
+thread metadata when available, or an explicitly supplied `dashboardThreadId`.
+Existing dashboard ownership takes precedence over legacy supervisor metadata.
 The plugin does not change previously configured host automations.
 
 Worker threads are archived after an attempt and unarchived before resuming.
@@ -515,12 +518,24 @@ configuration without interrupting active tasks.
 
 ### Model availability and config updates
 
-Seven Codex models are represented by eight task profiles (Astra has
-separate complex and very complex roles). The executor's paginated `model/list`
-catalog determines availability for the actual account/CLI: the desktop picker
-can expose models that a background executor cannot yet use. Legacy model names
-remain in the template so their status and replacement are visible; listing
-is not a claim of availability. Spark is excluded from profiles, execution, and automatic model discovery.
+Four current Codex models serve eight task profiles. Profile names remain stable
+for existing tasks; built-in profiles use GPT-5.6 or newer.
+
+| Profile | Model | Reasoning |
+| --- | --- | --- |
+| `mini` | `gpt-5.6-luna` | `low` |
+| `fast` | `gpt-5.6-luna` | `medium` |
+| `standard` | `gpt-5.6-terra` | `low` |
+| `medium` | `gpt-5.6-terra` | `medium` |
+| `proven` | `gpt-5.6-sol` | `medium` |
+| `advanced` | `gpt-5.6-sol` | `high` |
+| `expert` | `gpt-6-astra` | `xhigh` |
+| `ultra` | `gpt-6-astra` | `max` |
+
+The executor's paginated `model/list` catalog determines availability for the
+actual account/CLI: the desktop picker can expose models that a background
+executor cannot yet use. Spark is excluded from profiles, execution, and
+automatic model discovery.
 
 `task_preflight` returns model diagnostics. Before starting an agent, the runner
 resolves each saved profile against the current config (or built-in profiles),
@@ -532,10 +547,12 @@ minutes and invalidated when the configured models or executor change.
 Use the `model_profiles` MCP tool with `action: inspect` to refresh availability
 and preview the complete update: available/deprecated/retired/unsupported models,
 unsupported reasoning levels, replacements, removals, and newly discovered
-models. Newly discovered models use their executor description and default
-reasoning level; review their suitability before assigning work. The preview
-preserves supported custom profiles, replaces retired models when the executor
-supplies a supported successor, and removes unsupported entries.
+models. Automatic discovery skips GPT generations older than 5.6. Newly
+discovered models use their executor description and default reasoning level; review their suitability before assigning work. The preview
+migrates known old built-in mappings (`mini`, `standard`, `proven`, `expert`,
+`ultra`) to their current roles when available, preserves supported custom
+profiles and custom efforts on current models, replaces retired models when the
+executor supplies a supported successor, and removes unsupported entries.
 
 After approving the exact preview, call `action: apply` with its `planId`.
 A changed config or catalog invalidates the preview. Applying creates a private
@@ -676,6 +693,16 @@ its owning Codex thread, but can change after a collision; query
 stale URL. Prompts, readable transcripts, worker JSONL event logs, results, and
 metrics remain in `.todo/` for audit and debugging.
 
+The owning task's `-> ToDo (…r / …q / …f / …w)` counters are recomputed on task
+and claim file changes, with a 25 ms event coalescing window independent of the
+worker polling interval. Updates are serialized and changes during an in-flight
+rename trigger another computation. Failed title updates retry after five seconds.
+`r` counts running tasks; `q` includes queued, blocked, staging, merge-queued and
+merge-conflict tasks; `f` counts failures; `w` appears while input is needed.
+Without a desktop connection, app-server still stores the title, but immediate
+refresh in the desktop UI is not guaranteed. `supervisorThreadTitle.transport`
+in runner state identifies the successful path; connection failures remain errors.
+
 Dependency IDs link to their task Markdown when the referenced task is available.
 Canceled lifecycle records are labeled `rejected` in the dashboard. Field filters
 accept OR values as either `status:completed|rejected` or
@@ -735,6 +762,10 @@ or invalid configuration reports `update-blocked` instead of interrupting work.
 - Stopping the runner does not interrupt active tasks unless explicitly forced.
 - The runner leaves the last synchronized `-> ToDo (...)` title in place after
   it stops; it cannot publish later task-state changes while it is offline.
+- Desktop title updates require the host-provided `CODEX_APP_TOOLS_PIPE_PATH`
+  and bundled MCP/Node runtime. Native peer authorization is left intact; rejected
+  connections are reported and retried, never bypassed. Restart the runner from
+  a new Codex task if its inherited desktop connection becomes stale after an app restart.
 - Opening the dashboard from `$todo:start` requires the bundled in-app Browser;
   Browser failure does not roll back an otherwise successful runner start.
 - Archiving a Codex thread hides it from the active thread list but does not

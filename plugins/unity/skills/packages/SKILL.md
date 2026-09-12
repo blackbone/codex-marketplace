@@ -1,6 +1,6 @@
 ---
 name: packages
-description: Discover, add, remove or change versions of Unity UPM packages through the current Editor's native Pipeline commands. Use for Unity package dependencies; use unity:init only for initial Pipeline setup.
+description: Discover, add, remove or change versions of Unity UPM packages through the current Editor's native Pipeline commands. Use for Unity package dependencies; use unity:init for installing or updating Pipeline to latest.
 ---
 
 # Unity packages
@@ -24,7 +24,8 @@ an installer script; that statement does not apply to inspected Pipeline 0.6.
 Do not duplicate the installer or launch a headless Editor against this open project.
 If these commands are absent, report the capability gap before choosing a version-
 appropriate Client API solution; do not silently upgrade Pipeline or hand-edit its
-manifest to bypass it. `$unity:init` is for requested initial Pipeline setup only.
+manifest to bypass it. `$unity:init` installs or updates Pipeline to the latest
+registry version when explicitly requested.
 
 Verify the requested package exists and choose the version against the project's
 Editor and existing constraints using native package search/registry metadata.

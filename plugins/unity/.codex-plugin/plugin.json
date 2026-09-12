@@ -1,6 +1,6 @@
 {
   "name": "unity",
-  "version": "0.1.0+codex.20260910121816",
+  "version": "0.1.0+codex.20260911193459",
   "description": "Open the current Unity project and run Editor actions through the official CLI, with Pipeline checks only on demand.",
   "author": {
     "name": "blackbone"

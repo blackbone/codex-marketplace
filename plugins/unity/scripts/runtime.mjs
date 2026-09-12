@@ -367,17 +367,35 @@ async function recoverInner(project, phase, id, run, deps) {
   return { ...status, ok: status.state === 'ready', recovery: status.state === 'ready' ? 'verified' : 'not_verified', recoveryId: id };
 }
 
-export async function initialize(project, run = execute) {
+export async function initialize(project, run = execute, deps = {}) {
   assertTodoCompatible(project.root);
-  if (operationOwner(project.root)) return operationBlocked(project);
   if (Number(project.version.split('.')[0]) < 6000) return { ok: false, project, state: 'unsupported_unity' };
-  if (project.pipeline) return { ok: true, project, state: 'pipeline_present' };
-  const result = await run(process.env.UNITY_CLI || 'unity',
-    ['pipeline', 'install', '--project-path', project.root, ...globalArgs], { cwd: project.root, timeout: 30000 });
-  const updated = readProject(project.root);
-  const ok = result.ok && Boolean(updated.pipeline);
-  return { ok, project: updated, state: ok ? 'pipeline_installed' : 'install_failed',
-    ...(ok ? {} : { error: result.ok ? 'PACKAGE_NOT_ADDED' : result.error }) };
+  const lease=acquireOperation(project.root,'command');
+  if (!lease) return operationBlocked(project);
+  let sent=false,unknown=false;
+  try {
+    const before=readProject(project.root);
+    if(deps.signal?.aborted) return cancelled(project);
+    sent=true;
+    const result = await run(process.env.UNITY_CLI || 'unity',
+      ['pipeline', before.pipeline ? 'upgrade' : 'install', '--project-path', project.root, ...globalArgs],
+      { cwd: project.root, timeout: 30000, signal:deps.signal });
+    const updated = readProject(project.root);
+    const ok = result.ok && Boolean(updated.pipeline);
+    unknown=!ok && result.started!==false && result.error!=='CLI_MISSING';
+    return { ok, project: updated, versionPolicy:'latest',
+      state: ok ? (!before.pipeline ? 'pipeline_installed' : before.pipeline===updated.pipeline ? 'pipeline_present' : 'pipeline_upgraded') : 'install_failed',
+      outcome:ok?'succeeded':unknown?'unknown':'not_sent',
+      ...(unknown?{operationId:lease.id}:{}),
+      ...(ok ? {} : { error: result.ok ? 'PACKAGE_NOT_ADDED' : safeCode(result.error) }) };
+  } catch(error) {
+    unknown=sent;
+    if(!sent) throw error;
+    return {ok:false,project,state:'install_failed',outcome:'unknown',error:'INSTALL_OUTCOME_UNKNOWN',operationId:lease.id};
+  } finally {
+    if(unknown) retainUnknown(project.root,lease.id);
+    else releaseOperation(project.root,lease.id);
+  }
 }
 
 export { resolveProject };

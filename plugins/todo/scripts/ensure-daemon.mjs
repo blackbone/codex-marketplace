@@ -28,6 +28,7 @@ import {
   loadConfig,
   processIsAlive,
   readDaemonState,
+  readDashboardThreadRequest,
   requestDashboardThread,
   todoDir,
 } from "./lib.mjs";
@@ -569,6 +570,7 @@ export function ensureDaemon(
   ensureLayout(repoRoot);
   const dashboardOwner =
     dashboardThreadId ||
+    readDashboardThreadRequest(repoRoot)?.threadId ||
     getSupervisorStatus(repoRoot).automation?.targetThreadId ||
     null;
   const requestedDashboardThreadId = dashboardOwner
@@ -670,7 +672,7 @@ export function ensureDaemon(
     const startedAt = Date.now();
     try {
       child = spawn(
-        process.execPath,
+        process.env.CODEX_MCP_NODE_PATH || process.execPath,
         [path.join(scriptDir, "daemon.mjs"), "--repo", repoRoot],
         {
           cwd: repoRoot,

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-09-11 — Latest Pipeline setup
+
+- Explicit init now updates existing Pipeline through official `pipeline upgrade`;
+  missing packages still use `pipeline install`, with registry latest selected by CLI.
+- Serialize setup with Editor operations, preserve uncertain outcomes without replay,
+  and pass cancellation through to the installer. Ordinary actions never auto-upgrade.
+
 ## 2026-09-10 — Native engine workflows
 
 - Add focused recipes for native file scripts/dry-run, targeted validation, Safe Mode

@@ -1,12 +1,12 @@
 ---
 name: init
-description: Set up the official Unity Pipeline package in the Unity project belonging to the current task. Use when the user asks to initialize or connect a Unity project for Editor actions.
+description: Install or update the official Unity Pipeline package to the latest registry version in the current task's Unity project. Use when the user asks to initialize, connect or upgrade Pipeline for Editor actions.
 ---
 
 # Initialize Unity
 
 For ordinary UPM dependencies, upgrades or removals, use [the packages skill](../packages/SKILL.md).
-This skill only sets up the Pipeline connection package.
+This skill installs or updates the Pipeline connection package.
 
 In a repository initialized with ToDo, Unity setup also requires
 `git.executionMode: "single-branch"` in `.todo/config.json`. The wrapper blocks
@@ -24,14 +24,24 @@ node "<PLUGIN_ROOT>/scripts/cli.mjs" init --cwd "<task-folder>"
 If several projects are found, ask which one to initialize and add
 `--project "<absolute-unity-root>"`. Do not select a candidate on the user's behalf.
 
-This installs `com.unity.pipeline` through the official CLI into the selected
-project's `Packages/manifest.json`. Unity subsequently resolves packages and may
-update its package lock. A request to initialize authorizes this setup; state
-the change and proceed. Existing dependencies and an existing Pipeline version
-are preserved. This command does not upgrade or install Unity itself.
+This selects the latest registry version of `com.unity.pipeline` through the official
+CLI: `pipeline install` when missing, `pipeline upgrade` when already declared.
+The CLI resolves the version at call time; there is no bundled version pin or
+custom registry/version comparator. An already-current package is left as-is.
+A request to initialize or upgrade Pipeline authorizes this setup; state the change
+and proceed. Other dependencies are preserved. The manifest changes first; Unity
+subsequently resolves packages and may update its lock. This does not upgrade the
+CLI or Unity Editor. A requested exact version/custom package source is a separate
+package-management action; do not use latest-mode init to satisfy a pin request.
+
+The operation uses the same project lease as Editor commands. An uncertain failure
+retains its operation ID for reconciliation; do not repeat an upgrade automatically.
+Only explicit init performs this version check. Startup, status, doctor, list and
+run never automatically upgrade Pipeline. Historical versions in validation notes
+describe inspected contracts, not installation requirements.
 
 After successful setup, call the wrapper's `open` operation once if opening the
-project is part of the request. Report `pipeline_installed` or `pipeline_present`
+project is part of the request. Report `pipeline_installed`, `pipeline_upgraded` or `pipeline_present`
 separately from Editor readiness. Do not wait for package import, compilation,
 or Pipeline startup and do not repeatedly check status. The next requested
 Editor action waits for readiness, compilation and import completion itself.

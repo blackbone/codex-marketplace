@@ -133,7 +133,7 @@ test("ToDo MCP server resolves from the installed plugin root", async () => {
   assert.equal(server.command, "sh");
   assert.deepEqual(server.args, [
     "-c",
-    "exec node \"$PLUGIN_ROOT/scripts/mcp-server.mjs\"",
+    "exec \"${CODEX_MCP_NODE_PATH:-node}\" \"$PLUGIN_ROOT/scripts/mcp-server.mjs\"",
   ]);
   assert.equal(server.cwd, ".");
   assert.deepEqual(server.env, { PLUGIN_ROOT: "." });

@@ -2546,6 +2546,11 @@ for await (const line of createInterface({ input: process.stdin })) {
     stickyState.dashboard.port === replacementDashboardPort,
     "original thread did not recover its reserved dashboard port",
   );
+  ensureDaemon(repoRoot);
+  assert(
+    readDaemonState(repoRoot).dashboard.threadId === stickyThreadId,
+    "ordinary runner calls must preserve the dashboard owner over legacy supervisor metadata",
+  );
   await callMcpStop();
 
   writeFileSync(configFile, '{"retries":-1}\n', "utf8");
