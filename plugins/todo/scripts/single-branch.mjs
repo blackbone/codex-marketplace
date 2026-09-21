@@ -181,7 +181,7 @@ export function reserveSingleBranch(root, taskPath, mode, state, { administrativ
   recoverClosedReservation(state);
   const reservation = state.reservation;
   if (reservation && reservation.taskPath !== realpathSync(taskPath)) {
-    fail("single_branch_reserved", `Working copy is reserved by ${reservation.taskPath}; finish or recover that task first`);
+    fail("single_branch_reserved", `Working copy is reserved by ${reservation.taskPath}; finish or recover that task before starting another ToDo task. Local builds, tests, and previews without project edits run directly without a ToDo claim; they do not require releasing this reservation`);
   }
   if (mode !== "single-branch" && !reservation) return;
   if (recover === true && reservation?.executors) {

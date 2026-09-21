@@ -25,6 +25,11 @@ Installing ToDo does not activate it in every repository. In a target Git
 repository, ask Codex to use `$todo:init`. Initialization creates
 `.todo/config.json`, excludes `.todo/` from Git by default, and installs a managed
 routing block in the applicable root `AGENTS.md` without replacing other rules.
+It opens the default browser with the Settings dialog so you can configure the
+repository before starting workers. Existing config is preserved until you save.
+For headless initialization, pass `openBrowser: false` to `repo_init`. Browser
+failures return a manual `settingsUrl`; the setup listener lasts for the MCP
+session and does not start workers.
 The bundled MCP launcher resolves its runtime from the installed plugin directory,
 so local marketplace installs do not depend on an inherited `PLUGIN_ROOT` value.
 
@@ -49,18 +54,22 @@ linked worktrees, without spawning Git on each poll.
 
 In an activated repository, `$todo:route` applies to repository mutations even
 when ToDo is not mentioned explicitly. Read-only analysis, planning, status, and
-inspection stay in the current thread. The legacy config value `all-mutations`
-means project mutations subject to the following purpose-based exception.
+inspection stay in the current thread. Local builds, tests, application launches,
+and previews without project edits also run directly, including while a
+single-branch task is active. The legacy config value `all-mutations` means
+project mutations subject to the following purpose-based exceptions.
 
 <!-- TODO TOOLING EXCEPTION START -->
 Classify each operation by its purpose and effects, not just its file path or the fact that a plugin/tool is invoked.
 - Perform Codex plugin and auxiliary tool installation, configuration, updates, diagnostics, tool connections, and creation or refresh of their service configurations, indexes, and caches directly, without creating a ToDo task. This includes service files inside the repository.
-- Product code, project documentation, application dependencies, build, CI/CD, and deployment changes still require ToDo, even when performed through a plugin or described as "tooling setup". Developing a plugin as the repository's product is also a project change.
+- Run local builds, tests, application launches, previews, and runtime inspection directly in the current thread when they do not edit product code, project documentation, application dependencies, or build/CI/CD/deployment configuration. Generated local build outputs, caches, logs, test reports, and disposable runtime data are allowed effects of this verification; they do not require a ToDo task.
+- Local verification requires no task creation, task_preflight, task_run_start, or task_run_finish, including while another task owns a single-branch reservation. Do not add task dependencies, wait for task completion, stop a worker, or release/recover its reservation merely to run local verification. Respect actual tool/resource conflicts (for example, an occupied Editor or output directory); use separate local outputs where needed and report the concrete conflict if it cannot be avoided.
+- Changes to product code, project documentation, application dependencies, build scripts/settings, CI/CD, or deployment still require ToDo, even when performed through a plugin or described as "tooling setup" or "verification". Route any required implementation fixes separately; the local verification exception does not authorize source edits, dependency upgrades, Git mutations, publishing, or deployment. Developing a plugin as the repository's product is also a project change.
 - Split mixed requests: perform tool setup directly and route project changes through ToDo. Complete prerequisite setup before publishing dependent project tasks; a setup failure must not publish tasks that depend on it.
 - A user's request to configure a tool already authorizes that setup; do not ask for a separate routing confirmation. Preserve existing permission, access, authentication, and hook-trust requirements; never approve hook trust on the user's behalf.
 - Examples: docs:init writing .semantic-search.json and indexing docs/ is direct; configuring another Codex plugin or MCP connection is direct; editing source code or docs/ through a plugin requires ToDo; changing a build pipeline or deployment under the label "tooling setup" requires ToDo; connecting a documentation search tool and then rewriting project documentation splits into direct setup and a ToDo documentation task.
 
-The tooling exception does not expand a claimed worker's assigned task scope, repository access, permissions, or authority to create follow-up tasks. Perform tool setup only when required for the assigned task and already allowed by its restrictions; never use it to alter unrelated repositories, managed routing instructions, or .todo runtime state.
+The tooling and local verification exceptions do not expand a claimed worker's assigned task scope, repository access, permissions, or authority to create follow-up tasks. Perform tool setup or local verification only when required for the assigned task and already allowed by its restrictions; never use these exceptions to alter unrelated repositories, managed routing instructions, or .todo runtime state.
 <!-- TODO TOOLING EXCEPTION END -->
 
 After a plugin update, trusted `SessionStart` and `UserPromptSubmit` hooks refresh
@@ -382,6 +391,14 @@ old worktree attempts before starting new single-branch work. All participating
 runners must use a plugin version supporting this policy; a legacy running
 claim is detected and must drain before entry.
 
+This reservation governs ToDo task execution. Local builds, tests, launches,
+and previews without project edits run directly without a task or claim, while
+the owning worker continues. Build outputs, caches, logs, and reports are allowed;
+no dependency on the active task is needed. Use separate output paths if a real
+resource conflict requires them. Results reflect the current working copy, which
+may include the worker's unfinished changes; they do not establish that its task
+is complete or replace its required validation.
+
 The worker, app-server thread and every pipeline step use the same copy.
 Pipeline `cwd` remains relative and symlinks escaping the copy are rejected.
 Unity workers must resolve the Unity project inside that copy and verify the
@@ -473,6 +490,25 @@ accepted SHA is idempotent. Interrupted acceptance can be retried through this
 same operation; do not edit task metadata or reservation files manually.
 
 ## Configuration
+
+Hover over a task's **Profile** to see its currently configured model and reasoning
+effort. Click the profile to filter tasks by that profile.
+
+Use **Settings** in the dashboard to edit worker count, the default model
+profile, target branch, Git execution/delivery mode, remote/push, retries, and
+poll/reload intervals. Branch suggestions come from local Git branches; an empty
+target uses the branch active at preflight. Single-branch mode runs one worker
+and disables push. Saves validate input, preserve other fields, and reject stale
+edits if the file changed since opening; use **Reload** to fetch the latest values.
+Advanced options such as custom model definitions, pipelines, and dashboard port
+remain editable directly in `.todo/config.json`. A running daemon applies changes
+on its next config reload; active tasks retain their settings.
+
+![Repository settings](assets/screenshots/settings.png)
+
+Settings writes are restricted to the loopback dashboard with same-origin and
+custom-header checks. Like the other local dashboard actions, they have no user
+authentication and are intended for a trusted local machine.
 
 The default `.todo/config.json` is:
 

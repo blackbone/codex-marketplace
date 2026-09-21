@@ -1,0 +1,11 @@
+{
+  "sourceDigest": "683b4d34dba570a960fd559363758d724a0e0beb593e06ea52ce7756c35ec013",
+  "binaries": {
+    "darwin-amd64/ori": "6f70ee651081f02ec0c01c3ffc94c9904b43a41afd92175aa88d3ac361a3109d",
+    "darwin-arm64/ori": "d1e4726fe56a6afc1c82ca8e73c58cf3b11b6029cd3df770aa2312155f51ada8",
+    "linux-amd64/ori": "7814eb2e2768d21ed0987f62d662fa31883c29dc1c2bba8888ddfbe0d7f3e84d",
+    "linux-arm64/ori": "b36570f59510a20f97fe29f8f96debef369c0f5a3486ba41a9160c7677d2c8ad",
+    "windows-amd64/ori.exe": "922c38a022fa0d65064dda4513d03f18d11e5c49e985ea5b0ebc353b04124ac3",
+    "windows-arm64/ori.exe": "fb71cf98117f6808fec6875d53cb22b5e1c11a5d66ea31f937a73390bc7a6c92"
+  }
+}

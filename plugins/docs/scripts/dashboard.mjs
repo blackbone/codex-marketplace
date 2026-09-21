@@ -6,11 +6,12 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { cacheDir, tempRoot, readConfig, atomicJson, withLock, alive, hash, delay } from './common.mjs';
-import { healthy } from './client.mjs';
+import { healthy, request } from './client.mjs';
+import { dashboardDocument, contextualResults, sourceContext, openDocument } from './dashboard-documents.mjs';
 
 const script = fileURLToPath(import.meta.url);
 const assets = new URL('../assets/dashboard/', import.meta.url);
-const version = hash([fs.readFileSync(script), ...['index.html', 'app.js', 'style.css'].map(file => fs.readFileSync(new URL(file, assets)))].map(hash).join(':')).slice(0, 16);
+const version = hash([fs.readFileSync(script), fs.readFileSync(new URL('./dashboard-documents.mjs', import.meta.url)), ...['index.html', 'app.js', 'style.css'].map(file => fs.readFileSync(new URL(file, assets)))].map(hash).join(':')).slice(0, 16);
 const statePath = () => path.join(cacheDir('servers'), `dashboard-${version}.json`);
 
 function indexCounts(root) {
@@ -55,9 +56,10 @@ export async function dashboardSnapshot(selectedRoot, { service = healthy } = {}
       active: projects.reduce((n, p) => n + p.activeCount, 0), pending: projects.reduce((n, p) => n + p.pendingCount, 0) } };
 }
 
-export async function startDashboard({ token, idleMs = 120_000, snapshot = dashboardSnapshot, onStop = () => {} } = {}) {
+export async function startDashboard({ token, idleMs = 120_000, snapshot = dashboardSnapshot, search = args => request('search', args), launch, onStop = () => {} } = {}) {
   if (!/^[a-f0-9]{64}$/.test(token || '')) throw new Error('A private dashboard token is required');
   let lastUse = Date.now();
+  let searches = 0;
   let origin;
   const prefix = `/${token}/`;
   const resources = new Map([['', ['index.html', 'text/html; charset=utf-8']], ['app.js', ['app.js', 'text/javascript; charset=utf-8']], ['style.css', ['style.css', 'text/css; charset=utf-8']]]);
@@ -68,13 +70,49 @@ export async function startDashboard({ token, idleMs = 120_000, snapshot = dashb
       res.end(type === 'application/json' ? JSON.stringify(body) : body);
     };
     if (req.headers.host !== new URL(origin).host || (req.headers.origin && req.headers.origin !== origin)) return send(403, { error: 'Forbidden' });
-    if (req.method !== 'GET') return send(405, { error: 'Read-only dashboard' });
     const url = new URL(req.url, origin);
     if (!url.pathname.startsWith(prefix)) return send(403, { error: 'Forbidden' });
     const route = url.pathname.slice(prefix.length);
+    const action = ['search', 'open'].includes(route);
+    if (req.method !== (action ? 'POST' : 'GET')) return send(405, { error: 'Method not allowed' });
+    if (action && req.headers.origin !== origin) return send(403, { error: 'Forbidden' });
     lastUse = Date.now();
     if (route === 'health') return send(200, { pid: process.pid, version });
     try {
+      if (action) {
+        if (req.headers['content-type']?.split(';')[0].trim() !== 'application/json') return send(415, { error: 'Expected application/json' });
+        req.setEncoding('utf8');
+        let body = '';
+        for await (const part of req) {
+          body += part;
+          if (Buffer.byteLength(body) > 20_000) return send(413, { error: 'Request too large' });
+        }
+        const args = JSON.parse(body);
+        if (route === 'open') {
+          if (typeof args?.cwd !== 'string' || !path.isAbsolute(args.cwd)) throw new Error('cwd must be an absolute directory path');
+          return send(200, await openDocument(args.cwd, args.path, launch));
+        }
+        if (typeof args?.query !== 'string' || !args.query.trim() || args.query.length > 4000) throw new Error('query must contain 1–4000 characters');
+        if (typeof args.cwd !== 'string' || !path.isAbsolute(args.cwd)) throw new Error('cwd must be an absolute directory path');
+        const root = readConfig(args.cwd).root;
+        searches++;
+        try { return send(200, contextualResults(root, await search({ cwd: root, query: args.query.trim(), limit: 20 }))); }
+        finally { searches--; lastUse = Date.now(); }
+      }
+      if (route === 'document') {
+        const cwd = url.searchParams.get('cwd');
+        if (!cwd || !path.isAbsolute(cwd)) throw new Error('cwd must be an absolute directory path');
+        const document = dashboardDocument(cwd, url.searchParams.get('path'));
+        return send(200, document.text, 'text/plain; charset=utf-8');
+      }
+      if (route === 'context') {
+        const cwd = url.searchParams.get('cwd');
+        if (!cwd || !path.isAbsolute(cwd)) throw new Error('cwd must be an absolute directory path');
+        const document = dashboardDocument(cwd, url.searchParams.get('path'));
+        const context = sourceContext(document.text, Number(url.searchParams.get('from')), Number(url.searchParams.get('to')), true);
+        if (!context) throw new Error('Source line range is no longer available');
+        return send(200, context);
+      }
       if (route === 'state') {
         const cwd = url.searchParams.get('cwd');
         const root = cwd ? readConfig(cwd).root : null;
@@ -94,7 +132,7 @@ export async function startDashboard({ token, idleMs = 120_000, snapshot = dashb
     if (stopped) return;
     stopped = true; clearInterval(timer); server.close(); server.closeAllConnections(); onStop();
   };
-  const timer = setInterval(() => { if (Date.now() - lastUse > idleMs) stop(); }, Math.min(5000, idleMs));
+  const timer = setInterval(() => { if (!searches && Date.now() - lastUse > idleMs) stop(); }, Math.min(5000, idleMs));
   return { url: origin + prefix, stop, port: server.address().port };
 }
 

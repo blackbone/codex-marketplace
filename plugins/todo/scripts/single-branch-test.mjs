@@ -80,6 +80,46 @@ test("different threads/processes and linked copies cannot run concurrently; fai
   const next = await startInteractiveTask(root, two.id); await done(root, two, next, []);
 });
 
+test("direct local build and launch preserve an active reservation and its task delivery", async t => {
+  const root = fixture(t), owner = make(root, "Active implementation"), other = make(root, "Other implementation");
+  const run = await startInteractiveTask(root, owner.id);
+  writeFileSync(path.join(root, "foreign.txt"), "worker changes in progress\n");
+  const reservationFile = path.join(root, ".git", "todo-execution.json");
+  const reservation = readFileSync(reservationFile);
+  const claim = readFileSync(`${owner.path}.lock`);
+  const taskBody = readFileSync(owner.path);
+  const head = git(root, "rev-parse", "HEAD");
+  const index = git(root, "ls-files", "--stage");
+
+  // A small build fixture generates a runnable artifact and a report from the
+  // current source, using only ignored outputs and no ToDo claim or state edits.
+  const build = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+    mkdirSync('cache', { recursive: true });
+    const source = readFileSync('foreign.txt', 'utf8');
+    writeFileSync('cache/preview.mjs', 'console.log(' + JSON.stringify(source.trim()) + ');');
+    writeFileSync('cache/build.log', 'Local build complete');
+  `], { cwd: root, encoding: "utf8" });
+  assert.equal(build.status, 0, build.stderr);
+  const launch = spawnSync(process.execPath, ["cache/preview.mjs"], { cwd: root, encoding: "utf8" });
+  assert.equal(launch.status, 0, launch.stderr);
+  assert.equal(launch.stdout.trim(), "worker changes in progress");
+  assert.deepEqual(readFileSync(reservationFile), reservation);
+  assert.deepEqual(readFileSync(`${owner.path}.lock`), claim);
+  assert.deepEqual(readFileSync(owner.path), taskBody);
+  assert.equal(git(root, "rev-parse", "HEAD"), head);
+  assert.equal(git(root, "ls-files", "--stage"), index);
+  await assert.rejects(startInteractiveTask(root, other.id), error => {
+    assert.equal(error.kind, "single_branch_reserved");
+    assert.match(error.message, /Local builds, tests, and previews without project edits run directly/);
+    return true;
+  });
+  const receipt = await done(root, owner, run, ["foreign.txt"]);
+  assert.equal(receipt.status, "completed");
+  assert.equal(readFileSync(path.join(root, "cache/build.log"), "utf8"), "Local build complete");
+  assert.equal(git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), "foreign.txt");
+});
+
 test("crash preserves partial work, requires explicit recovery and never releases another owner's claim", async t => {
   const root = fixture(t), one = make(root, "Crash"), two = make(root, "Next");
   const p = spawnSync(process.execPath, ["--input-type=module", "-e", `import { startInteractiveTask } from ${JSON.stringify(lib)}; import {writeFileSync} from 'node:fs'; const run = await startInteractiveTask(${JSON.stringify(root)}, ${JSON.stringify(one.id)}); writeFileSync(${JSON.stringify(path.join(root, "partial.txt"))}, 'crash work'); console.log(JSON.stringify(run));`], { encoding: "utf8" });

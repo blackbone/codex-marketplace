@@ -1,6 +1,6 @@
 {
   "name": "docs",
-  "version": "0.1.0+codex.20260907134258",
+  "version": "0.1.0+codex.20260921183157",
   "description": "Local semantic documentation search with a shared watcher daemon, batched indexing and project-local SQLite indexes.",
   "author": {
     "name": "blackbone"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Docs",
     "shortDescription": "Search current local project documentation",
-    "longDescription": "Initialize documentation folders in each project. Session hooks register watchers with one shared daemon. A recoverable queue batches multilingual embeddings across projects; SQLite indexes stay in each project, while the model and queue journal live in system tmp. Open a small live status page to see indexed counts and the active and waiting file queue.",
+    "longDescription": "Initialize documentation folders in each project. Session hooks register watchers with one shared daemon. A recoverable queue batches multilingual embeddings across projects; SQLite indexes stay in each project, while the model and queue journal live in system tmp. Open a live dashboard to search documentation fragments by project and see indexed counts and the active and waiting file queue.",
     "developerName": "blackbone",
     "category": "Productivity",
     "capabilities": [

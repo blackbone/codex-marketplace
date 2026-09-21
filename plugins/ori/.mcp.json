@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ori": {
+      "command": "sh",
+      "args": ["-c", "exec \"$PLUGIN_ROOT/scripts/ori\" mcp"],
+      "cwd": ".",
+      "env": {"PLUGIN_ROOT": "."},
+      "startup_timeout_sec": 600,
+      "tool_timeout_sec": 1800
+    }
+  }
+}

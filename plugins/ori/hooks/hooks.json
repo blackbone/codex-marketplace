@@ -1,0 +1,42 @@
+{
+  "description": "Load Ori graph workflow instructions only in configured repositories.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$PLUGIN_ROOT/scripts/session-context.sh\"",
+            "timeout": 5,
+            "additionalContextLimit": 1500
+          }
+        ],
+        "matcher": "startup|resume|clear|compact"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$PLUGIN_ROOT/scripts/session-context.sh\"",
+            "timeout": 5,
+            "additionalContextLimit": 1500
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$PLUGIN_ROOT/scripts/session-context.sh\"",
+            "timeout": 5,
+            "additionalContextLimit": 1500
+          }
+        ]
+      }
+    ]
+  }
+}

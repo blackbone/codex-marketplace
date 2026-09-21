@@ -1,6 +1,6 @@
 {
   "name": "todo",
-  "version": "0.1.0+codex.20260921131800",
+  "version": "0.1.0+codex.20260921223535",
   "description": "Atomic repository task routing with optional YAML execution pipelines, persistent threads, deterministic gates, and telemetry.",
   "author": {
     "name": "blackbone"
@@ -18,7 +18,8 @@
     ],
     "screenshots": [
       "./assets/screenshots/plugin-details.png",
-      "./assets/screenshots/dashboard.png"
+      "./assets/screenshots/dashboard.png",
+      "./assets/screenshots/settings.png"
     ],
     "defaultPrompt": [
       "Use $todo:route to route this repository change through ToDo.",

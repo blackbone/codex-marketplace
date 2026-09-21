@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+# Resolve the bundled executable without changing the caller's working directory.
+ori_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+ori_suffix=
+case "$(uname -s)" in
+  Darwin) ori_os=darwin ;;
+  Linux) ori_os=linux ;;
+  MINGW*|MSYS*|CYGWIN*) ori_os=windows; ori_suffix=.exe ;;
+  *) echo "Ori: unsupported operating system: $(uname -s)" >&2; exit 1 ;;
+esac
+case "$(uname -m)" in
+  x86_64|amd64) ori_arch=amd64 ;;
+  arm64|aarch64) ori_arch=arm64 ;;
+  *) echo "Ori: unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+ori_binary="$ori_root/bin/$ori_os-$ori_arch/ori$ori_suffix"
+if [ ! -x "$ori_binary" ]; then
+  # Hooks never build, download, or modify the installed package.
+  if [ "${ORI_NO_BUILD:-0}" = 1 ]; then exit 0; fi
+  echo "Ori: bundled binary missing or not executable: $ori_binary. Reinstall the plugin." >&2
+  exit 1
+fi
+exec "$ori_binary" "$@"

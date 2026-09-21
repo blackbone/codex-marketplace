@@ -45,6 +45,11 @@ const scenarios = [
   ["3. plugin edits product code or project docs => ToDo", /editing source code or docs\/ through a plugin requires ToDo/],
   ["4. build/deployment disguised as tooling => ToDo", /changing a build pipeline or deployment under the label "tooling setup" requires ToDo/],
   ["5. mixed request => setup direct, docs task routed", /connecting a documentation search tool and then rewriting project documentation splits into direct setup and a ToDo documentation task/],
+  ["6. local build, test, launch and inspection => direct", /Run local builds, tests, application launches, previews, and runtime inspection directly in the current thread/],
+  ["7. generated verification artifacts do not require tasks", /Generated local build outputs, caches, logs, test reports, and disposable runtime data are allowed effects/],
+  ["8. active single-branch task does not gate local verification", /Local verification requires no task creation, task_preflight, task_run_start, or task_run_finish, including while another task owns a single-branch reservation/],
+  ["9. no invented blockers or worker interruption for verification", /Do not add task dependencies, wait for task completion, stop a worker, or release\/recover its reservation merely to run local verification/],
+  ["10. implementation fixes remain routed", /Route any required implementation fixes separately; the local verification exception does not authorize source edits, dependency upgrades, Git mutations, publishing, or deployment/],
 ];
 const sources = [TODO_ROUTING_POLICY, managedRoutingPolicyBlock()];
 for (const name of ["route", "create", "init", "run"]) {
@@ -73,7 +78,7 @@ for (const [name, pattern] of scenarios) {
 }
 test("permissions, hook trust, semantic purpose, mixed prerequisites and worker restrictions stay explicit", () => {
   assert.match(TOOLING_OPERATION_POLICY, /purpose and effects, not just its file path/);
-  assert.match(TOOLING_OPERATION_POLICY, /application dependencies, build, CI\/CD, and deployment changes still require ToDo/);
+  assert.match(TOOLING_OPERATION_POLICY, /application dependencies, build scripts\/settings, CI\/CD, or deployment still require ToDo/);
   assert.match(TOOLING_OPERATION_POLICY, /Developing a plugin as the repository's product is also a project change/);
   assert.match(TOOLING_OPERATION_POLICY, /do not ask for a separate routing confirmation/);
   assert.match(TOOLING_OPERATION_POLICY, /never approve hook trust on the user's behalf/);

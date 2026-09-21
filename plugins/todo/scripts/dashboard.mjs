@@ -1,3 +1,4 @@
+import { readSettings, saveSettings, SETTINGS_SCRIPT, SETTINGS_STYLE, SETTINGS_HTML } from "./dashboard-settings.mjs";
 import { readLogPreview } from "./bounded-log.mjs";
 import { readTaskChat } from "./task-chat.mjs";
 import { createServer } from "node:http";
@@ -1082,7 +1083,7 @@ const DASHBOARD_SCRIPT = `(() => {
       profileButton.className = "filter-token";
       profileButton.dataset.filterField = "profile";
       profileButton.dataset.filterValue = profile;
-      profileButton.title = "Add profile filter";
+      profileButton.title = task.profileTooltip;
       profileButton.textContent = profile;
       profileCell.append(profileButton);
     }
@@ -1673,11 +1674,19 @@ function sortLink(field, label, currentField, currentDirection, query = "") {
 
 function statusPayload(repoRoot) {
   const now = Date.now();
+  const config = loadConfig(repoRoot);
   const tasks = listTaskStatuses(repoRoot, {
     includeClosed: true,
     limit: null,
-  }).map((task) => dashboardTask(task, now));
-  const config = loadConfig(repoRoot);
+  }).map((task) => {
+    const profile = config.modelProfiles.find(
+      (candidate) => candidate.name === task.execution?.modelProfile,
+    );
+    const profileTooltip = profile
+      ? `Model: ${profile.model}\nReasoning: ${profile.reasoningEffort}\nClick to add profile filter`
+      : "Profile is not configured\nClick to add profile filter";
+    return { ...dashboardTask(task, now), profileTooltip };
+  });
   const daemon = readDaemonState(repoRoot);
   const appliedConfig = daemon?.appliedConfig || null;
   return {
@@ -1743,7 +1752,7 @@ function renderDashboard(repoRoot, requestUrl) {
   <td>${escapeHtml(task.title)}</td>
   <td><button type="button" class="filter-token status status-${escapeHtml(safeStatus)}" data-filter-field="status" data-filter-value="${escapeHtml(displayStatus)}" title="Add status filter">${escapeHtml(displayStatus)}</button></td>
   <td>${escapeHtml(task.workerId ?? "")}</td>
-  <td>${profile ? `<button type="button" class="filter-token" data-filter-field="profile" data-filter-value="${escapeHtml(profile)}" title="Add profile filter">${escapeHtml(profile)}</button>` : ""}</td>
+  <td>${profile ? `<button type="button" class="filter-token" data-filter-field="profile" data-filter-value="${escapeHtml(profile)}" title="${escapeHtml(task.profileTooltip)}">${escapeHtml(profile)}</button>` : ""}</td>
   <td>${blockerLinks(task, payload.tasks)}</td>
   <td class="time">${escapeHtml(formatTimestamp(updated))}</td>
   <td class="time">${escapeHtml(formatTimestamp(task.metrics?.startedAt))}</td>
@@ -1765,6 +1774,7 @@ function renderDashboard(repoRoot, requestUrl) {
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ToDo — ${escapeHtml(path.basename(repoRoot))}</title>
   <style>
+    ${SETTINGS_STYLE}
     :root { color-scheme: light dark; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     body { margin: 20px; font-size: 13px; }
     h1 { margin: 0; font-size: 20px; }
@@ -1840,7 +1850,7 @@ function renderDashboard(repoRoot, requestUrl) {
 <body>
   <div class="heading">
     <h1>ToDo — ${escapeHtml(path.basename(repoRoot))}</h1>
-    <button type="button" data-log-all>All logs</button>
+    <div><button type="button" id="settings-open">Settings</button> <button type="button" data-log-all>All logs</button></div>
   </div>
   <p class="summary">${tasks.length}${tasks.length === payload.tasks.length ? "" : ` of ${payload.tasks.length}`} tasks · ${taskCounts.running || 0} running · ${taskCounts.queued || 0} queued/blocked · ${taskCounts.failed || 0} failed · ${payload.tasks.filter(task => task.status === "waiting-input").length} waiting · merge ${escapeHtml(payload.runner?.mergeWorker?.status || "offline")} · ${escapeHtml(payload.runner?.implementation || "unknown runner")} ${escapeHtml(payload.runner?.pluginVersion || "")} · runtime ${escapeHtml(payload.runner?.runtimeState || "offline")} · config ${escapeHtml(Math.round((payload.config.configReloadIntervalMs || 5000) / 1000))}s · live 1s</p>
   <div class="filters" role="search">
@@ -1871,6 +1881,7 @@ function renderDashboard(repoRoot, requestUrl) {
     </thead>
     <tbody>${rows || '<tr data-empty-state><td colspan="15">No tasks</td></tr>'}</tbody>
   </table></div>
+  ${SETTINGS_HTML}
   <dialog id="input-dialog" aria-labelledby="input-title">
     <div class="chat-header"><h2 id="input-title">Task chat</h2><span id="input-state"></span><span id="chat-status" role="status"></span></div>
     <div id="chat-content" tabindex="0" aria-label="Execution messages"></div>
@@ -1947,6 +1958,34 @@ function persistDashboardPort(repoRoot, threadId, port) {
 function createDashboardServer(repoRoot, port, onTaskAction) {
   const server = createServer(async (request, response) => {
     try {
+      if (request.url === "/api/settings") {
+        const host = `${DASHBOARD_HOST}:${server.address().port}`;
+        if (request.headers.host !== host || (request.method === "POST" &&
+            (request.headers.origin !== `http://${host}` || request.headers["x-todo-action"] !== "1" ||
+             !request.headers["content-type"]?.startsWith("application/json")))) {
+          response.writeHead(403); response.end("Same-origin settings request required"); return;
+        }
+        if (!["GET", "POST"].includes(request.method)) {
+          response.writeHead(405, { Allow: "GET, POST" }); response.end("Method not allowed"); return;
+        }
+        try {
+          let result;
+          if (request.method === "POST") {
+            let body = "";
+            for await (const chunk of request) {
+              body += chunk;
+              if (Buffer.byteLength(body) > 32768) { response.writeHead(413); response.end("Input too large"); return; }
+            }
+            result = saveSettings(repoRoot, JSON.parse(body));
+          } else result = readSettings(repoRoot);
+          response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          response.end(JSON.stringify(result));
+        } catch (error) {
+          response.writeHead(409, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          response.end(JSON.stringify({ error: error.message }));
+        }
+        return;
+      }
       if (request.method === "POST" && request.url === "/api/task-action") {
         const origin = `http://${DASHBOARD_HOST}:${server.address().port}`;
         if (request.headers.host !== `${DASHBOARD_HOST}:${server.address().port}` ||
@@ -2064,7 +2103,7 @@ function createDashboardServer(repoRoot, port, onTaskAction) {
           "Content-Type": "text/javascript; charset=utf-8",
           "Cache-Control": "no-store",
         });
-        response.end(`${DASHBOARD_SCRIPT}\n`);
+        response.end(`${DASHBOARD_SCRIPT}\n${SETTINGS_SCRIPT}\n`);
         return;
       }
       if (requestUrl.pathname !== "/") {

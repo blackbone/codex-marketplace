@@ -1,3 +1,4 @@
+import { openInitSettings } from "./init-dashboard.mjs";
 import { refreshModelCatalog, modelProfilePlan, applyModelProfilePlan } from "./model-profiles.mjs";
 import { executionOwner } from "./execution-owner.mjs";
 import { TODO_ROUTING_POLICY, TOOLING_OPERATION_POLICY, WORKER_TOOLING_BOUNDARY } from "./routing-policy.mjs";
@@ -427,10 +428,11 @@ const tools = [
   {
     name: "repo_init",
     description:
-      "Activate durable ToDo routing in a Git repository by creating .todo/config.json and installing an idempotent managed routing block in the applicable root AGENTS instruction file. Existing configuration and unrelated instructions are never overwritten.",
+      "Activate durable ToDo routing in a Git repository by creating .todo/config.json and installing an idempotent managed routing block in the applicable root AGENTS instruction file. Existing configuration and unrelated instructions are never overwritten. Opens browser settings by default without starting workers; set openBrowser=false for headless initialization.",
     inputSchema: {
       type: "object",
       properties: {
+        openBrowser: { type: "boolean", default: true, description: "Open dashboard settings in the default browser without starting workers." },
         repoPath: {
           type: "string",
           description: "Path inside the target Git repository.",
@@ -1557,8 +1559,15 @@ async function callTool(name, args = {}, metadata = {}) {
       }
       return updateTask(repoRoot, args.id, args);
     }
-    case "repo_init":
-      return initializeRepo(resolveRepo(args));
+    case "repo_init": {
+      const repoRoot = resolveRepo(args);
+      const result = initializeRepo(repoRoot);
+      try {
+        return { ...result, ...await openInitSettings(repoRoot, { open: args.openBrowser !== false }) };
+      } catch (error) {
+        return { ...result, settingsUrl: null, browserOpened: false, browserError: error.message };
+      }
+    }
     case "task_get": {
       const repoRoot = activatedRepo(args);
       return getTaskDetails(repoRoot, args.id);

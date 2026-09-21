@@ -1,0 +1,4 @@
+# Keep launchers and source fingerprints stable in Windows checkouts.
+* text=auto eol=lf
+bin/*/ori -text
+bin/*/ori.exe -text

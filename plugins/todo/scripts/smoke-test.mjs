@@ -210,7 +210,7 @@ async function callMcp() {
         method: "tools/call",
         params: {
           name: "repo_init",
-          arguments: { repoPath: repoRoot },
+          arguments: { repoPath: repoRoot, openBrowser: false },
         },
       },
     ]

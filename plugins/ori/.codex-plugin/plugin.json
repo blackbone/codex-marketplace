@@ -1,0 +1,33 @@
+{
+  "name": "ori",
+  "version": "0.1.4+codex.20260916093808",
+  "description": "Git-native product graphs, local semantic search, portable projections and isolated source execution.",
+  "author": {
+    "name": "blackbone"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Ori",
+    "shortDescription": "Shape product graphs and build from intent",
+    "longDescription": "Keep product intent in Git files. Explore and edit the graph through Codex skills and a local React interface, find related requirements with on-device multilingual search, export immutable projections, and execute source changes in isolated Git worktrees. The plugin bundles standalone macOS, Linux and Windows binaries for x64 and ARM64, selected by a launcher without a build toolchain.",
+    "developerName": "blackbone",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use $ori:install to set up this project.",
+      "Use $ori:open to explore this product graph.",
+      "Use $ori:change to update the product intent."
+    ],
+    "screenshots": [
+      "./assets/screenshots/atlas.png",
+      "./assets/screenshots/atlas-dark.png",
+      "./assets/screenshots/lens.png",
+      "./assets/screenshots/lens-dark.png"
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

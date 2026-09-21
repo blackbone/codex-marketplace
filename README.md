@@ -9,8 +9,9 @@ A Git-backed Codex marketplace for plugins maintained by [blackbone](https://git
 | Plugin | What it does | Package |
 | --- | --- | --- |
 | ToDo | Atomic repository task routing with optional YAML execution pipelines, persistent threads, deterministic gates, and telemetry. | [Documentation](plugins/todo/README.md) |
-| Docs | Search local documentation with shared indexing, project-local SQLite indexes, and a live status page. | [Documentation](plugins/docs/README.md) |
+| Docs | Search local documentation with shared indexing, project-local SQLite indexes, and a live dashboard with project search. | [Documentation](plugins/docs/README.md) |
 | Unity | Open the current Unity project and run Editor actions through the official CLI, with Pipeline checks only on demand. | [Documentation](plugins/unity/README.md) |
+| Ori | Git-native product graphs, local semantic search, portable projections and isolated source execution. | [Documentation](plugins/ori/README.md) |
 
 ![ToDo plugin details](plugins/todo/assets/screenshots/plugin-details.png)
 
@@ -54,7 +55,7 @@ hooks, and runtime code. The root README is only the marketplace index.
 
 ## Development
 
-Requirements: Node.js 22 or newer, Git, and the Codex CLI.
+Requirements: Node.js 22.16 or newer, npm, Go 1.27.1 or newer, Git, and the Codex CLI.
 
 ```bash
 make test
@@ -68,6 +69,7 @@ The suite validates the marketplace and documentation contracts, then runs the
 ToDo runtime smoke test across preflight and atomic DAG publication, isolated
 execution, tiered retries, the local rebase merge queue, attempt-local metrics,
 the dashboard, and safe runtime updates.
+Ori adds Go tests and a build-and-CLI smoke test with the embedded React interface.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md), [repository architecture](docs/ARCHITECTURE.md),
 and [AGENTS.md](AGENTS.md) before changing a package.

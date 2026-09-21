@@ -1,0 +1,30 @@
+name: Ori bundled binaries
+
+on:
+  push:
+    branches: [main]
+    paths: ['plugins/ori/**', '.github/workflows/ori-binaries.yml']
+  pull_request:
+    paths: ['plugins/ori/**', '.github/workflows/ori-binaries.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify all packaged binaries and source fingerprint
+        run: node plugins/ori/scripts/binaries.mjs
+      - name: Exercise bundled binary, launcher and hooks without building
+        run: node plugins/ori/scripts/platform-smoke.mjs
