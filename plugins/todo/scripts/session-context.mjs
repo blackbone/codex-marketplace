@@ -43,7 +43,7 @@ process.stdin.on("end", () => {
   const git = spawnSync(
     "git",
     ["-C", cwd, "rev-parse", "--show-toplevel"],
-    { encoding: "utf8" },
+    { windowsHide: true, encoding: "utf8" },
   );
   if (git.status !== 0) return;
   let repoRoot = git.stdout.trim();

@@ -4,7 +4,11 @@
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "node \"$PLUGIN_ROOT/scripts/interactive-stop.mjs\"" }
+          {
+            "type": "command",
+            "command": "node \"$PLUGIN_ROOT/scripts/interactive-stop.mjs\"",
+            "commandWindows": "node -e \"import(require('node:url').pathToFileURL(require('node:path').join(process.env.PLUGIN_ROOT,'scripts','interactive-stop.mjs')).href)\""
+          }
         ]
       }
     ],
@@ -16,7 +20,8 @@
             "type": "command",
             "command": "node \"$PLUGIN_ROOT/scripts/session-context.mjs\"",
             "statusMessage": "Loading ToDo execution policy",
-            "additionalContextLimit": 16000
+            "additionalContextLimit": 16000,
+            "commandWindows": "node -e \"import(require('node:url').pathToFileURL(require('node:path').join(process.env.PLUGIN_ROOT,'scripts','session-context.mjs')).href)\""
           }
         ]
       }
@@ -27,7 +32,8 @@
           {
             "type": "command",
             "command": "node \"$PLUGIN_ROOT/scripts/session-context.mjs\"",
-            "additionalContextLimit": 16000
+            "additionalContextLimit": 16000,
+            "commandWindows": "node -e \"import(require('node:url').pathToFileURL(require('node:path').join(process.env.PLUGIN_ROOT,'scripts','session-context.mjs')).href)\""
           }
         ]
       }
@@ -38,7 +44,8 @@
           {
             "type": "command",
             "command": "node \"$PLUGIN_ROOT/scripts/session-context.mjs\"",
-            "additionalContextLimit": 16000
+            "additionalContextLimit": 16000,
+            "commandWindows": "node -e \"import(require('node:url').pathToFileURL(require('node:path').join(process.env.PLUGIN_ROOT,'scripts','session-context.mjs')).href)\""
           }
         ]
       }

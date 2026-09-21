@@ -1,5 +1,5 @@
 // Workspace policy for the existing runner; no executor or scheduling loop lives here.
-import { existsSync, readFileSync, writeFileSync, renameSync, realpathSync, lstatSync, readlinkSync, readdirSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, realpathSync, statSync, lstatSync, readlinkSync, readdirSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -8,13 +8,39 @@ import { withExecutionRegistryLock } from "./git-worktree.mjs";
 function fail(kind, message) { const e = new Error(message); e.kind = kind; throw e; }
 function git(root, args, env = {}) {
   const result = spawnSync("git", ["-C", root, ...args], {
+    windowsHide: true,
     encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_LITERAL_PATHSPECS: "1", ...env },
   });
   if (result.status !== 0) fail("single_branch_git", result.stderr || `git ${args[0]} failed`);
   return result.stdout;
 }
 function location(root) {
-  return realpathSync(path.resolve(root, git(root, ["rev-parse", "--git-common-dir"]).trim()));
+  // Callers supply a worktree root. Resolve Git's administrative files directly:
+  // stale-claim polling must not launch git.exe on every daemon tick.
+  const marker = path.resolve(root, process.env.GIT_DIR || ".git");
+  let gitDir = marker;
+  if (!statSync(marker).isDirectory()) {
+    const match = /^gitdir: (.+)$/.exec(readFileSync(marker, "utf8").replace(/[\r\n]+$/, ""));
+    if (!match) fail("single_branch_git", `Invalid Git directory pointer: ${marker}`);
+    gitDir = path.resolve(path.dirname(marker), match[1]);
+  }
+  gitDir = realpathSync(gitDir);
+  let common = gitDir;
+  if (process.env.GIT_COMMON_DIR) {
+    common = path.resolve(root, process.env.GIT_COMMON_DIR);
+  } else {
+    const file = path.join(gitDir, "commondir");
+    let relative;
+    try { relative = readFileSync(file, "utf8").replace(/[\r\n]+$/, ""); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+    if (relative !== undefined) {
+      if (!relative || /[\r\n\0]/.test(relative)) fail("single_branch_git", `Invalid Git common directory pointer: ${file}`);
+      common = path.resolve(gitDir, relative);
+    }
+  }
+  common = realpathSync(common);
+  if (!statSync(common).isDirectory()) fail("single_branch_git", `Git common directory is not a directory: ${common}`);
+  return common;
 }
 function read(file, fallback = null) { return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : fallback; }
 function save(file, value) {

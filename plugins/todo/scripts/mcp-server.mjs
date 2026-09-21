@@ -45,6 +45,7 @@ import {
   updateTask,
   todoDir,
 } from "./lib.mjs";
+import { signalDaemon } from "./daemon-process.mjs";
 import { ensureDaemon, verifyDaemonProcess } from "./ensure-daemon.mjs";
 import {
   commandCheck,
@@ -829,7 +830,7 @@ function gitCommonDir(repoRoot) {
   const result = spawnSync(
     "git",
     ["-C", repoRoot, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-    { encoding: "utf8", timeout: 10000 },
+    { windowsHide: true, encoding: "utf8", timeout: 10000 },
   );
   if (result.status !== 0 || !result.stdout.trim()) return null;
   const commonDir = path.resolve(repoRoot, result.stdout.trim());
@@ -996,7 +997,7 @@ async function stopRunner(repoRoot, force = false) {
   });
 
   try {
-    process.kill(daemon.pid, "SIGTERM");
+    signalDaemon(daemon.pid, "SIGTERM");
   } catch (error) {
     if (existsSync(stopRequest)) unlinkSync(stopRequest);
     if (error.code !== "ESRCH") throw error;
@@ -1188,7 +1189,7 @@ function branchWorktrees(repoRoot, branch) {
   const result = spawnSync(
     "git",
     ["-C", repoRoot, "worktree", "list", "--porcelain"],
-    { encoding: "utf8", timeout: 10000 },
+    { windowsHide: true, encoding: "utf8", timeout: 10000 },
   );
   if (result.status !== 0) return [];
   return result.stdout
@@ -1388,7 +1389,7 @@ async function taskPreflight(repoRoot, args) {
               ".",
               ":(exclude).todo/**",
             ],
-            { cwd: checkouts[0], encoding: "utf8" },
+            { windowsHide: true, cwd: checkouts[0], encoding: "utf8" },
           );
           return dirty.status === 0 && !dirty.stdout.trim()
             ? { status: "ok", summary: "merge target is clean" }
@@ -1402,7 +1403,7 @@ async function taskPreflight(repoRoot, args) {
           // Check configuration only. Do not expose URLs (which can contain
           // credentials), contact the remote or claim write access is proven.
           const result = spawnSync("git", ["remote", "get-url", "--push", config.git.remote],
-            { cwd: repoRoot, encoding: "utf8", timeout: 10000 });
+            { windowsHide: true, cwd: repoRoot, encoding: "utf8", timeout: 10000 });
           return result.status === 0
             ? { status: "ok", summary: "push remote is configured; write access is checked at delivery" }
             : { status: "failed", summary: "push remote is not configured" };

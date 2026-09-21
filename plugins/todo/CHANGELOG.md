@@ -1,5 +1,17 @@
 # Changelog
 
+## Windows runner startup
+
+- Resolve the execution registry from `.git`/`commondir` in JavaScript, so task
+  polling and stale-claim cleanup no longer launch `git rev-parse` every interval.
+- Launch MCP without `sh`, provide Windows hook commands, and hide background
+  startup, inspection, and helper process windows.
+- Verify daemon creation time and quoted command paths with PowerShell CIM on
+  Windows; retain PID, repository, runtime ownership, and token checks.
+- Poll authorized stop requests for graceful Windows shutdown and use the same
+  file-based control path for restart and dashboard updates.
+- Normalize runtime import paths and add Windows startup/lifecycle CI coverage.
+
 ## Current model profile audit
 
 - Map mini/fast to GPT-5.6 Luna, standard/medium to Terra, proven/advanced to Sol,

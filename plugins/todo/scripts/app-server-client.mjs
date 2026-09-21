@@ -47,6 +47,7 @@ export class AppServerClient {
   async start() {
     if (this.child) return this;
     this.child = spawn(this.command, ["app-server", "--stdio"], {
+      windowsHide: true,
       cwd: this.cwd,
       env: this.env,
       stdio: ["pipe", "pipe", "pipe"],

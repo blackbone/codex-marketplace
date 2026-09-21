@@ -136,7 +136,7 @@ export function findGitRoot(startPath = process.cwd()) {
   const result = spawnSync(
     "git",
     ["-C", path.resolve(startPath), "rev-parse", "--show-toplevel"],
-    { encoding: "utf8" },
+    { windowsHide: true, encoding: "utf8" },
   );
   if (result.status !== 0) return null;
   const root = result.stdout.trim();
@@ -147,7 +147,7 @@ export function currentGitBranch(repoRoot) {
   const result = spawnSync(
     "git",
     ["-C", path.resolve(repoRoot), "symbolic-ref", "--quiet", "--short", "HEAD"],
-    { encoding: "utf8" },
+    { windowsHide: true, encoding: "utf8" },
   );
   const branch = result.status === 0 ? result.stdout.trim() : "";
   return branch || null;
@@ -157,7 +157,7 @@ function assertExistingLocalBranch(repoRoot, branch) {
   const valid = spawnSync(
     "git",
     ["-C", path.resolve(repoRoot), "check-ref-format", "--branch", branch],
-    { encoding: "utf8" },
+    { windowsHide: true, encoding: "utf8" },
   );
   const exists =
     valid.status === 0
@@ -171,7 +171,7 @@ function assertExistingLocalBranch(repoRoot, branch) {
             "--end-of-options",
             `refs/heads/${branch}^{commit}`,
           ],
-          { encoding: "utf8" },
+          { windowsHide: true, encoding: "utf8" },
         )
       : null;
   if (valid.status !== 0 || exists?.status !== 0) {
@@ -1071,7 +1071,7 @@ export function prepareTaskMergeConflictRepair(repoRoot, taskPath, claim) {
   }
   if (!task.metadata.codexThread?.id) throw new Error("Merge repair requires the original persistent app-server thread");
   const head = (cwd, ref) => {
-    const result = spawnSync("git", ["-C", cwd, "rev-parse", "--verify", ref], { encoding: "utf8" });
+    const result = spawnSync("git", ["-C", cwd, "rev-parse", "--verify", ref], { windowsHide: true, encoding: "utf8" });
     if (result.status !== 0) throw new Error(result.stderr || `Cannot inspect ${ref}`);
     return result.stdout.trim();
   };
@@ -1094,7 +1094,7 @@ export function applyGitExcludes(repoRoot, patterns) {
   const result = spawnSync(
     "git",
     ["-C", repoRoot, "rev-parse", "--git-path", "info/exclude"],
-    { encoding: "utf8" },
+    { windowsHide: true, encoding: "utf8" },
   );
   if (result.status !== 0) {
     throw new Error(result.stderr.trim() || "Could not resolve .git/info/exclude");
@@ -3771,6 +3771,7 @@ export function reopenTask(repoRoot, id) {
     spawnSync(
       "git",
       ["-C", repoRoot, "show-ref", "--verify", "--quiet", `refs/heads/${previousBranch}`],
+      { windowsHide: true },
     ).status === 0;
   const targetBranch = continueKeptBranch
     ? previousBranch

@@ -40,28 +40,11 @@ import {
   runtimeMismatch,
 } from "./runtime-update.mjs";
 
+import { commandDaemonPath, inspectProcess, signalDaemon } from "./daemon-process.mjs";
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(scriptDir, "..");
 const startupWait = new Int32Array(new SharedArrayBuffer(4));
-
-function commandDaemonPath(command, repoRoot) {
-  const repoSuffix = ` --repo ${repoRoot}`;
-  if (!command.endsWith(repoSuffix)) return null;
-  const launch = command.slice(0, -repoSuffix.length);
-  const separator = launch.indexOf(" ");
-  if (separator <= 0) return null;
-  const executable = launch.slice(0, separator);
-  const daemonPath = launch.slice(separator + 1);
-  if (
-    !path.isAbsolute(executable) ||
-    !/^node(?:js)?(?:\.exe)?$/i.test(path.basename(executable)) ||
-    !path.isAbsolute(daemonPath) ||
-    !daemonPath.endsWith(path.join("scripts", "daemon.mjs"))
-  ) {
-    return null;
-  }
-  return path.resolve(daemonPath);
-}
 
 function manifestOwnsTodoDaemon(daemonPath) {
   const pluginRoot = path.dirname(path.dirname(daemonPath));
@@ -159,6 +142,9 @@ function acquireStartupLock(repoRoot) {
 }
 
 function requestIdleDaemonStop(repoRoot, running) {
+  // Older runtimes cannot cooperatively stop on Windows. Leave the update
+  // pending instead of emulating Unix suspension or forcibly killing a worker.
+  if (process.platform === "win32") return false;
   if (
     running.status !== "running" ||
     !running.token ||
@@ -251,29 +237,6 @@ function requestIdleDaemonStop(repoRoot, running) {
       }
     }
   }
-}
-
-function inspectProcess(pid) {
-  const inspected = spawnSync(
-    "ps",
-    ["-ww", "-p", String(pid), "-o", "lstart=", "-o", "command="],
-    {
-      encoding: "utf8",
-      env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
-    },
-  );
-  const match = inspected.stdout?.trim().match(
-    /^(\S+\s+\S+\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/,
-  );
-  const processStartedAt = Date.parse(`${match?.[1] || ""} UTC`);
-  if (
-    inspected.status !== 0 ||
-    !Number.isFinite(processStartedAt) ||
-    !match?.[2]
-  ) {
-    return null;
-  }
-  return { startedAt: processStartedAt, command: match[2] };
 }
 
 export function verifyDaemonProcess(repoRoot, running) {
@@ -521,11 +484,7 @@ function waitForDashboardThread(repoRoot, pid, threadId, timeoutMs) {
 }
 
 function wakeDashboardThreadSync(pid) {
-  try {
-    process.kill(pid, "SIGUSR2");
-  } catch (error) {
-    if (error.code !== "ESRCH" && error.code !== "EINVAL") throw error;
-  }
+  signalDaemon(pid, "SIGUSR2");
 }
 
 function discardFailedStartup(repoRoot, pid, spawnedIdentity) {
@@ -677,6 +636,7 @@ export function ensureDaemon(
         {
           cwd: repoRoot,
           detached: true,
+          windowsHide: true,
           env: {
             ...process.env,
             TODO_RUNNER_REPO_ROOT: repoRoot,

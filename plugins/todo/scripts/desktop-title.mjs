@@ -47,6 +47,7 @@ export class DesktopTitleClient {
     const launch = this.command || desktopTitleCommand(this.env);
     if (!launch) throw new Error("Desktop title sync has no host connection");
     const child = spawn(launch.command, launch.args, {
+      windowsHide: true,
       cwd: launch.cwd, env: this.env, stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;

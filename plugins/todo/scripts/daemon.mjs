@@ -2389,6 +2389,8 @@ function consumeAuthorizedStopRequest() {
     ) {
       return false;
     }
+    // Recheck live work here: a task may have started after the MCP snapshot.
+    if (request.force !== true && active.size > 0) return false;
     unlinkSync(requestPath);
     return true;
   } catch {
@@ -2574,6 +2576,10 @@ let nextTaskPollAt = Date.now();
 let nextConfigReloadAt =
   Date.now() + runtimeConfig.configReloadIntervalMs;
 while (!stopping) {
+  if (consumeAuthorizedStopRequest()) {
+    await shutdown("stop-request");
+    break;
+  }
   const restartDecision = daemonRestartDecision(
     repoRoot,
     { pid: process.pid, token: daemonToken },
@@ -2640,6 +2646,7 @@ while (!stopping) {
   }
 
   const sleepUntil = Math.min(nextTaskPollAt, nextConfigReloadAt);
-  const sleepMs = Math.max(10, sleepUntil - Date.now());
+  // Control requests must remain responsive even with a long task poll interval.
+  const sleepMs = Math.min(250, Math.max(10, sleepUntil - Date.now()));
   await new Promise((resolve) => setTimeout(resolve, sleepMs));
 }

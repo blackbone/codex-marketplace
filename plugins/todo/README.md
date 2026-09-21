@@ -31,6 +31,20 @@ so local marketplace installs do not depend on an inherited `PLUGIN_ROOT` value.
 Use `$todo:start` to start the detached runner and `$todo:dashboard` to retrieve
 its current local URL.
 
+Windows startup requires Node.js 22+ (`node`) and Git on the Codex process's
+`PATH`, plus Windows PowerShell with `Get-CimInstance` for process verification.
+The MCP entry point runs directly with Node; Windows hooks resolve `PLUGIN_ROOT`
+without Unix shell expansion. Background startup and inspection commands hide
+their console windows. Stop requests are checked by PID and token and consumed
+by the daemon, so Windows shutdown runs cleanup without Unix signals. Updating
+the plugin requires a new Codex session and review of changed hook definitions.
+Very old runtimes without cooperative restart support need a manual stop before
+upgrading on Windows.
+
+Periodic task/claim polling reads files and checks PIDs through Node.js. Resolving
+the shared execution registry reads `.git` and `commondir` directly, including
+linked worktrees, without spawning Git on each poll.
+
 ## How routing works
 
 In an activated repository, `$todo:route` applies to repository mutations even

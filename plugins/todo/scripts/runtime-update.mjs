@@ -94,7 +94,7 @@ function runtimeFiles(pluginRoot) {
     if (!existsSync(absolutePath)) return;
     const entries = readdirSync(absolutePath, { withFileTypes: true });
     for (const entry of entries) {
-      const child = path.join(relativePath, entry.name);
+      const child = path.posix.join(relativePath, entry.name);
       if (entry.isDirectory()) visit(child);
       else if (entry.isFile() && !isTestScript(child)) files.push(child);
     }
@@ -133,6 +133,7 @@ function validateStaticImports(pluginRoot, files) {
       STATIC_IMPORT_SCANNER,
     ],
     {
+      windowsHide: true,
       input: JSON.stringify({ root: pluginRoot, files: moduleFiles }),
       encoding: "utf8",
       maxBuffer: 1024 * 1024,
@@ -201,7 +202,7 @@ function validateStaticImports(pluginRoot, files) {
         if (!statSync(realTarget).isFile()) {
           throw new Error("import target is not a file");
         }
-        const relativeTarget = path.relative(realRoot, realTarget);
+        const relativeTarget = path.relative(realRoot, realTarget).split(path.sep).join("/");
         if (relativeTarget.endsWith(".mjs")) {
           if (!runtimeModules.has(relativeTarget)) {
             throw new Error("import target is outside runtime paths");
@@ -244,7 +245,7 @@ function validateRuntime(pluginRoot, files, fingerprint) {
     const result = spawnSync(
       process.execPath,
       ["--check", path.join(pluginRoot, relativePath)],
-      { encoding: "utf8", timeout: 5000 },
+      { windowsHide: true, encoding: "utf8", timeout: 5000 },
     );
     if (result.status === 0 && !result.error) continue;
     syntaxValid = false;

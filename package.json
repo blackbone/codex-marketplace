@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "npm run test:contract && npm run test:docs && npm run test:unity && npm run test:models && npm run test:safety && npm run test:preflight && npm run test:pipeline && npm run test:app-server && npm run test:runtime && npm run test:git && npm run test:smoke",
+    "test": "npm run test:contract && npm run test:docs && npm run test:unity && npm run test:models && npm run test:safety && npm run test:preflight && npm run test:pipeline && npm run test:app-server && npm run test:windows && npm run test:runtime && npm run test:git && npm run test:smoke",
     "test:unity": "node --test plugins/unity/scripts/test.mjs",
     "test:contract": "node --test tests/*.test.mjs plugins/todo/scripts/routing-policy-test.mjs",
     "test:docs": "node --test plugins/docs/scripts/test.mjs plugins/docs/scripts/dashboard-test.mjs",
@@ -15,6 +15,7 @@
     "test:git": "node plugins/todo/scripts/git-worktree.mjs --self-check && node --test plugins/todo/scripts/git-push-test.mjs",
     "test:smoke": "node plugins/todo/scripts/smoke-test.mjs",
     "test:models": "node --test plugins/todo/scripts/model-profiles-test.mjs",
-    "test:safety": "node --test plugins/todo/scripts/single-branch-test.mjs plugins/todo/scripts/runtime-safety-test.mjs plugins/todo/scripts/task-status-test.mjs plugins/todo/scripts/interactive-runtime-test.mjs plugins/todo/scripts/merge-repair-test.mjs"
+    "test:safety": "node --test plugins/todo/scripts/single-branch-test.mjs plugins/todo/scripts/runtime-safety-test.mjs plugins/todo/scripts/task-status-test.mjs plugins/todo/scripts/interactive-runtime-test.mjs plugins/todo/scripts/merge-repair-test.mjs",
+    "test:windows": "node --test plugins/todo/scripts/windows-compat-test.mjs"
   }
 }
