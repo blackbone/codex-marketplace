@@ -57,11 +57,11 @@ import { DEFAULT_MODEL_PROFILES, profileDiagnostic, modelProfilePlan, applyModel
   assertProfilesAvailable, refreshModelCatalog } from "./model-profiles.mjs";
 import { chmodSync, readFileSync } from "node:fs";
 
-test("eight profiles use four current executor models; invalid config never selects a fallback", () => {
+test("eight profiles use three GPT-6 executor models; invalid config never selects a fallback", () => {
   assert.deepEqual(DEFAULT_MODEL_PROFILES.map(({ name, model, reasoningEffort }) => [name, model, reasoningEffort]), [
-    ["mini", "gpt-5.6-luna", "low"], ["fast", "gpt-5.6-luna", "medium"],
-    ["standard", "gpt-5.6-terra", "low"], ["medium", "gpt-5.6-terra", "medium"],
-    ["proven", "gpt-5.6-sol", "medium"], ["advanced", "gpt-5.6-sol", "high"],
+    ["mini", "gpt-6-luna", "low"], ["fast", "gpt-6-luna", "medium"],
+    ["standard", "gpt-6-sol", "low"], ["medium", "gpt-6-sol", "medium"],
+    ["proven", "gpt-6-sol", "high"], ["advanced", "gpt-6-sol", "xhigh"],
     ["expert", "gpt-6-astra", "xhigh"], ["ultra", "gpt-6-astra", "max"],
   ]);
   assert.ok(DEFAULT_MODEL_PROFILES.every(p => p.name !== "spark" && p.model !== "gpt-5.3-codex-spark"));
@@ -106,6 +106,56 @@ test("legacy builtin copies migrate while custom profiles and pipeline reference
     // Discovery also must not add 5.5 when no intentional custom profile uses it.
     writeFileSync(file, JSON.stringify({ ...saved, models: saved.models.filter(p => p.name !== "custom") }));
     assert.equal(modelProfilePlan(root, catalog).changed, false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("GPT-5.6 defaults migrate once, preserve custom overrides, and wait for available targets", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "todo-gpt6-migration-"));
+  try {
+    mkdirSync(path.join(root, ".todo"));
+    const file = path.join(root, ".todo/config.json");
+    const previous = [
+      ["mini", "gpt-5.6-luna", "low"], ["fast", "gpt-5.6-luna", "medium"],
+      ["standard", "gpt-5.6-terra", "low"], ["medium", "gpt-5.6-terra", "medium"],
+      ["proven", "gpt-5.6-sol", "medium"], ["advanced", "gpt-5.6-sol", "high"],
+    ].map(([name, model, reasoningEffort]) => ({ name, model, reasoningEffort,
+      description: name === "proven" ? "Multi-step engineering and debugging with moderate reasoning."
+        : name === "advanced" ? "Multi-step implementation, debugging, and substantial everyday engineering."
+        : DEFAULT_MODEL_PROFILES.find(p => p.name === name).description,
+    }));
+    const catalog = { command: "codex", checkedAt: new Date().toISOString(), models:
+      [...new Set([...DEFAULT_MODEL_PROFILES.map(p => p.model), ...previous.map(p => p.model)])].map(model => ({
+        model, efforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium",
+      })) };
+    const original = { workers: 3, defaultModelProfile: "medium", pipeline: { file: "quality.yaml" },
+      models: [...previous, ...DEFAULT_MODEL_PROFILES.filter(p => ["expert", "ultra"].includes(p.name))] };
+    writeFileSync(file, JSON.stringify(original));
+    const plan = modelProfilePlan(root, catalog);
+    assert.deepEqual(plan.proposed.models, DEFAULT_MODEL_PROFILES);
+    assert.equal(plan.changes.filter(p => p.action === "update").length, 6);
+    assert.equal(plan.proposed.defaultModelProfile, "medium");
+    assertProfilesAvailable(plan.proposed.models, catalog);
+    applyModelProfilePlan(root, catalog, plan.planId);
+    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { ...original, models: DEFAULT_MODEL_PROFILES });
+    assert.equal(modelProfilePlan(root, catalog).changed, false);
+
+    const overrides = [
+      { ...previous[1], reasoningEffort: "high" },
+      { ...previous[2], description: "Keep my Terra workflow" },
+      { name: "custom", model: "gpt-5.6-sol", reasoningEffort: "high" },
+    ];
+    writeFileSync(file, JSON.stringify({ ...original, models: overrides }));
+    const customPlan = modelProfilePlan(root, catalog);
+    for (const override of overrides) {
+      assert.deepEqual(customPlan.proposed.models.find(p => p.name === override.name), override);
+    }
+
+    writeFileSync(file, JSON.stringify(original));
+    const oldCatalog = { ...catalog, models: catalog.models.filter(m => !["gpt-6-sol", "gpt-6-luna"].includes(m.model)) };
+    const unavailablePlan = modelProfilePlan(root, oldCatalog);
+    for (const profile of previous) {
+      assert.deepEqual(unavailablePlan.proposed.models.find(p => p.name === profile.name), profile);
+    }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -204,7 +254,7 @@ test("omitted models remain inherited and old task models resolve through the sa
     const raw = JSON.parse(readFileSync(file, "utf8"));
     assert.equal(Object.hasOwn(raw, "models"), false);
     const config = loadConfig(root);
-    for (const [name, oldModel] of Object.entries({ mini: "gpt-5.4-mini", standard: "gpt-5.4", proven: "gpt-5.5" })) {
+    for (const [name, oldModel] of Object.entries({ mini: "gpt-5.6-luna", fast: "gpt-5.6-luna", standard: "gpt-5.6-terra", medium: "gpt-5.6-terra", proven: "gpt-5.6-sol", advanced: "gpt-5.6-sol" })) {
       const profile = DEFAULT_MODEL_PROFILES.find(p => p.name === name);
       const execution = resolveSavedExecution(config, { modelProfile: name, model: oldModel, reasoningEffort: "high" });
       assert.equal(execution.model, profile.model);
@@ -226,7 +276,7 @@ test("omitted models remain inherited and old task models resolve through the sa
       { id: "test", type: "shell", command: "true" },
     ], repair: { type: "codex-thread", modelProfile: "ultra", model: "old-repair", reasoningEffort: "low" } };
     const resolved = resolvePipelineProfiles(config, oldPipeline, current);
-    assert.equal(resolved.steps[0].model, "gpt-5.6-luna");
+    assert.equal(resolved.steps[0].model, "gpt-6-luna");
     assert.equal(resolved.repair.model, "gpt-6-astra");
     assert.equal(resolved.repair.reasoningEffort, "max");
     assert.deepEqual(resolved.steps[1], oldPipeline.steps[1]);

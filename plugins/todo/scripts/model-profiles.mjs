@@ -5,6 +5,17 @@ import { AppServerClient } from "./app-server-client.mjs";
 
 // Task roles, not a benchmark ranking. Keep original profile names stable.
 export const DEFAULT_MODEL_PROFILES = [
+  { name: "mini", model: "gpt-6-luna", reasoningEffort: "low", description: "Small, mechanical edits and simple bounded fixes." },
+  { name: "fast", model: "gpt-6-luna", reasoningEffort: "medium", description: "Mechanical edits, straightforward fixes, and cost-sensitive routine work." },
+  { name: "standard", model: "gpt-6-sol", reasoningEffort: "low", description: "Straightforward everyday implementation with clear requirements." },
+  { name: "medium", model: "gpt-6-sol", reasoningEffort: "medium", description: "Bounded implementation across several files; balanced everyday coding." },
+  { name: "proven", model: "gpt-6-sol", reasoningEffort: "high", description: "Multi-step engineering and debugging with high reasoning." },
+  { name: "advanced", model: "gpt-6-sol", reasoningEffort: "xhigh", description: "Multi-step implementation, debugging, and substantial refactoring with extra reasoning." },
+  { name: "expert", model: "gpt-6-astra", reasoningEffort: "xhigh", description: "Most capable model for complex implementation work." },
+  { name: "ultra", model: "gpt-6-astra", reasoningEffort: "max", description: "Most capable model for very complex, high-risk, cross-cutting work." },
+];
+// Recognize exact previous defaults without overwriting intentional custom efforts or descriptions.
+const previousBuiltinProfiles = [
   { name: "mini", model: "gpt-5.6-luna", reasoningEffort: "low", description: "Small, mechanical edits and simple bounded fixes." },
   { name: "fast", model: "gpt-5.6-luna", reasoningEffort: "medium", description: "Mechanical edits, straightforward fixes, and cost-sensitive routine work." },
   { name: "standard", model: "gpt-5.6-terra", reasoningEffort: "low", description: "Straightforward everyday implementation with clear requirements." },
@@ -16,10 +27,10 @@ export const DEFAULT_MODEL_PROFILES = [
 ];
 const excludedModel = model => model === "gpt-5.3-codex-spark";
 const legacyBuiltinModels = { mini: "gpt-5.4-mini", standard: "gpt-5.4", proven: "gpt-5.5", expert: "gpt-5.6-sol", ultra: "gpt-5.6-sol" };
-// Keep intentional custom profiles, but do not automatically add pre-5.6 GPT models.
+// Keep intentional custom profiles, but do not automatically add pre-6 GPT models.
 const legacyGeneration = model => {
   const version = /^gpt-(\d+)(?:\.(\d+))?(?:-|$)/.exec(model);
-  return version && (Number(version[1]) < 5 || (Number(version[1]) === 5 && Number(version[2] || 0) < 6));
+  return version && Number(version[1]) < 6;
 };
 const visibleModels = catalog => catalog.models.filter(m => !excludedModel(m.model));
 const CATALOG_TTL_MS = 5 * 60 * 1000;
@@ -134,7 +145,9 @@ export function modelProfilePlan(root, catalog) {
     if (!profile || typeof profile !== "object" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(profile.name || "")) continue;
     if (excludedModel(profile.model) || profile.name === "spark") continue;
     const builtin = DEFAULT_MODEL_PROFILES.find(p => p.name === profile.name);
-    const legacyBuiltin = legacyBuiltinModels[profile.name] === profile.model;
+    const legacyBuiltin = legacyBuiltinModels[profile.name] === profile.model || previousBuiltinProfiles.some(old =>
+      old.name === profile.name && old.model === profile.model && old.reasoningEffort === profile.reasoningEffort &&
+      (profile.description === undefined || profile.description === old.description));
     if (builtin?.model === profile.model) {
       // A familiar profile name can still carry an intentional custom effort.
       if (profileUsable(profileDiagnostic(profile, catalog))) {

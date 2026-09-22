@@ -1,5 +1,17 @@
 # Changelog
 
+## GPT-6 Sol and Luna profiles
+
+- Upgrade mini/fast to GPT-6 Luna at low/medium; standard/medium and
+  proven/advanced to GPT-6 Sol at low/medium/high/xhigh. Keep Astra expert/ultra
+  at xhigh/max and preserve all eight profile names and the configured default.
+- Migrate exact GPT-5.6 built-in copies through model_profiles while preserving
+  supported custom efforts, descriptions, profiles, and pipeline references.
+- Stop automatically discovering pre-6 GPT models; keep supported explicit
+  custom models. Saved tasks resolve the new mappings on their next attempt.
+- Recapture the repository settings screenshot as PNG to satisfy the package
+  contract (the previous .png file contained JPEG data).
+
 ## Windows runner startup
 
 - Resolve the execution registry from `.git`/`commondir` in JavaScript, so task

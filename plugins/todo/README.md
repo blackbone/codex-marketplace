@@ -568,19 +568,26 @@ configuration without interrupting active tasks.
 
 ### Model availability and config updates
 
-Four current Codex models serve eight task profiles. Profile names remain stable
-for existing tasks; built-in profiles use GPT-5.6 or newer.
+Three current Codex models serve eight task profiles. Profile names remain stable
+for existing tasks; built-in profiles use GPT-6.
 
 | Profile | Model | Reasoning |
 | --- | --- | --- |
-| `mini` | `gpt-5.6-luna` | `low` |
-| `fast` | `gpt-5.6-luna` | `medium` |
-| `standard` | `gpt-5.6-terra` | `low` |
-| `medium` | `gpt-5.6-terra` | `medium` |
-| `proven` | `gpt-5.6-sol` | `medium` |
-| `advanced` | `gpt-5.6-sol` | `high` |
+| `mini` | `gpt-6-luna` | `low` |
+| `fast` | `gpt-6-luna` | `medium` |
+| `standard` | `gpt-6-sol` | `low` |
+| `medium` | `gpt-6-sol` | `medium` |
+| `proven` | `gpt-6-sol` | `high` |
+| `advanced` | `gpt-6-sol` | `xhigh` |
 | `expert` | `gpt-6-astra` | `xhigh` |
 | `ultra` | `gpt-6-astra` | `max` |
+
+Luna handles small routine tasks, Sol spans everyday implementation through
+substantial refactoring, and Astra remains reserved for complex work. Existing
+explicit copies of the previous GPT-5.6 built-ins can be migrated with
+`model_profiles`; custom efforts, descriptions, and named profiles are preserved
+when supported. The update keeps the configured default and task profile names.
+See the [GPT-6 Sol and Luna release](https://openai.com/index/introducing-gpt-6-sol-and-luna/).
 
 The executor's paginated `model/list` catalog determines availability for the
 actual account/CLI: the desktop picker can expose models that a background
@@ -597,10 +604,10 @@ minutes and invalidated when the configured models or executor change.
 Use the `model_profiles` MCP tool with `action: inspect` to refresh availability
 and preview the complete update: available/deprecated/retired/unsupported models,
 unsupported reasoning levels, replacements, removals, and newly discovered
-models. Automatic discovery skips GPT generations older than 5.6. Newly
+models. Automatic discovery skips GPT generations older than 6. Newly
 discovered models use their executor description and default reasoning level; review their suitability before assigning work. The preview
-migrates known old built-in mappings (`mini`, `standard`, `proven`, `expert`,
-`ultra`) to their current roles when available, preserves supported custom
+migrates known old built-in mappings and exact GPT-5.6 default profiles
+to their current roles when available, preserves supported custom
 profiles and custom efforts on current models, replaces retired models when the
 executor supplies a supported successor, and removes unsupported entries.
 
