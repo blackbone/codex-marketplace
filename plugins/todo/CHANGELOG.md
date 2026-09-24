@@ -1,5 +1,15 @@
 # Changelog
 
+## Heavy-task profiles after Bug Hunt Bench review
+
+- Use GPT-5.6 Sol at max for advanced heavy work. Keep GPT-6 Luna/Sol for
+  mini through proven and Astra at xhigh/max for expert/ultra, preserving profile
+  names and the configured default.
+- Document the benchmark's bug-fixing scope, sample sizes, and differing CLI
+  versions; newer model generations are not automatic quality upgrades.
+- Migrate exact GPT-6 default copies through model_profiles, preserve supported
+  custom overrides, and include GPT-5.6 in model discovery again.
+
 ## GPT-6 Sol and Luna profiles
 
 - Upgrade mini/fast to GPT-6 Luna at low/medium; standard/medium and

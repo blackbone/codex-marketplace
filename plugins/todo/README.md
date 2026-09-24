@@ -568,8 +568,8 @@ configuration without interrupting active tasks.
 
 ### Model availability and config updates
 
-Three current Codex models serve eight task profiles. Profile names remain stable
-for existing tasks; built-in profiles use GPT-6.
+Four current Codex models serve eight task profiles. Profile names remain stable
+for existing tasks; built-in profiles combine GPT-6 Luna/Sol, GPT-5.6 Sol, and GPT-6 Astra.
 
 | Profile | Model | Reasoning |
 | --- | --- | --- |
@@ -578,16 +578,29 @@ for existing tasks; built-in profiles use GPT-6.
 | `standard` | `gpt-6-sol` | `low` |
 | `medium` | `gpt-6-sol` | `medium` |
 | `proven` | `gpt-6-sol` | `high` |
-| `advanced` | `gpt-6-sol` | `xhigh` |
+| `advanced` | `gpt-5.6-sol` | `max` |
 | `expert` | `gpt-6-astra` | `xhigh` |
 | `ultra` | `gpt-6-astra` | `max` |
 
-Luna handles small routine tasks, Sol spans everyday implementation through
-substantial refactoring, and Astra remains reserved for complex work. Existing
-explicit copies of the previous GPT-5.6 built-ins can be migrated with
-`model_profiles`; custom efforts, descriptions, and named profiles are preserved
-when supported. The update keeps the configured default and task profile names.
-See the [GPT-6 Sol and Luna release](https://openai.com/index/introducing-gpt-6-sol-and-luna/).
+GPT-6 Luna/Sol handle routine work at low through high effort. Heavy debugging
+and substantial refactoring use GPT-5.6 Sol at max (`advanced`), followed by
+Astra at xhigh/max (`expert`/`ultra`). A newer generation is not an automatic
+quality upgrade.
+On [Bug Hunt Bench](https://bughunt.productcompass.pm/?preset=ceiling), as of
+2026-09-23, Sol 5.6/6 scored 43.5/29.3 and Luna 5.6/6 scored 31.3/18.3 planted
+bugs fixed out of 105 at max effort. This covers two repositories, with only two
+or three runs per configuration and different Codex CLI versions across
+generations; it is evidence for bug-fixing, not a universal intelligence ranking
+or proof of superiority at every effort level. See the
+[run notes](https://github.com/phuryn/bug-hunt-bench/blob/main/results/run-notes.md).
+The split keeps GPT-6 for cost-sensitive routine work and favors the observed
+GPT-5.6 Sol max configuration for heavy work. Supported custom models, including
+GPT-5.6 Luna, remain available.
+
+Explicit copies of earlier built-ins, including the GPT-6 defaults, can be
+migrated with `model_profiles`; supported custom efforts, descriptions, and named
+profiles are preserved. The update keeps the configured default and task profile
+names. A generation number alone does not mark a model unavailable or retired.
 
 The executor's paginated `model/list` catalog determines availability for the
 actual account/CLI: the desktop picker can expose models that a background
@@ -604,9 +617,11 @@ minutes and invalidated when the configured models or executor change.
 Use the `model_profiles` MCP tool with `action: inspect` to refresh availability
 and preview the complete update: available/deprecated/retired/unsupported models,
 unsupported reasoning levels, replacements, removals, and newly discovered
-models. Automatic discovery skips GPT generations older than 6. Newly
+models. Automatic discovery skips GPT generations older than 5.6 and does not
+re-add former built-in models as new profiles after migration; those models remain
+selectable through explicit custom profiles when supported. Newly
 discovered models use their executor description and default reasoning level; review their suitability before assigning work. The preview
-migrates known old built-in mappings and exact GPT-5.6 default profiles
+migrates known old built-in mappings and exact previous default profiles
 to their current roles when available, preserves supported custom
 profiles and custom efforts on current models, replaces retired models when the
 executor supplies a supported successor, and removes unsupported entries.

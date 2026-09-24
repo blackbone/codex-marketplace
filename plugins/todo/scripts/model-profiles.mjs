@@ -10,12 +10,21 @@ export const DEFAULT_MODEL_PROFILES = [
   { name: "standard", model: "gpt-6-sol", reasoningEffort: "low", description: "Straightforward everyday implementation with clear requirements." },
   { name: "medium", model: "gpt-6-sol", reasoningEffort: "medium", description: "Bounded implementation across several files; balanced everyday coding." },
   { name: "proven", model: "gpt-6-sol", reasoningEffort: "high", description: "Multi-step engineering and debugging with high reasoning." },
-  { name: "advanced", model: "gpt-6-sol", reasoningEffort: "xhigh", description: "Multi-step implementation, debugging, and substantial refactoring with extra reasoning." },
+  { name: "advanced", model: "gpt-5.6-sol", reasoningEffort: "max", description: "Deep debugging and substantial refactoring with maximum reasoning." },
   { name: "expert", model: "gpt-6-astra", reasoningEffort: "xhigh", description: "Most capable model for complex implementation work." },
   { name: "ultra", model: "gpt-6-astra", reasoningEffort: "max", description: "Most capable model for very complex, high-risk, cross-cutting work." },
 ];
 // Recognize exact previous defaults without overwriting intentional custom efforts or descriptions.
 const previousBuiltinProfiles = [
+  { name: "mini", model: "gpt-6-luna", reasoningEffort: "low", description: "Small, mechanical edits and simple bounded fixes." },
+  { name: "fast", model: "gpt-6-luna", reasoningEffort: "medium", description: "Mechanical edits, straightforward fixes, and cost-sensitive routine work." },
+  { name: "standard", model: "gpt-6-sol", reasoningEffort: "low", description: "Straightforward everyday implementation with clear requirements." },
+  { name: "medium", model: "gpt-6-sol", reasoningEffort: "medium", description: "Bounded implementation across several files; balanced everyday coding." },
+  { name: "proven", model: "gpt-6-sol", reasoningEffort: "high", description: "Multi-step engineering and debugging with high reasoning." },
+  { name: "advanced", model: "gpt-6-sol", reasoningEffort: "xhigh", description: "Multi-step implementation, debugging, and substantial refactoring with extra reasoning." },
+  { name: "expert", model: "gpt-6-astra", reasoningEffort: "xhigh", description: "Most capable model for complex implementation work." },
+  { name: "ultra", model: "gpt-6-astra", reasoningEffort: "max", description: "Most capable model for very complex, high-risk, cross-cutting work." },
+
   { name: "mini", model: "gpt-5.6-luna", reasoningEffort: "low", description: "Small, mechanical edits and simple bounded fixes." },
   { name: "fast", model: "gpt-5.6-luna", reasoningEffort: "medium", description: "Mechanical edits, straightforward fixes, and cost-sensitive routine work." },
   { name: "standard", model: "gpt-5.6-terra", reasoningEffort: "low", description: "Straightforward everyday implementation with clear requirements." },
@@ -27,10 +36,10 @@ const previousBuiltinProfiles = [
 ];
 const excludedModel = model => model === "gpt-5.3-codex-spark";
 const legacyBuiltinModels = { mini: "gpt-5.4-mini", standard: "gpt-5.4", proven: "gpt-5.5", expert: "gpt-5.6-sol", ultra: "gpt-5.6-sol" };
-// Keep intentional custom profiles, but do not automatically add pre-6 GPT models.
+// Keep intentional custom profiles, but do not automatically add pre-5.6 GPT models.
 const legacyGeneration = model => {
   const version = /^gpt-(\d+)(?:\.(\d+))?(?:-|$)/.exec(model);
-  return version && Number(version[1]) < 6;
+  return version && (Number(version[1]) < 5 || (Number(version[1]) === 5 && Number(version[2] || 0) < 6));
 };
 const visibleModels = catalog => catalog.models.filter(m => !excludedModel(m.model));
 const CATALOG_TTL_MS = 5 * 60 * 1000;
@@ -131,7 +140,8 @@ export function modelProfilePlan(root, catalog) {
     return { ...p, reasoningEffort: model.efforts.includes(p.reasoningEffort) ? p.reasoningEffort : model.defaultEffort };
   });
   for (const model of supported) {
-    if (legacyGeneration(model.model)) continue;
+    // Former built-ins remain selectable, but migrating them must not rediscover them on the next inspection.
+    if (legacyGeneration(model.model) || previousBuiltinProfiles.some(p => p.model === model.model)) continue;
     if (recommended.some(p => p.model === model.model) || current.some(p =>
       p?.model === model.model && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(p.name || "") && profileUsable(profileDiagnostic(p, catalog)))) continue;
     let name = `model-${model.model.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/-+$/, "")}`;
