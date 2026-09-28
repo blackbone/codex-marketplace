@@ -1503,6 +1503,17 @@ for await (const line of createInterface({ input: process.stdin })) {
     ["table", dashboardHtml.includes("<table>")],
     ["all-logs", dashboardHtml.includes("data-log-all")],
     ["task-logs", dashboardHtml.includes("data-log-task=")],
+    [
+      "split-task-actions",
+      dashboardHtml.includes('<th class="task-action">Logs</th>') &&
+        dashboardHtml.includes('<th class="task-action">Chat / input</th>'),
+    ],
+    [
+      "single-line-task-actions",
+      dashboardHtml.includes(
+        ".task-action button { white-space: nowrap; }",
+      ),
+    ],
     ["dialog", dashboardHtml.includes('id="log-dialog"')],
     ["filter", dashboardHtml.includes('id="task-filter"')],
     ["placeholder", dashboardHtml.includes('placeholder="status:completed|rejected"')],

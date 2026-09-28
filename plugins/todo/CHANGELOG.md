@@ -1,5 +1,10 @@
 # Changelog
 
+## Separate dashboard action columns
+
+- Give task Logs and Chat / input controls their own content-width columns and
+  keep each button label on one line.
+
 ## Heavy-task profiles after Bug Hunt Bench review
 
 - Use GPT-5.6 Sol at max for advanced heavy work. Keep GPT-6 Luna/Sol for

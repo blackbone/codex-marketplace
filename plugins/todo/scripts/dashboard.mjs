@@ -1122,17 +1122,21 @@ const DASHBOARD_SCRIPT = `(() => {
     row.append(retriesCell);
     row.append(cell(task.error?.message ?? "", "error"));
     const logsCell = document.createElement("td");
+    logsCell.className = "task-action";
     const logsButton = document.createElement("button");
     logsButton.type = "button";
     logsButton.dataset.logTask = task.id;
     logsButton.textContent = "Logs";
     logsCell.append(logsButton);
+    row.append(logsCell);
+    const controlCell = document.createElement("td");
+    controlCell.className = "task-action";
     const control = document.createElement("button");
     control.type = "button";
     control.dataset.controlTask = task.id;
     control.textContent = task.status === "waiting-input" ? "Answer" : "Chat / input";
-    logsCell.append(control);
-    row.append(logsCell);
+    controlCell.append(control);
+    row.append(controlCell);
     return row;
   }
 
@@ -1762,7 +1766,8 @@ function renderDashboard(repoRoot, requestUrl) {
   <td title="${escapeHtml(tokens.title)}">${escapeHtml(tokens.text)}</td>
   <td title="${escapeHtml(retries.title)}">${escapeHtml(retries.text)}</td>
   <td class="error">${escapeHtml(task.error?.message ?? "")}</td>
-  <td><button type="button" data-log-task="${escapeHtml(task.id)}">Logs</button><button type="button" data-control-task="${escapeHtml(task.id)}">${task.status === "waiting-input" ? "Answer" : "Chat / input"}</button></td>
+  <td class="task-action"><button type="button" data-log-task="${escapeHtml(task.id)}">Logs</button></td>
+  <td class="task-action"><button type="button" data-control-task="${escapeHtml(task.id)}">${task.status === "waiting-input" ? "Answer" : "Chat / input"}</button></td>
 </tr>`;
     })
     .join("\n");
@@ -1824,6 +1829,8 @@ function renderDashboard(repoRoot, requestUrl) {
     .status-blocked { color: #7c3aed; }
     .summary.disconnected { color: #dc2626; opacity: 1; }
     .time { white-space: nowrap; }
+    .task-action { width: 1%; white-space: nowrap; }
+    .task-action button { white-space: nowrap; }
     .error { min-width: 320px; max-width: 420px; white-space: pre-wrap; overflow-wrap: anywhere; }
     dialog { width: min(1400px, calc(100vw - 32px)); height: min(880px, calc(100vh - 32px)); padding: 0; border: 1px solid #8888; background: Canvas; color: CanvasText; }
     dialog::backdrop { background: #0008; }
@@ -1876,10 +1883,11 @@ function renderDashboard(repoRoot, requestUrl) {
         <th>${sortLink("tokens", "Tokens", sort, direction, filterQuery)}</th>
         <th>${sortLink("retries", "Retries", sort, direction, filterQuery)}</th>
         <th>${sortLink("error", "Error", sort, direction, filterQuery)}</th>
-        <th>Logs</th>
+        <th class="task-action">Logs</th>
+        <th class="task-action">Chat / input</th>
       </tr>
     </thead>
-    <tbody>${rows || '<tr data-empty-state><td colspan="15">No tasks</td></tr>'}</tbody>
+    <tbody>${rows || '<tr data-empty-state><td colspan="16">No tasks</td></tr>'}</tbody>
   </table></div>
   ${SETTINGS_HTML}
   <dialog id="input-dialog" aria-labelledby="input-title">
