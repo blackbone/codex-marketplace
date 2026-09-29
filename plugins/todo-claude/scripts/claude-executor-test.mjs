@@ -66,8 +66,10 @@ test("a turn runs claude -p and reports app-server events, usage and the structu
   const schema = JSON.parse(call.args[call.args.indexOf("--json-schema") + 1]);
   assert.equal(schema.$schema, undefined);
   assert.deepEqual(schema.required, resultSchema.required);
-  assert.equal(call.args[call.args.indexOf("--permission-mode") + 1], "bypassPermissions");
-  assert.equal(JSON.parse(call.args[call.args.indexOf("--settings") + 1]).sandbox.enabled, true);
+  assert.equal(call.args[call.args.indexOf("--permission-mode") + 1], "acceptEdits");
+  const sandbox = JSON.parse(call.args[call.args.indexOf("--settings") + 1]).sandbox;
+  assert.equal(sandbox.enabled, true);
+  assert.equal(sandbox.failIfUnavailable, true, "workspace-write never runs unsandboxed");
   await client.close();
 });
 
@@ -125,7 +127,12 @@ test("sandbox modes map to Claude Code permission modes", () => {
   assert.equal(readOnly[1], "dontAsk");
   assert.match(readOnly[2], /^--allowedTools=Read,/);
   assert.doesNotMatch(readOnly[2], /Edit|Write/);
-  assert.equal(JSON.parse(permissionArgs("workspace-write")[3]).sandbox.allowUnsandboxedCommands, false);
+  const workspace = permissionArgs("workspace-write");
+  assert.deepEqual(workspace.slice(0, 3), ["--permission-mode", "acceptEdits", "--allowedTools=mcp__plugin_todo_todo"]);
+  const sandbox = JSON.parse(workspace[4]).sandbox;
+  assert.equal(sandbox.allowUnsandboxedCommands, false);
+  assert.equal(sandbox.failIfUnavailable, true);
+  assert.equal(sandbox.network.strictAllowlist, true);
 });
 
 test("built-in profiles are available in the Claude model catalog", async (t) => {

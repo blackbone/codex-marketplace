@@ -96,7 +96,7 @@ selected by `codexSandbox` in `.todo/config.json`:
 | `codexSandbox` | Claude worker |
 | --- | --- |
 | `read-only` | `--permission-mode dontAsk` with read-only tools (Read, Grep, Glob, web reads, read-only Git) |
-| `workspace-write` (default) | `--permission-mode bypassPermissions` with the Claude Code sandbox enabled: shell commands run sandboxed, writes stay in the worktree, and network access is off |
+| `workspace-write` (default) | `--permission-mode acceptEdits`: file edits are accepted inside the worktree only; shell commands run in the Claude Code sandbox (`failIfUnavailable`, no unsandboxed fallback, strict empty network allowlist), so writes stay in the worktree and network access is off. Other tools that would need a prompt are denied, except the ToDo MCP server |
 | `danger-full-access` | `--permission-mode bypassPermissions` without the sandbox |
 
 ### Interactive runs
@@ -151,11 +151,13 @@ types (`codex-exec`, `codex-thread`); both run as Claude sessions here.
 
 ## Limitations
 
-- Workers run with the current user's local permissions. The Claude Code sandbox
-  in `workspace-write` needs its platform support (for example bubblewrap on
-  Linux); `danger-full-access` and interactive runs are not sandboxed.
-- `bypassPermissions` is refused when Claude Code runs as root outside a
-  recognized sandbox.
+- Workers run with the current user's local permissions. `workspace-write`
+  requires the Claude Code sandbox (macOS, or Linux/WSL2 with bubblewrap and
+  socat); where it is unavailable, such as native Windows, worker turns fail
+  instead of running unsandboxed. Choose `danger-full-access` there explicitly.
+  Interactive runs use the permissions of the current session.
+- `danger-full-access` uses `bypassPermissions`, which Claude Code refuses when
+  running as root outside a recognized sandbox.
 - Dashboard **Send answer** for a live question is unavailable: `claude -p` does
   not ask questions mid-turn, so a worker that needs input finishes with
   `requiresInteractive` and the answer continues the task in a new turn.

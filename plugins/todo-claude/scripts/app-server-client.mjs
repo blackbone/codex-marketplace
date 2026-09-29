@@ -20,17 +20,31 @@ export const CLAUDE_MODELS = [
 const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "WebSearch", "WebFetch",
   "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(ls:*)"];
 
+// Workers may call the ToDo MCP server for authorized follow-up tasks.
+const TODO_MCP_TOOLS = "mcp__plugin_todo_todo";
+
 // Codex sandbox modes mapped to Claude Code permission modes.
 export function permissionArgs(sandbox) {
   if (sandbox === "read-only") {
     return ["--permission-mode", "dontAsk", `--allowedTools=${READ_ONLY_TOOLS.join(",")}`];
   }
   if (sandbox === "danger-full-access") return ["--permission-mode", "bypassPermissions"];
-  // workspace-write: no prompts, writes limited to the worktree and no network
-  // by the Claude Code sandbox.
+  // workspace-write: edits are accepted inside the worktree only; shell
+  // commands run in the Claude Code sandbox, which must be available, with
+  // writes limited to the worktree and no network. Anything else is denied
+  // because a background turn cannot answer permission prompts.
   return [
-    "--permission-mode", "bypassPermissions",
-    "--settings", JSON.stringify({ sandbox: { enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false } }),
+    "--permission-mode", "acceptEdits",
+    `--allowedTools=${TODO_MCP_TOOLS}`,
+    "--settings", JSON.stringify({
+      sandbox: {
+        enabled: true,
+        failIfUnavailable: true,
+        autoAllowBashIfSandboxed: true,
+        allowUnsandboxedCommands: false,
+        network: { strictAllowlist: true },
+      },
+    }),
   ];
 }
 
