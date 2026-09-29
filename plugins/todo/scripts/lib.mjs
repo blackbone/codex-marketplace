@@ -2,6 +2,7 @@ import { withRepositoryExecution, reserveSingleBranch, checkpointSingleBranch, s
   singleBranchPlan, prepareSingleBranch, commitSingleBranch, singleBranchFiles, singleBranchInstructions, activeSingleBranchExecutors, verifySingleBranchDelivery, assertSingleBranchCancellation, recoverSingleBranchHead } from "./single-branch.mjs";
 import { DEFAULT_MODEL_PROFILES, readModelCatalog, profileDiagnostic, profileUsable, assertProfilesAvailable } from "./model-profiles.mjs";
 import { runShellCommand } from "./shell-step.mjs";
+import { assertRepoHost, daemonHost, HOST_ID, hostClaimRecord, hostModels, hostName, repoHostFromConfig } from "./host.mjs";
 import { recoverUsageRuns, combineUsage } from "./usage-recovery.mjs";
 import {
   appendFileSync,
@@ -315,7 +316,8 @@ export function initializeRepo(repoRoot) {
   const file = configPath(repoRoot);
   const created = !existsSync(file);
   ensureLayout(repoRoot);
-  if (created) atomicWriteJson(file, DEFAULT_CONFIG);
+  if (created) atomicWriteJson(file, { ...DEFAULT_CONFIG, host: hostClaimRecord() });
+  else ensureRepoHost(repoRoot);
   const config = loadConfig(repoRoot);
   return {
     repoRoot,
@@ -383,6 +385,7 @@ export function loadConfig(repoRoot) {
   if (!existsSync(file)) {
     return {
       activated: false,
+      host: HOST_ID,
       workers: DEFAULT_WORKERS,
       pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
       configReloadIntervalMs: DEFAULT_CONFIG_RELOAD_INTERVAL_MS,
@@ -434,7 +437,7 @@ export function loadConfig(repoRoot) {
   if (raw.executionBackend !== undefined && !["app-server", "exec"].includes(raw.executionBackend)) {
     warning = warning ? `${warning}; executionBackend must be app-server` : "executionBackend must be app-server";
   }
-  const normalizedProfiles = normalizeModelProfiles(raw.models);
+  const normalizedProfiles = normalizeModelProfiles(hostModels(raw.models));
   if (normalizedProfiles.warning) {
     warning = warning ? `${warning}; ${normalizedProfiles.warning}` : normalizedProfiles.warning;
     readError = `Invalid custom model profiles: ${normalizedProfiles.warning}. Use model_profiles to inspect and update; no fallback model was selected.`;
@@ -572,6 +575,7 @@ export function loadConfig(repoRoot) {
     routingMode,
     git: { executionMode, delivery: gitDelivery, targetBranch: executionMode === "single-branch" ? null : targetBranch, remote, push: rawGit.push === true },
     pipeline,
+    host: repoHostFromConfig(raw),
     warning,
     readError,
   };
@@ -1576,7 +1580,9 @@ export function readTask(taskPath) {
       (thread.lastTurnId !== undefined &&
         (typeof thread.lastTurnId !== "string" || !thread.lastTurnId)) ||
       (thread.archivedAt !== undefined &&
-        !validMetricTimestamp(thread.archivedAt))
+        !validMetricTimestamp(thread.archivedAt)) ||
+      (thread.host !== undefined &&
+        (typeof thread.host !== "string" || !thread.host))
     ) {
       throw new Error("invalid codexThread metadata");
     }
@@ -4178,6 +4184,36 @@ export function waitForTaskInput(repoRoot, id, { claimToken, question, owner = n
   return getTaskStatus(repoRoot, id);
 }
 
+// After a host takeover, interactive claims left by the previous host cannot be
+// reconciled through its executor; pause them for the new host.
+function adoptForeignInteractiveClaims(repoRoot) {
+  for (const taskPath of listTaskFiles(repoRoot)) {
+    const lockPath = `${taskPath}.lock`;
+    let raw;
+    try { raw = readJson(lockPath); } catch { continue; }
+    if (raw?.workerId !== "interactive" || daemonHost(raw) === HOST_ID) continue;
+    const claim = readClaim(lockPath, { includeToken: true });
+    if (!claim?.taskId || !claim.token) continue;
+    try {
+      waitForTaskInput(repoRoot, claim.taskId, {
+        claimToken: claim.token,
+        owner: claim.owner || null,
+        question: `The ${hostName(daemonHost(raw))} turn that ran this task ended when ToDo moved to ${hostName(HOST_ID)}. Continue it here or send an instruction from the dashboard.`,
+      });
+    } catch {
+      // Leave an unverifiable claim to normal recovery.
+    }
+  }
+}
+
+// Claims the repository for this host, or throws HOST_MISMATCH while a live
+// process of another host still works in it.
+export function ensureRepoHost(repoRoot) {
+  const result = assertRepoHost(repoRoot);
+  if (result.status === "claimed") adoptForeignInteractiveClaims(repoRoot);
+  return result;
+}
+
 export function reconcileInteractiveClaim(repoRoot, id, observed, expectedToken) {
   const file = path.join(todoDir(repoRoot), existingTaskFilename(repoRoot, id));
   const claim = readClaim(`${file}.lock`, { includeToken: true });
@@ -4267,6 +4303,7 @@ export function claimTask(
   { modelAttempt = false, owner = null, recoverSingleBranch = false } = {},
 ) {
   const repoRoot = path.dirname(path.dirname(path.resolve(taskPath)));
+  ensureRepoHost(repoRoot);
   return withRepositoryExecution(repoRoot, (state, saveState) => {
     const config = loadConfig(repoRoot);
     if (config.readError) throw new Error(config.readError);
@@ -4335,6 +4372,7 @@ function claimTaskUnlocked(taskPath, workerId, { modelAttempt, owner }) {
       `${JSON.stringify({
         token,
         pid: process.pid,
+        host: HOST_ID,
         workerId,
         task: path.basename(taskPath),
         claimedAt,

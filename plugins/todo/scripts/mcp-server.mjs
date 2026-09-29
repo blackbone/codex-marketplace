@@ -31,6 +31,7 @@ import {
   getSupervisorStatus,
   initializeRepo,
   isActivated,
+  ensureRepoHost,
   isCurrentDaemonState,
   listTaskStatuses,
   listWorkerStatuses,
@@ -46,6 +47,7 @@ import {
   updateTask,
   todoDir,
 } from "./lib.mjs";
+import { HOST_MANIFEST, HOST_MISMATCH } from "./host.mjs";
 import { signalDaemon } from "./daemon-process.mjs";
 import { ensureDaemon, verifyDaemonProcess } from "./ensure-daemon.mjs";
 import {
@@ -62,7 +64,7 @@ import {
 
 const pluginManifest = JSON.parse(
   readFileSync(
-    new URL("../.codex-plugin/plugin.json", import.meta.url),
+    new URL(`../${HOST_MANIFEST}/plugin.json`, import.meta.url),
     "utf8",
   ),
 );
@@ -1493,7 +1495,30 @@ function ensureTaskCreationRuntime(repoRoot) {
   return daemon;
 }
 
+// Reads stay available while another host owns the repository.
+const HOST_READ_ONLY_TOOLS = new Set([
+  "task_get",
+  "task_list",
+  "worker_list",
+  "todo_status",
+  "supervisor_get",
+  "runner_status",
+]);
+
+function guardRepoHost(name, args) {
+  if (HOST_READ_ONLY_TOOLS.has(name) || name === "repo_init") return;
+  if (name === "model_profiles" && args.action !== "apply") return;
+  let repoRoot;
+  try {
+    repoRoot = resolveRepo(args);
+  } catch {
+    return; // The tool reports its own argument error.
+  }
+  if (isActivated(repoRoot)) ensureRepoHost(repoRoot);
+}
+
 async function callTool(name, args = {}, metadata = {}) {
+  guardRepoHost(name, args);
   switch (name) {
     case "model_profiles": {
       const root = activatedRepo(args);
@@ -1716,7 +1741,10 @@ async function handle(message) {
       });
     } catch (error) {
       return success(message.id, {
-        content: [{ type: "text", text: error.message }],
+        content: [{
+          type: "text",
+          text: error.code === HOST_MISMATCH ? `${HOST_MISMATCH}: ${error.message}` : error.message,
+        }],
         isError: true,
       });
     }

@@ -1,5 +1,13 @@
 # Changelog
 
+## Host claim for the Claude Code fork
+
+- Record the owning host in `.todo/config.json` and refuse task changes,
+  runner starts, and hook policy while a live runner or task claim of another
+  host works in the repository; a dead PID hands the repository over.
+- Pause interactive claims and skip resuming threads left by the other host.
+- Read `models` from a per-host map as well as the legacy Codex array.
+
 ## Separate dashboard action columns
 
 - Give task Logs and Chat / input controls their own content-width columns and

@@ -531,12 +531,20 @@ The default `.todo/config.json` is:
     "targetBranch": null,
     "remote": "origin",
     "push": false
+  },
+  "host": {
+    "id": "codex",
+    "claimedAt": "2026-09-29T12:00:00.000Z",
+    "pluginVersion": "0.1.0+codex.20260929120000"
   }
 }
 ```
 
 `workers` accepts 1–32. Poll and reload intervals accept 250–60000 ms. The
-optional `models` array overrides the plugin task-role profiles. When omitted,
+optional `models` array overrides the plugin task-role profiles. `models` may
+also be a map keyed by host (`{"codex": [...], "claude": [...]}`); a plain array
+belongs to Codex, and the Claude Code fork writes its profiles under `claude`
+without touching the Codex array. When omitted,
 the current built-in profiles are used without copying them into the config. Task formation selects the lowest adequate
 available profile. Built-in retries follow Mini → fast, standard → medium,
 proven → advanced, and fast → medium → advanced → expert → ultra, staying at
@@ -809,6 +817,23 @@ timing, and error kind; model attempts also link their usage record. Automatic
 retry is fail-closed: only a known transient failure is retried in the same model
 or delivery phase. Unknown, authentication, permission, cancellation, preflight,
 and interactive failures wait for an explicit fix or manual action.
+
+## Host claim
+
+ToDo also ships for Claude Code as a separate fork that uses the same
+`.todo/` state, tasks, pipelines, and routing rules. A repository is claimed by
+one host at a time; `host` in `.todo/config.json` records it (a repository
+without it belongs to Codex).
+
+- While a live process of the other host works in the repository (its runner PID
+  from `.todo/daemon.json`, or the PID of a task claim), ToDo in this host stays
+  disabled: the session hook says so, and every task-changing MCP tool fails with
+  `HOST_MISMATCH`. Status, task, and worker reads keep working.
+- When that PID is no longer alive, the first task-changing call, runner start,
+  or activation claims the repository for this host. Interactive claims left by
+  the other host become `waiting-input`, and threads created by the other host
+  are not resumed: the next attempt starts a new thread.
+- To hand a repository over, stop the runner from the host that owns it.
 
 ## Runtime updates
 

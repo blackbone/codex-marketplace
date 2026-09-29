@@ -12,6 +12,7 @@ import {
 } from "./lib.mjs";
 import { ensureDaemon } from "./ensure-daemon.mjs";
 import { daemonRestartRequestPath } from "./runtime-update.mjs";
+import { foreignActivity, hostMismatchMessage } from "./host.mjs";
 
 let input = "";
 process.stdin.setEncoding("utf8");
@@ -60,6 +61,21 @@ process.stdin.on("end", () => {
     return;
   }
 
+  // Another host owns this repository while its process is alive: keep the
+  // policy out of this session and say why ToDo is unavailable.
+  const activity = process.env.TODO_RUNNER_WORKER === "1" ? null : foreignActivity(repoRoot);
+  if (activity) {
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName,
+          additionalContext: `ToDo is disabled in this session. ${hostMismatchMessage({ host: activity.host, activity })} Do not call ToDo MCP tools that change tasks, and tell the user before making project changes in this repository.`,
+        },
+      }),
+    );
+    return;
+  }
+
   let runtimeNotice = "";
   let routingNotice = "";
   // Subagents and claimed workers only receive policy; maintenance belongs to
@@ -88,7 +104,7 @@ process.stdin.on("end", () => {
           runtimeNotice =
             "\nToDo runtime update was applied and the daemon restarted with current plugin files and repository config.";
         } else if (
-          ["conflict", "start-failed", "start-blocked", "update-blocked"].includes(
+          ["conflict", "host-busy", "start-failed", "start-blocked", "update-blocked"].includes(
             ensured.status,
           )
         ) {

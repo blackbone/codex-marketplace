@@ -74,6 +74,7 @@ import {
   parseAppServerExecutionStats,
 } from "./execution-stats.mjs";
 import { AppServerClient } from "./app-server-client.mjs";
+import { HOST_ID, threadIsForeign } from "./host.mjs";
 import { DesktopTitleClient } from "./desktop-title.mjs";
 import { combineUsage } from "./usage-recovery.mjs";
 import { createTaskInteraction } from "./task-interaction.mjs";
@@ -211,6 +212,7 @@ function writeState(status = null) {
   atomicWriteJson(daemonStatePath(repoRoot), {
     implementation: DAEMON_IMPLEMENTATION,
     protocolVersion: DAEMON_PROTOCOL_VERSION,
+    host: HOST_ID,
     pluginVersion,
     runtimeFingerprint: ownRuntime.fingerprint,
     runtime: ownRuntime,
@@ -535,7 +537,10 @@ function buildPrompt(task, worktreePath) {
 }
 
 function buildAppServerPrompt(task, worktreePath, claim) {
-  if (!task.metadata.codexThread?.id) return buildPrompt(task, worktreePath);
+  // A thread created by another host cannot be resumed; start fresh.
+  if (!task.metadata.codexThread?.id || threadIsForeign(task.metadata.codexThread)) {
+    return buildPrompt(task, worktreePath);
+  }
   const previousError = task.metadata.error?.message;
   return [
     `Continue ToDo task ${task.id} in the existing Codex thread.`,
@@ -829,15 +834,19 @@ async function loadTaskThread(taskPath, execution, worktreePath, config) {
     approvalPolicy: "never",
     sandbox: config.codexSandbox,
   };
-  if (!thread) {
+  if (!thread || threadIsForeign(thread)) {
     const started = await client.startThread({
       ...common,
       serviceName: "todo",
     });
     thread = updateTaskCodexThread(taskPath, {
       id: started.id,
+      host: HOST_ID,
       state: "active",
       createdAt: new Date().toISOString(),
+      name: undefined,
+      lastTurnId: undefined,
+      archivedAt: undefined,
     });
     log("task_thread_created", { task: task.id, threadId: thread.id });
     await nameTaskThread(client, taskPath, task);
@@ -878,8 +887,11 @@ async function archiveTaskThread(taskPath, config) {
   const thread = task.metadata.codexThread;
   if (!thread || thread.state === "archived") return;
   updateTaskCodexThread(taskPath, { state: "archive-pending" });
-  const client = await ensureAppServer(config);
-  await archiveThreadIdempotently(client, thread.id);
+  // Another host's thread is not reachable from this executor.
+  if (!threadIsForeign(thread)) {
+    const client = await ensureAppServer(config);
+    await archiveThreadIdempotently(client, thread.id);
+  }
   updateTaskCodexThread(taskPath, {
     state: "archived",
     archivedAt: new Date().toISOString(),
@@ -919,8 +931,10 @@ async function processPendingThreadArchives(config) {
     let receipt;
     try {
       receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
-      const client = await ensureAppServer(config);
-      await archiveThreadIdempotently(client, receipt.codexThread.id);
+      if (!threadIsForeign(receipt.codexThread)) {
+        const client = await ensureAppServer(config);
+        await archiveThreadIdempotently(client, receipt.codexThread.id);
+      }
       markClosedTaskThreadArchived(receiptPath);
       log("closed_task_thread_archived", {
         task: receipt.id,

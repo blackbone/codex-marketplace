@@ -20,6 +20,7 @@ import {
   daemonStatePath,
   daemonStopRequestPath,
   ensureLayout,
+  ensureRepoHost,
   findLegacyRunner,
   getSupervisorStatus,
   isActivated,
@@ -41,6 +42,7 @@ import {
 } from "./runtime-update.mjs";
 
 import { commandDaemonPath, inspectProcess, signalDaemon } from "./daemon-process.mjs";
+import { HOST_MANIFEST, HOST_MISMATCH } from "./host.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(scriptDir, "..");
@@ -51,7 +53,7 @@ function manifestOwnsTodoDaemon(daemonPath) {
   try {
     const manifest = JSON.parse(
       readFileSync(
-        path.join(pluginRoot, ".codex-plugin", "plugin.json"),
+        path.join(pluginRoot, HOST_MANIFEST, "plugin.json"),
         "utf8",
       ),
     );
@@ -524,6 +526,13 @@ export function ensureDaemon(
   }
   if (!isActivated(repoRoot)) {
     return { status: "inactive" };
+  }
+  // Never start, restart or replace a runner while another host owns the repository.
+  try {
+    ensureRepoHost(repoRoot);
+  } catch (error) {
+    if (error.code !== HOST_MISMATCH) throw error;
+    return { status: "host-busy", host: error.host, activity: error.activity, reason: error.message };
   }
 
   ensureLayout(repoRoot);

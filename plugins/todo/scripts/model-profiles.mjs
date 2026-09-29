@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import path from "node:path";
 import { AppServerClient } from "./app-server-client.mjs";
+import { hostModels, withHostModels } from "./host.mjs";
 
 // Task roles, not a benchmark ranking. Keep original profile names stable.
 export const DEFAULT_MODEL_PROFILES = [
@@ -47,7 +48,7 @@ const catalogPath = root => path.join(root, ".todo", "model-catalog.json");
 const hash = value => createHash("sha256").update(value).digest("hex");
 const inFlight = new Map();
 const modelConfigKey = root => {
-  try { return hash(JSON.stringify(JSON.parse(readFileSync(path.join(root, ".todo/config.json"), "utf8")).models ?? null)); }
+  try { return hash(JSON.stringify(hostModels(JSON.parse(readFileSync(path.join(root, ".todo/config.json"), "utf8")).models) ?? null)); }
   catch { return hash(""); }
 };
 
@@ -125,8 +126,9 @@ export function modelProfilePlan(root, catalog) {
   const file = path.join(root, ".todo", "config.json");
   const text = readFileSync(file, "utf8");
   const config = JSON.parse(text);
-  const current = Array.isArray(config.models) ? config.models : DEFAULT_MODEL_PROFILES;
-  if (config.models === undefined) {
+  const configured = hostModels(config.models);
+  const current = Array.isArray(configured) ? configured : DEFAULT_MODEL_PROFILES;
+  if (configured === undefined) {
     const profiles = { models: DEFAULT_MODEL_PROFILES, defaultModelProfile: config.defaultModelProfile || "expert" };
     return { source: "plugin", checkedAt: catalog.checkedAt, executor: catalog.command,
       models: visibleModels(catalog), diagnostics: current.map(p => profileDiagnostic(p, catalog)),
@@ -180,7 +182,7 @@ export function modelProfilePlan(root, catalog) {
   }
   const defaultModelProfile = proposed.some(p => p.name === config.defaultModelProfile) ? config.defaultModelProfile
     : proposed.find(p => p.name === "expert")?.name || proposed.find(p => p.name === "advanced")?.name || proposed[0]?.name;
-  const next = { ...config, models: proposed, defaultModelProfile };
+  const next = { ...withHostModels(config, proposed), defaultModelProfile };
   const changes = current.map(profile => {
     const replacement = proposed.find(p => p.name === profile?.name);
     return { profile: profile?.name || null, before: profile, after: replacement || null,

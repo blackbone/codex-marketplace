@@ -17,6 +17,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ensureDaemon } from "./ensure-daemon.mjs";
+import { HOST_MANIFEST } from "./host.mjs";
 import {
   DAEMON_IMPLEMENTATION,
   DAEMON_PROTOCOL_VERSION,
@@ -62,11 +63,11 @@ async function mockDaemon(extraArgument = null) {
 
 try {
   const fixturePlugin = path.join(temporaryRoot, "plugin");
-  mkdirSync(path.join(fixturePlugin, ".codex-plugin"), { recursive: true });
+  mkdirSync(path.join(fixturePlugin, HOST_MANIFEST), { recursive: true });
   mkdirSync(path.join(fixturePlugin, "scripts"));
   mkdirSync(path.join(fixturePlugin, "hooks"));
   writeFileSync(
-    path.join(fixturePlugin, ".codex-plugin", "plugin.json"),
+    path.join(fixturePlugin, HOST_MANIFEST, "plugin.json"),
     '{"version":"1.0.0"}\n',
   );
   writeFileSync(path.join(fixturePlugin, ".mcp.json"), "{}\n");
@@ -89,6 +90,7 @@ try {
     "execution-stats.mjs",
     "usage-recovery.mjs",
     "git-worktree.mjs",
+    "host.mjs",
     "lib.mjs",
     "mcp-server.mjs",
     "pipeline.mjs",
@@ -176,7 +178,7 @@ try {
     '{"type":"object"}\n',
   );
   writeFileSync(
-    path.join(fixturePlugin, ".codex-plugin", "plugin.json"),
+    path.join(fixturePlugin, HOST_MANIFEST, "plugin.json"),
     "{\n",
   );
   const brokenManifest = runtimeDescriptor(fixturePlugin);
@@ -184,10 +186,10 @@ try {
   assert.equal(brokenManifest.pluginVersion, null);
   assert.equal(
     brokenManifest.diagnostics[0].path,
-    ".codex-plugin/plugin.json",
+    `${HOST_MANIFEST}/plugin.json`,
   );
   writeFileSync(
-    path.join(fixturePlugin, ".codex-plugin", "plugin.json"),
+    path.join(fixturePlugin, HOST_MANIFEST, "plugin.json"),
     '{"version":"1.0.0"}\n',
   );
   assert.equal(runtimeDescriptor(fixturePlugin).available, true);

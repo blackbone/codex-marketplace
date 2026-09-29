@@ -15,7 +15,7 @@
     "test:git": "node plugins/todo/scripts/git-worktree.mjs --self-check && node --test plugins/todo/scripts/git-push-test.mjs",
     "test:smoke": "node plugins/todo/scripts/smoke-test.mjs",
     "test:models": "node --test plugins/todo/scripts/model-profiles-test.mjs",
-    "test:safety": "node --test plugins/todo/scripts/single-branch-test.mjs plugins/todo/scripts/runtime-safety-test.mjs plugins/todo/scripts/task-status-test.mjs plugins/todo/scripts/interactive-runtime-test.mjs plugins/todo/scripts/merge-repair-test.mjs",
+    "test:safety": "node --test plugins/todo/scripts/host-claim-test.mjs plugins/todo/scripts/single-branch-test.mjs plugins/todo/scripts/runtime-safety-test.mjs plugins/todo/scripts/task-status-test.mjs plugins/todo/scripts/interactive-runtime-test.mjs plugins/todo/scripts/merge-repair-test.mjs",
     "test:ori": "sh plugins/ori/scripts/test.sh",
     "test:windows": "node --test plugins/todo/scripts/windows-compat-test.mjs"
   }

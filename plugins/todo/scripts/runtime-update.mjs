@@ -17,16 +17,18 @@ import {
   releaseTaskBatchGate,
   todoDir,
 } from "./lib.mjs";
+import { HOST_MANIFEST } from "./host.mjs";
 
+const MANIFEST_FILE = `${HOST_MANIFEST}/plugin.json`;
 const RUNTIME_PATHS = [
-  ".codex-plugin/plugin.json",
+  MANIFEST_FILE,
   ".mcp.json",
   "hooks",
   "scripts",
   "skills",
 ];
 const REQUIRED_RUNTIME_FILES = [
-  ".codex-plugin/plugin.json",
+  MANIFEST_FILE,
   ".mcp.json",
   "hooks/hooks.json",
   "scripts/attempt-ledger.mjs",
@@ -46,6 +48,7 @@ const REQUIRED_RUNTIME_FILES = [
   "scripts/execution-stats.mjs",
   "scripts/usage-recovery.mjs",
   "scripts/git-worktree.mjs",
+  "scripts/host.mjs",
   "scripts/lib.mjs",
   "scripts/mcp-server.mjs",
   "scripts/pipeline.mjs",
@@ -264,11 +267,7 @@ function validateRuntime(pluginRoot, files, fingerprint) {
 }
 
 export function runtimeDescriptor(pluginRoot) {
-  const manifestPath = path.join(
-    pluginRoot,
-    ".codex-plugin",
-    "plugin.json",
-  );
+  const manifestPath = path.join(pluginRoot, MANIFEST_FILE);
   let pluginVersion = null;
   try {
     pluginVersion = JSON.parse(readFileSync(manifestPath, "utf8")).version;
@@ -292,11 +291,11 @@ export function runtimeDescriptor(pluginRoot) {
   if (
     (typeof pluginVersion !== "string" || pluginVersion.length === 0) &&
     !diagnostics.some(
-      (diagnostic) => diagnostic.path === ".codex-plugin/plugin.json",
+      (diagnostic) => diagnostic.path === MANIFEST_FILE,
     )
   ) {
     diagnostics.unshift({
-      path: ".codex-plugin/plugin.json",
+      path: MANIFEST_FILE,
       check: "manifest",
       message: "version must be a non-empty string",
     });
