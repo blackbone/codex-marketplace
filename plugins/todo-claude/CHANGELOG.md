@@ -12,3 +12,5 @@
   profiles are stored under `models.claude`.
 - Claim repositories per host and resolve interactive run ownership from the
   Claude Code session hooks.
+- Recognize the runner of a Windows repository opened through an 8.3 short
+  path, so `runner_stop` no longer refuses it as unverified.

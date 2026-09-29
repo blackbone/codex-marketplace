@@ -273,10 +273,16 @@ export function verifyDaemonProcess(repoRoot, running) {
   let expectedRepo;
   let stateRepo;
   try {
-    expectedRepo = realpathSync(repoRoot);
-    stateRepo = realpathSync(running.repoRoot || "");
+    // The native resolver expands Windows 8.3 short names, so a daemon started
+    // from C:\Users\RUNNER~1\... matches the long path Git reports.
+    expectedRepo = realpathSync.native(repoRoot);
+    stateRepo = realpathSync.native(running.repoRoot || "");
   } catch {
     return { ok: false, reason: "daemon repository identity is not verifiable" };
+  }
+  if (process.platform === "win32") {
+    expectedRepo = expectedRepo.toLowerCase();
+    stateRepo = stateRepo.toLowerCase();
   }
   if (stateRepo !== expectedRepo) {
     return { ok: false, reason: "daemon command does not match this repository" };

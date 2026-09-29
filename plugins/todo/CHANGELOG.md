@@ -7,6 +7,8 @@
   host works in the repository; a dead PID hands the repository over.
 - Pause interactive claims and skip resuming threads left by the other host.
 - Read `models` from a per-host map as well as the legacy Codex array.
+- Recognize the runner of a Windows repository opened through an 8.3 short
+  path, so `runner_stop` no longer refuses it as unverified.
 
 ## Separate dashboard action columns
 
