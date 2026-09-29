@@ -2,10 +2,17 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { atomicWriteJson, configPath, DEFAULT_CONFIG, loadConfig } from "./lib.mjs";
+import { RUNNERS, configRunner, runnerDefaultProfiles, runnerModels } from "./model-profiles.mjs";
 
 const numericFields = { workers: [1, 32], retries: [-1, Number.MAX_SAFE_INTEGER], pollIntervalMs: [250, 60000], configReloadIntervalMs: [250, 60000] };
 const gitFields = ["executionMode", "delivery", "targetBranch", "remote", "push"];
 const revision = text => createHash("sha256").update(text).digest("hex");
+// Profile names each runner would use, so the form can switch runners.
+function runnerProfileNames(raw, runner) {
+  const configured = runnerModels(raw.models, runner);
+  const profiles = configured === undefined ? runnerDefaultProfiles(runner) : Array.isArray(configured) ? configured : [];
+  return profiles.map(profile => profile?.name).filter(name => typeof name === "string" && name);
+}
 
 export function readSettings(repoRoot) {
   const text = readFileSync(configPath(repoRoot), "utf8");
@@ -15,8 +22,9 @@ export function readSettings(repoRoot) {
   const branches = spawnSync("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads/"], { cwd: repoRoot, encoding: "utf8", timeout: 3000, windowsHide: true });
   return {
     revision: revision(text),
-    values: Object.fromEntries([...Object.keys(numericFields), "defaultModelProfile"].map(key => [key, raw[key] ?? DEFAULT_CONFIG[key]]).concat([["git", Object.fromEntries(gitFields.map(key => [key, raw.git?.[key] ?? DEFAULT_CONFIG.git[key]]))]])),
+    values: Object.fromEntries([...Object.keys(numericFields), "defaultModelProfile"].map(key => [key, raw[key] ?? DEFAULT_CONFIG[key]]).concat([["runner", configRunner(raw)], ["git", Object.fromEntries(gitFields.map(key => [key, raw.git?.[key] ?? DEFAULT_CONFIG.git[key]]))]])),
     profiles: config.modelProfiles.map(profile => profile.name),
+    runnerProfiles: Object.fromEntries(RUNNERS.map(runner => [runner, runnerProfileNames(raw, runner)])),
     branches: branches.status === 0 ? branches.stdout.trim().split("\n").filter(Boolean) : [],
     warning: config.readError,
   };
@@ -30,12 +38,14 @@ export function saveSettings(repoRoot, input) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("config.json must contain an object");
   const values = input.values;
   if (!values || typeof values !== "object" || Array.isArray(values)) throw new Error("Settings must be an object");
-  const allowed = [...Object.keys(numericFields), "defaultModelProfile", "git"];
+  const allowed = [...Object.keys(numericFields), "defaultModelProfile", "runner", "git"];
   if (Object.keys(values).some(key => !allowed.includes(key))) throw new Error("Unsupported settings field");
   for (const [key, [min, max]] of Object.entries(numericFields)) {
     if (!Number.isSafeInteger(values[key]) || values[key] < min || values[key] > max) throw new Error(`${key} must be an integer between ${min} and ${max}`);
   }
-  if (!loadConfig(repoRoot).modelProfiles.some(profile => profile.name === values.defaultModelProfile)) throw new Error("Select a configured model profile");
+  if (!RUNNERS.includes(values.runner)) throw new Error(`Runner must be ${RUNNERS.join(" or ")}`);
+  const profiles = values.runner === configRunner(raw) ? loadConfig(repoRoot).modelProfiles.map(profile => profile.name) : runnerProfileNames(raw, values.runner);
+  if (!profiles.includes(values.defaultModelProfile)) throw new Error("Select a configured model profile");
   const git = values.git;
   if (!git || typeof git !== "object" || Array.isArray(git) || Object.keys(git).some(key => !gitFields.includes(key))) throw new Error("Invalid Git settings");
   if (!["worktree", "single-branch"].includes(git.executionMode)) throw new Error("Invalid execution mode");
@@ -66,12 +76,24 @@ function settingsClient() {
     if (single) field("push").checked = false;
     document.querySelector("#settings-mode-help").textContent = single ? "Single-branch runs one worker and commits locally in the current branch." : "Empty target branch uses the branch active at preflight.";
   }
+  function runnerChanged() {
+    const profiles = field("defaultModelProfile");
+    const selected = profiles.value || loaded.values.defaultModelProfile;
+    const names = loaded.runnerProfiles?.[field("runner").value] || loaded.profiles;
+    profiles.replaceChildren(...names.map(name => new Option(name, name)));
+    profiles.value = names.includes(selected) ? selected : names.includes("expert") ? "expert" : names[0] || "";
+    document.querySelector("#settings-runner-help").textContent = field("runner").value === "claude"
+      ? "Claude Code CLI runs background turns with claude -p; profiles map to Claude models. New sessions start for tasks whose thread belongs to the other runner."
+      : "Codex app-server runs background turns in persistent Codex threads.";
+  }
   function populate(data) {
     loaded = data;
     for (const key of numbers) field(key).value = data.values[key];
+    field("runner").value = data.values.runner;
     const profiles = field("defaultModelProfile");
     profiles.replaceChildren(...data.profiles.map(name => new Option(name, name)));
     profiles.value = data.values.defaultModelProfile;
+    runnerChanged();
     for (const key of ["executionMode", "delivery", "targetBranch", "remote"]) field(key).value = data.values.git[key] ?? "";
     field("push").checked = data.values.git.push;
     document.querySelector("#settings-branches").replaceChildren(...data.branches.map(name => new Option(name, name)));
@@ -94,12 +116,14 @@ function settingsClient() {
   document.querySelector("#settings-reload").addEventListener("click", reload);
   document.querySelector("#settings-close").addEventListener("click", () => dialog.close());
   field("executionMode").addEventListener("change", modeChanged);
+  field("runner").addEventListener("change", runnerChanged);
   form.addEventListener("submit", async event => {
     event.preventDefault();
     if (!loaded) return;
     save.disabled = true;
     const values = Object.fromEntries(numbers.map(key => [key, Number(field(key).value)]));
     values.defaultModelProfile = field("defaultModelProfile").value;
+    values.runner = field("runner").value;
     values.git = Object.fromEntries(["executionMode", "delivery", "targetBranch", "remote"].map(key => [key, field(key).value.trim()]));
     values.git.targetBranch ||= null;
     values.git.push = field("push").checked;
@@ -124,6 +148,8 @@ export const SETTINGS_STYLE = `
 .settings-grid label { display: flex; flex-direction: column; gap: 7px; }
 .settings-grid input:not([type=checkbox]), .settings-grid select { box-sizing: border-box; width: 100%; padding: 8px; font: inherit; background: Canvas; color: CanvasText; border: 1px solid #8888; border-radius: 4px; }
 .settings-grid .settings-check { flex-direction: row; align-items: center; }
+.settings-grid .settings-wide { grid-column: 1 / -1; }
+#settings-runner-help { opacity: 0.75; line-height: 1.4; }
 .settings-actions { display: flex; gap: 10px; justify-content: flex-end; }
 .settings-actions button { padding: 8px 12px; }
 #settings-save { background: #2563eb; color: white; border: 1px solid #2563eb; border-radius: 4px; }
@@ -136,6 +162,7 @@ export const SETTINGS_HTML = `
   <p>Edit <code>.todo/config.json</code>. Other configuration fields are preserved.</p>
   <form id="settings-form">
     <div class="settings-grid">
+      <label class="settings-wide">Runner <select name="runner" aria-describedby="settings-runner-help"><option value="codex">Codex app-server</option><option value="claude">Claude Code CLI</option></select><small id="settings-runner-help"></small></label>
       <label>Workers <input name="workers" type="number" min="1" max="32" required></label>
       <label>Default model profile <select name="defaultModelProfile" required></select></label>
       <label>Execution mode <select name="executionMode"><option value="worktree">Isolated worktrees</option><option value="single-branch">Single branch</option></select></label>

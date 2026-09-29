@@ -38,7 +38,7 @@ async function taskAction({ taskId, action, text = "", expectedTurnId, expectedI
   if (action === "steer") {
     if (typeof text !== "string" || !text.trim() || text.length > 8000) throw new Error("Enter an instruction (1-8000 characters)");
     if (entry?.threadId && entry.turnId && entry.turnId === expectedTurnId) {
-      const result = await getAppServer().steerTurn(entry.threadId, entry.turnId, text.trim());
+      const result = await getAppServer(entry).steerTurn(entry.threadId, entry.turnId, text.trim());
       return { accepted: true, turnId: result.turnId, ...record(task.id, { role: "user", label: "Instruction", text: text.trim() }) };
     }
     throw new Error("The task's active turn changed. Refresh before sending an instruction.");

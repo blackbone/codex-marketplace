@@ -1,5 +1,17 @@
 # Changelog
 
+## Claude Code runner
+
+- Add an optional Claude Code CLI runner (`"runner": "claude"`) next to the
+  Codex app-server, selectable in dashboard settings. Turns run as `claude -p`
+  stream-json sessions that continue with `--resume`, load the ToDo MCP server,
+  and map `codexSandbox` to Claude Code permission modes.
+- Keep profile names and map them to Claude models; custom Claude profiles live
+  under `models.claude`. Model catalogs and preflight follow the runner
+  (`claudeCommand`, `claude-command` check).
+- Record the runner on task threads and start a new session for a thread of the
+  other runner.
+
 ## Host claim for the Claude Code fork
 
 - Record the owning host in `.todo/config.json` and refuse task changes,

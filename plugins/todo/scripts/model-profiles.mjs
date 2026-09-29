@@ -2,7 +2,19 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import path from "node:path";
 import { AppServerClient } from "./app-server-client.mjs";
-import { hostModels, withHostModels } from "./host.mjs";
+import { ClaudeRunnerClient } from "./claude-runner.mjs";
+import { HOST_ID, hostModels, withHostModels } from "./host.mjs";
+
+// The runner executes background turns: the Codex app-server (default) or the
+// Claude Code CLI. Each runner has its own command, profiles and catalog.
+export const DEFAULT_RUNNER = "codex";
+export const RUNNERS = ["codex", "claude"];
+export const RUNNER_NAMES = { codex: "Codex app-server", claude: "Claude Code CLI" };
+export const configRunner = raw => RUNNERS.includes(raw?.runner) ? raw.runner : DEFAULT_RUNNER;
+export function runnerCommand(raw, runner = configRunner(raw)) {
+  const key = runner === "claude" ? "claudeCommand" : "codexCommand";
+  return typeof raw?.[key] === "string" && raw[key].trim() ? raw[key].trim() : runner;
+}
 
 // Task roles, not a benchmark ranking. Keep original profile names stable.
 export const DEFAULT_MODEL_PROFILES = [
@@ -15,6 +27,34 @@ export const DEFAULT_MODEL_PROFILES = [
   { name: "expert", model: "gpt-6-astra", reasoningEffort: "xhigh", description: "Most capable model for complex implementation work." },
   { name: "ultra", model: "gpt-6-astra", reasoningEffort: "max", description: "Most capable model for very complex, high-risk, cross-cutting work." },
 ];
+// Claude runner profiles keep the same names and roles; only the models differ.
+// Haiku 4.5 has no effort control, so mini and fast share one model. They are
+// stored under `models.claude`, the same key the Claude Code fork uses.
+export const CLAUDE_MODEL_PROFILES = [
+  { name: "mini", model: "claude-haiku-4-5", reasoningEffort: "low", description: "Small, mechanical edits and simple bounded fixes." },
+  { name: "fast", model: "claude-haiku-4-5", reasoningEffort: "medium", description: "Mechanical edits, straightforward fixes, and cost-sensitive routine work." },
+  { name: "standard", model: "claude-sonnet-5-5", reasoningEffort: "low", description: "Straightforward everyday implementation with clear requirements." },
+  { name: "medium", model: "claude-sonnet-5-5", reasoningEffort: "medium", description: "Bounded implementation across several files; balanced everyday coding." },
+  { name: "proven", model: "claude-sonnet-5-5", reasoningEffort: "high", description: "Multi-step engineering and debugging with high reasoning." },
+  { name: "advanced", model: "claude-opus-5-5", reasoningEffort: "max", description: "Deep debugging and substantial refactoring with maximum reasoning." },
+  { name: "expert", model: "claude-fable-5-1", reasoningEffort: "xhigh", description: "Most capable model for complex implementation work." },
+  { name: "ultra", model: "claude-fable-5-1", reasoningEffort: "max", description: "Most capable model for very complex, high-risk, cross-cutting work." },
+];
+export const runnerDefaultProfiles = runner => runner === "claude" ? CLAUDE_MODEL_PROFILES : DEFAULT_MODEL_PROFILES;
+
+export function runnerModels(models, runner = DEFAULT_RUNNER) {
+  if (runner === DEFAULT_RUNNER) return hostModels(models);
+  return models && typeof models === "object" && !Array.isArray(models) ? models[runner] : undefined;
+}
+
+export function withRunnerModels(raw, runner, profiles) {
+  if (runner === DEFAULT_RUNNER) return withHostModels(raw, profiles);
+  const models = raw.models;
+  const map = Array.isArray(models) ? { [HOST_ID]: models } : models && typeof models === "object" ? { ...models } : {};
+  map[runner] = profiles;
+  return { ...raw, models: map };
+}
+
 // Recognize exact previous defaults without overwriting intentional custom efforts or descriptions.
 const previousBuiltinProfiles = [
   { name: "mini", model: "gpt-6-luna", reasoningEffort: "low", description: "Small, mechanical edits and simple bounded fixes." },
@@ -47,26 +87,28 @@ const CATALOG_TTL_MS = 5 * 60 * 1000;
 const catalogPath = root => path.join(root, ".todo", "model-catalog.json");
 const hash = value => createHash("sha256").update(value).digest("hex");
 const inFlight = new Map();
-const modelConfigKey = root => {
-  try { return hash(JSON.stringify(hostModels(JSON.parse(readFileSync(path.join(root, ".todo/config.json"), "utf8")).models) ?? null)); }
+const modelConfigKey = (root, runner) => {
+  try { return hash(JSON.stringify(runnerModels(JSON.parse(readFileSync(path.join(root, ".todo/config.json"), "utf8")).models, runner) ?? null)); }
   catch { return hash(""); }
 };
 
-export function readModelCatalog(root, command = "codex") {
+export function readModelCatalog(root, command = "codex", runner = DEFAULT_RUNNER) {
   try {
     const value = JSON.parse(readFileSync(catalogPath(root), "utf8"));
-    return value.command === command && value.configKey === modelConfigKey(root) && Array.isArray(value.models) &&
+    return value.command === command && (value.runner || DEFAULT_RUNNER) === runner &&
+      value.configKey === modelConfigKey(root, runner) && Array.isArray(value.models) &&
       Date.now() - Date.parse(value.checkedAt) < CATALOG_TTL_MS ? { ...value, models: visibleModels(value) } : null;
   } catch { return null; }
 }
 
-export async function refreshModelCatalog(root, command = "codex", { force = false } = {}) {
-  if (!force) { const cached = readModelCatalog(root, command); if (cached) return cached; }
-  const key = `${root}\0${command}`;
+export async function refreshModelCatalog(root, command = "codex", { force = false, runner = DEFAULT_RUNNER } = {}) {
+  if (!force) { const cached = readModelCatalog(root, command, runner); if (cached) return cached; }
+  const key = `${root}\0${runner}\0${command}`;
   if (inFlight.has(key)) return inFlight.get(key);
   const request = (async () => {
-    const configKey = modelConfigKey(root);
-    const client = new AppServerClient({ command, cwd: root });
+    const configKey = modelConfigKey(root, runner);
+    const Client = runner === "claude" ? ClaudeRunnerClient : AppServerClient;
+    const client = new Client({ command, cwd: root });
     let timer;
     try {
       const operation = (async () => {
@@ -87,7 +129,7 @@ export async function refreshModelCatalog(root, command = "codex", { force = fal
           if (cursor) cursors.add(cursor);
         } while (cursor);
         if (!models.length || models.some(m => typeof m.model !== "string" || !m.model)) throw new Error("model/list returned no usable models");
-        return { command, configKey, checkedAt: new Date().toISOString(), models: models.filter(m => !excludedModel(m.model)) };
+        return { command, runner, configKey, checkedAt: new Date().toISOString(), models: models.filter(m => !excludedModel(m.model)) };
       })();
       const catalog = await Promise.race([operation, new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error("Timed out querying executor model/list")), 10000);
@@ -126,24 +168,28 @@ export function modelProfilePlan(root, catalog) {
   const file = path.join(root, ".todo", "config.json");
   const text = readFileSync(file, "utf8");
   const config = JSON.parse(text);
-  const configured = hostModels(config.models);
-  const current = Array.isArray(configured) ? configured : DEFAULT_MODEL_PROFILES;
+  const runner = catalog.runner || DEFAULT_RUNNER;
+  const defaults = runnerDefaultProfiles(runner);
+  // Former Codex built-ins are not Claude runner history.
+  const previousBuiltins = runner === DEFAULT_RUNNER ? previousBuiltinProfiles : [];
+  const configured = runnerModels(config.models, runner);
+  const current = Array.isArray(configured) ? configured : defaults;
   if (configured === undefined) {
-    const profiles = { models: DEFAULT_MODEL_PROFILES, defaultModelProfile: config.defaultModelProfile || "expert" };
-    return { source: "plugin", checkedAt: catalog.checkedAt, executor: catalog.command,
+    const profiles = { models: defaults, defaultModelProfile: config.defaultModelProfile || "expert" };
+    return { source: "plugin", runner, checkedAt: catalog.checkedAt, executor: catalog.command,
       models: visibleModels(catalog), diagnostics: current.map(p => profileDiagnostic(p, catalog)),
       current: profiles, proposed: profiles, changes: [], changed: false,
       planId: hash(text + JSON.stringify(catalog.models)), next: config,
       message: "Profiles are inherited from the plugin. Updating the plugin updates future attempts without writing a models block." };
   }
   const supported = visibleModels(catalog).filter(m => !m.hidden && !(m.retirementAt && m.retirementAt * 1000 <= Date.now()));
-  const recommended = DEFAULT_MODEL_PROFILES.filter(p => supported.some(m => m.model === p.model)).map(p => {
+  const recommended = defaults.filter(p => supported.some(m => m.model === p.model)).map(p => {
     const model = supported.find(m => m.model === p.model);
     return { ...p, reasoningEffort: model.efforts.includes(p.reasoningEffort) ? p.reasoningEffort : model.defaultEffort };
   });
   for (const model of supported) {
     // Former built-ins remain selectable, but migrating them must not rediscover them on the next inspection.
-    if (legacyGeneration(model.model) || previousBuiltinProfiles.some(p => p.model === model.model)) continue;
+    if (legacyGeneration(model.model) || previousBuiltins.some(p => p.model === model.model)) continue;
     if (recommended.some(p => p.model === model.model) || current.some(p =>
       p?.model === model.model && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(p.name || "") && profileUsable(profileDiagnostic(p, catalog)))) continue;
     let name = `model-${model.model.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/-+$/, "")}`;
@@ -156,8 +202,8 @@ export function modelProfilePlan(root, catalog) {
   for (const profile of current) {
     if (!profile || typeof profile !== "object" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(profile.name || "")) continue;
     if (excludedModel(profile.model) || profile.name === "spark") continue;
-    const builtin = DEFAULT_MODEL_PROFILES.find(p => p.name === profile.name);
-    const legacyBuiltin = legacyBuiltinModels[profile.name] === profile.model || previousBuiltinProfiles.some(old =>
+    const builtin = defaults.find(p => p.name === profile.name);
+    const legacyBuiltin = (runner === DEFAULT_RUNNER && legacyBuiltinModels[profile.name] === profile.model) || previousBuiltins.some(old =>
       old.name === profile.name && old.model === profile.model && old.reasoningEffort === profile.reasoningEffort &&
       (profile.description === undefined || profile.description === old.description));
     if (builtin?.model === profile.model) {
@@ -182,13 +228,13 @@ export function modelProfilePlan(root, catalog) {
   }
   const defaultModelProfile = proposed.some(p => p.name === config.defaultModelProfile) ? config.defaultModelProfile
     : proposed.find(p => p.name === "expert")?.name || proposed.find(p => p.name === "advanced")?.name || proposed[0]?.name;
-  const next = { ...withHostModels(config, proposed), defaultModelProfile };
+  const next = { ...withRunnerModels(config, runner, proposed), defaultModelProfile };
   const changes = current.map(profile => {
     const replacement = proposed.find(p => p.name === profile?.name);
     return { profile: profile?.name || null, before: profile, after: replacement || null,
       action: !replacement ? "remove" : JSON.stringify(profile) === JSON.stringify(replacement) ? "keep" : "update" };
   }).concat(proposed.filter(p => !current.some(old => old?.name === p.name)).map(p => ({ profile: p.name, action: "add", after: p })));
-  return { checkedAt: catalog.checkedAt, executor: catalog.command,
+  return { runner, checkedAt: catalog.checkedAt, executor: catalog.command,
     models: visibleModels(catalog), diagnostics, current: { models: current, defaultModelProfile: config.defaultModelProfile || "expert" },
     changes,
     proposed: { models: proposed, defaultModelProfile },

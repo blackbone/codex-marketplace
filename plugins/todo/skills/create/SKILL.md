@@ -42,7 +42,7 @@ Use `modelDiagnostics` and `modelProfiles` returned by preflight when selecting 
    - Set `allowWorkerTaskCreation: true` only when the current user explicitly instructs this task's worker to create follow-up ToDo tasks. Include the exact delegation scope and requested model profiles in the description; never infer permission.
    - Omit `delivery` to use the repository default. Set `pr` only when the user explicitly requests a pull request.
 6. Use `runMode: "interactive"` only when the user explicitly requests current-thread execution.
-7. Background tasks use persistent app-server sessions. The legacy `ephemeral` field does not switch the transport.
+7. Background tasks use persistent sessions of the configured runner (Codex app-server by default, or the Claude Code CLI when `runner` is `claude`). The legacy `ephemeral` field does not switch the transport.
 8. Use `runner_status` to verify queue execution. Start a stopped runner with `runner_start` when work is ready; never call host automation or desktop application tools.
 9. Do not implement the queued task in the interactive session unless current-thread-only capabilities are independently required or the user explicitly asks for current-thread execution.
 10. Return only the task ID and initial status for the implementation portion, and any separate runner startup error.

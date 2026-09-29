@@ -46,6 +46,7 @@ import {
   waitForTaskInput,
   updateTask,
   todoDir,
+  runnerExecutable,
 } from "./lib.mjs";
 import { HOST_MANIFEST, HOST_MISMATCH } from "./host.mjs";
 import { signalDaemon } from "./daemon-process.mjs";
@@ -1220,14 +1221,14 @@ function preflightPath(repoRoot, id) {
   return path.join(todoDir(repoRoot), "preflight", `${id}.json`);
 }
 
-function requiredLocalChecks(deliveries, push = false, executionMode = "worktree") {
+function requiredLocalChecks(deliveries, push = false, executionMode = "worktree", runner = "codex") {
   const checks = [
     "config",
     "runtime",
     "git-root",
     "git-target",
     "git-identity",
-    "codex-command",
+    runner === "claude" ? "claude-command" : "codex-command",
     executionMode === "single-branch" ? "git-current-copy" : "git-worktree",
   ];
   if (executionMode !== "single-branch" && deliveries.includes("merge")) checks.push("git-merge-target");
@@ -1238,7 +1239,7 @@ function requiredLocalChecks(deliveries, push = false, executionMode = "worktree
 
 async function taskPreflight(repoRoot, args) {
   let config = loadConfig(repoRoot);
-  if (!config.readError) await refreshModelCatalog(repoRoot, config.codexCommand);
+  if (!config.readError) await refreshModelCatalog(repoRoot, runnerExecutable(config), { runner: config.runner });
   config = loadConfig(repoRoot);
   const deliveries = [
     ...new Set(
@@ -1322,15 +1323,20 @@ async function taskPreflight(repoRoot, args) {
             : { status: "failed", summary: "Git user.name/user.email missing" };
         },
       },
-      {
-        name: "codex-command",
-        run: () =>
-          commandCheck(
-            config.codexCommand,
-            ["app-server", "--help"],
-            repoRoot,
-          ),
-      },
+      config.runner === "claude"
+        ? {
+            name: "claude-command",
+            run: () => commandCheck(config.claudeCommand, ["--version"], repoRoot),
+          }
+        : {
+            name: "codex-command",
+            run: () =>
+              commandCheck(
+                config.codexCommand,
+                ["app-server", "--help"],
+                repoRoot,
+              ),
+          },
       {
         name: config.git.executionMode === "single-branch" ? "git-current-copy" : "git-worktree",
         run: () => {
@@ -1472,7 +1478,7 @@ function validatedPreflight(
     repoRoot,
     config: preflightBindingConfig(config, targetBranch),
     requiredCapabilities: args.requiredCapabilities || [],
-    requiredLocalChecks: requiredLocalChecks(deliveries, config.git.push, config.git.executionMode),
+    requiredLocalChecks: requiredLocalChecks(deliveries, config.git.push, config.git.executionMode, config.runner),
   });
   return {
     receipt,
@@ -1523,7 +1529,7 @@ async function callTool(name, args = {}, metadata = {}) {
     case "model_profiles": {
       const root = activatedRepo(args);
       const config = loadConfig(root);
-      const catalog = await refreshModelCatalog(root, config.codexCommand, { force: true });
+      const catalog = await refreshModelCatalog(root, runnerExecutable(config), { force: true, runner: config.runner });
       if (args.action === "apply") {
         if (process.env.TODO_RUNNER_WORKER === "1") throw new Error("Background workers cannot update model profiles");
         return applyModelProfilePlan(root, catalog, args.planId);

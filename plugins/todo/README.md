@@ -145,6 +145,32 @@ starts and archives it whenever that attempt ends, including failure and daemon
 shutdown. Retries and `$todo:reopen` unarchive that same thread before the next
 turn.
 
+### Claude Code runner
+
+Set **Runner** to *Claude Code CLI* in dashboard settings (or `"runner": "claude"`
+in `.todo/config.json`) to execute background turns with the Claude Code CLI
+instead of the Codex app-server. The repository stays claimed by Codex; only the
+worker executor changes. Each turn is one `claude -p` stream-json process in the
+task worktree: the first turn creates a Claude session with `--session-id`, and
+retries, repairs, and pipeline steps continue it with `--resume`. Events, token
+usage, and the structured result are recorded like app-server turns, and
+**Steer**/stop act on the running process.
+
+- `claudeCommand` (default `claude`) selects the executable; preflight checks it
+  with `claude --version` instead of checking `codex app-server`.
+- Profile names stay the same and map to Claude models (see the table below).
+  Custom Claude profiles live under `models.claude`, the same key the Claude
+  Code fork uses; the Codex profiles are untouched.
+- `codexSandbox` maps to Claude Code permission modes: `workspace-write` accepts
+  edits and runs shell commands only inside the Claude Code sandbox (worktree
+  writes, no network, never unsandboxed); `read-only` allows read tools only;
+  `danger-full-access` bypasses permissions.
+- Each turn loads this plugin's ToDo MCP server through `--mcp-config`, so
+  authorized workers can still create follow-up tasks.
+- A task thread records its runner. After switching runners, a task whose
+  thread belongs to the other runner starts a new session with the full task
+  prompt; active tasks finish on the runner they started with.
+
 ## Ponytail full lifecycle
 
 Every activated session, submitted prompt, and started subagent receives the
@@ -494,8 +520,8 @@ same operation; do not edit task metadata or reservation files manually.
 Hover over a task's **Profile** to see its currently configured model and reasoning
 effort. Click the profile to filter tasks by that profile.
 
-Use **Settings** in the dashboard to edit worker count, the default model
-profile, target branch, Git execution/delivery mode, remote/push, retries, and
+Use **Settings** in the dashboard to edit the runner (Codex app-server or Claude
+Code CLI), worker count, the default model profile, target branch, Git execution/delivery mode, remote/push, retries, and
 poll/reload intervals. Branch suggestions come from local Git branches; an empty
 target uses the branch active at preflight. Single-branch mode runs one worker
 and disables push. Saves validate input, preserve other fields, and reject stale
@@ -567,7 +593,8 @@ the escalation policy above. Active attempts keep the model selected at start.
 each host-confirmed Codex thread. An occupied reservation is atomically replaced
 after a new listener succeeds. `retries` is a non-negative integer or `-1` for
 unlimited retries. `executionBackend` uses `app-server`;
-legacy `exec` settings are migrated to app-server when the next attempt starts. `git.delivery` accepts
+legacy `exec` settings are migrated to app-server when the next attempt starts. `runner` accepts `codex`
+(default) or `claude`; see [Claude Code runner](#claude-code-runner). `git.delivery` accepts
 `keep` or `merge`; pull
 requests are an explicit per-task choice. `git.targetBranch: null` resolves to the
 branch active at preflight, and `git.remote` defaults to `origin`. The daemon
@@ -589,6 +616,21 @@ for existing tasks; built-in profiles combine GPT-6 Luna/Sol, GPT-5.6 Sol, and G
 | `advanced` | `gpt-5.6-sol` | `max` |
 | `expert` | `gpt-6-astra` | `xhigh` |
 | `ultra` | `gpt-6-astra` | `max` |
+
+With `"runner": "claude"` the same profiles use Claude models:
+
+| Profile | Model | Reasoning |
+| --- | --- | --- |
+| `mini` | `claude-haiku-4-5` | `low` |
+| `fast` | `claude-haiku-4-5` | `medium` |
+| `standard` | `claude-sonnet-5-5` | `low` |
+| `medium` | `claude-sonnet-5-5` | `medium` |
+| `proven` | `claude-sonnet-5-5` | `high` |
+| `advanced` | `claude-opus-5-5` | `max` |
+| `expert` | `claude-fable-5-1` | `xhigh` |
+| `ultra` | `claude-fable-5-1` | `max` |
+
+Haiku 4.5 has no effort control, so `mini` and `fast` run the same model.
 
 GPT-6 Luna/Sol handle routine work at low through high effort. Heavy debugging
 and substantial refactoring use GPT-5.6 Sol at max (`advanced`), followed by
@@ -645,9 +687,9 @@ removed or its current model is still unsupported, the task reports that exact
 problem instead of selecting a different profile. Runtime model catalogs and config
 backups are local data and must not be committed.
 
-Advanced local execution fields `codexCommand` and `codexSandbox` are also
-supported. The default sandbox is `workspace-write`. A change to the backend or
-Codex command takes effect for newly claimed tasks; existing tasks retain their
+Advanced local execution fields `codexCommand`, `claudeCommand`, and
+`codexSandbox` are also supported. The default sandbox is `workspace-write`. A
+change to the runner, backend, or executor command takes effect for newly claimed tasks; existing tasks retain their
 snapshotted backend and profile name; the model is resolved at the next attempt.
 
 ## Repository execution pipelines
@@ -869,6 +911,10 @@ or invalid configuration reports `update-blocked` instead of interrupting work.
   securely erase its persisted Codex rollout record.
 - `app-server` is still an experimental Codex CLI surface; protocol failures are
   recorded as transient task failures and retried in the saved thread.
+- The Claude Code runner needs an installed, signed-in Claude Code CLI. It has
+  no user-input requests during a turn (workers return `requiresInteractive`
+  instead), no thread archive, and no thread titles; switching runners does not
+  carry a task conversation across runners.
 - Preflight validates availability at creation time; it cannot guarantee that a
   connector or remote service stays available throughout execution.
 - Task workers use isolated worktrees by default (or the shared current copy in

@@ -67,6 +67,7 @@ import {
   taskIdFromFilename,
   todoDir,
   updateTaskCodexThread,
+  runnerExecutable,
   writeTask,
 } from "./lib.mjs";
 import {
@@ -74,6 +75,8 @@ import {
   parseAppServerExecutionStats,
 } from "./execution-stats.mjs";
 import { AppServerClient } from "./app-server-client.mjs";
+import { ClaudeRunnerClient } from "./claude-runner.mjs";
+import { DEFAULT_RUNNER } from "./model-profiles.mjs";
 import { HOST_ID, threadIsForeign } from "./host.mjs";
 import { DesktopTitleClient } from "./desktop-title.mjs";
 import { combineUsage } from "./usage-recovery.mjs";
@@ -113,8 +116,23 @@ let configAppliedAt = null;
 let configReloadWarning = null;
 let deactivationDeferred = false;
 let runtimeUpdateRequest = null;
-let appServer = null;
-let appServerStartPromise = null;
+// One executor client per runner. Tasks keep the runner that owns their thread.
+const executors = new Map();
+const executorStarts = new Map();
+const RUNNER_LABELS = {
+  codex: { turn: "Codex turn", thread: "Codex thread", source: "codex app-server JSON-RPC", client: "Codex app-server" },
+  claude: { turn: "Claude turn", thread: "Claude session", source: "claude -p stream-json", client: "Claude runner" },
+};
+const runnerOf = (config) => config?.runner || DEFAULT_RUNNER;
+const runnerLabel = (runner) => RUNNER_LABELS[runner] || RUNNER_LABELS[DEFAULT_RUNNER];
+const threadRunner = (thread) => thread?.runner || DEFAULT_RUNNER;
+// A thread of another host or runner cannot be resumed by this executor.
+const threadResumable = (thread, runner) =>
+  Boolean(thread?.id) && !threadIsForeign(thread) && threadRunner(thread) === runner;
+function executorPid(entry) {
+  if (!entry?.threadId) return null;
+  return executors.get(entry.runner || runnerOf(runtimeConfig))?.pid || null;
+}
 let dashboardSyncPromise = null;
 let supervisorTitleSyncPromise = null;
 let supervisorTitleSyncQueued = false;
@@ -183,7 +201,7 @@ function writeState(status = null) {
       id,
       status: entry ? "busy" : "idle",
       runner: "node",
-      pid: entry?.child?.pid || (entry?.threadId ? appServer?.pid : null),
+      pid: entry?.child?.pid || executorPid(entry),
       daemonPid: process.pid,
       taskId: entry?.taskId || null,
       taskTitle: entry?.taskTitle || null,
@@ -197,7 +215,7 @@ function writeState(status = null) {
       id: entry.workerId,
       status: "draining",
       runner: "node",
-      pid: entry.child?.pid || (entry.threadId ? appServer?.pid : null),
+      pid: entry.child?.pid || executorPid(entry),
       daemonPid: process.pid,
       taskId: entry.taskId,
       taskTitle: entry.taskTitle,
@@ -240,7 +258,8 @@ function writeState(status = null) {
       dashboardPort: config.dashboardPort,
       retries: config.retries,
       executionBackend: config.executionBackend,
-      appServerPid: appServer?.pid || null,
+      runner: runnerOf(config),
+      appServerPid: executors.get(runnerOf(config))?.pid || null,
       codexSandbox: config.codexSandbox,
       modelProfiles: config.modelProfiles,
       defaultModelProfile: config.defaultModelProfile,
@@ -269,7 +288,7 @@ function writeState(status = null) {
     },
     mergeRepairWorker: {
       status: repairEntry ? "busy" : "idle",
-      pid: repairEntry?.threadId ? appServer?.pid || null : null,
+      pid: executorPid(repairEntry),
       taskId: repairEntry?.taskId || null,
       taskTitle: repairEntry?.taskTitle || null,
     },
@@ -287,7 +306,9 @@ const RUNTIME_CONFIG_KEYS = [
   "retries",
   "executionBackend",
   "gitExclude",
+  "runner",
   "codexCommand",
+  "claudeCommand",
   "codexSandbox",
   "modelProfiles",
   "defaultModelProfile",
@@ -536,14 +557,14 @@ function buildPrompt(task, worktreePath) {
   ].join("\n");
 }
 
-function buildAppServerPrompt(task, worktreePath, claim) {
-  // A thread created by another host cannot be resumed; start fresh.
-  if (!task.metadata.codexThread?.id || threadIsForeign(task.metadata.codexThread)) {
+function buildAppServerPrompt(task, worktreePath, claim, runner = DEFAULT_RUNNER) {
+  // A thread created by another host or runner cannot be resumed; start fresh.
+  if (!threadResumable(task.metadata.codexThread, runner)) {
     return buildPrompt(task, worktreePath);
   }
   const previousError = task.metadata.error?.message;
   return [
-    `Continue ToDo task ${task.id} in the existing Codex thread.`,
+    `Continue ToDo task ${task.id} in the existing ${runnerLabel(runner).thread}.`,
     singleBranchInstructions(task, worktreePath),
     `This is ${claim.trigger || "manual_retry"} attempt ${claim.attempt || 1}.`,
     `The current task worktree is ${worktreePath}.`,
@@ -562,7 +583,7 @@ function buildPipelineStepPrompt(
   worktreePath,
   step,
   context,
-  { continueThread = false } = {},
+  { continueThread = false, runner = DEFAULT_RUNNER } = {},
 ) {
   const previousSummaries = context.executions
     .filter(
@@ -599,7 +620,7 @@ function buildPipelineStepPrompt(
     failurePayload
       ? `The deterministic pipeline step failed. Repair the worktree so the step passes. Do not lower quality thresholds, disable checks, or remove meaningful tests unless the task explicitly requires it.\n\nFailure receipt:\n${failurePayload}`
       : null,
-    "The runner executes the configured shell gates authoritatively after agent steps. Do not proactively rerun those full commands inside this Codex step; use only a narrower diagnostic command when it is necessary to implement or repair the change.",
+    "The runner executes the configured shell gates authoritatively after agent steps. Do not proactively rerun those full commands inside this agent step; use only a narrower diagnostic command when it is necessary to implement or repair the change.",
     WORKER_TOOLING_BOUNDARY,
     "Do not run Git mutation or delivery commands; the ToDo runner owns Git finalization.",
     "Return only the JSON object required by the pipeline step output schema. Validation may be empty because the runner executes authoritative shell gates.",
@@ -608,7 +629,7 @@ function buildPipelineStepPrompt(
     .join("\n\n");
   if (continueThread) {
     return [
-      `Continue ToDo task ${task.id} in its existing Codex thread.`,
+      `Continue ToDo task ${task.id} in its existing ${runnerLabel(runner).thread}.`,
       `The current task worktree is ${worktreePath}.`,
       "Reuse the requirements and repository findings already present in this thread.",
       stage,
@@ -683,17 +704,19 @@ function attemptFailure(
   };
 }
 
-async function ensureAppServer(config) {
-  if (appServer?.running) return appServer;
-  if (appServerStartPromise) return appServerStartPromise;
-  appServerStartPromise = (async () => {
-    if (appServer) {
-      await appServer.close().catch(() => {});
-      appServer = null;
+async function ensureAppServer(config, runner = runnerOf(config)) {
+  const current = executors.get(runner);
+  if (current?.running) return current;
+  if (executorStarts.has(runner)) return executorStarts.get(runner);
+  const start = (async () => {
+    if (current) {
+      await current.close().catch(() => {});
+      executors.delete(runner);
     }
-    const stderrPath = path.join(todoDir(repoRoot), "app-server.stderr.log");
-    const client = new AppServerClient({
-      command: config.codexCommand,
+    const stderrPath = path.join(todoDir(repoRoot), runner === "claude" ? "claude-runner.stderr.log" : "app-server.stderr.log");
+    const Client = runner === "claude" ? ClaudeRunnerClient : AppServerClient;
+    const client = new Client({
+      command: runner === "claude" ? config.claudeCommand : config.codexCommand,
       cwd: repoRoot,
       env: {
         ...process.env,
@@ -705,8 +728,8 @@ async function ensureAppServer(config) {
     });
     try {
       await client.start();
-      appServer = client;
-      log("app_server_start", { pid: client.pid });
+      executors.set(runner, client);
+      log("app_server_start", { runner, pid: client.pid });
       writeState();
       return client;
     } catch (error) {
@@ -714,15 +737,23 @@ async function ensureAppServer(config) {
       throw error;
     }
   })();
+  executorStarts.set(runner, start);
   try {
-    return await appServerStartPromise;
+    return await start;
   } finally {
-    appServerStartPromise = null;
+    executorStarts.delete(runner);
   }
 }
 
+async function closeExecutors() {
+  const clients = [...executors.values()];
+  executors.clear();
+  await Promise.all(clients.map((client) => client.close().catch(() => {})));
+}
+
 const interaction = createTaskInteraction({
-  repoRoot, active, getAppServer: () => appServer,
+  repoRoot, active,
+  getAppServer: (entry) => executors.get(entry?.runner || runnerOf(runtimeConfig)),
   onChange: () => scheduleSupervisorThreadTitleSync(runtimeConfig),
 });
 const taskAction = interaction.action;
@@ -766,7 +797,8 @@ async function syncSupervisorThreadTitle(config) {
   };
 
   try {
-    const client = desktopTitleClient || await ensureAppServer(config);
+    // The supervisor is a Codex host thread whatever runner executes tasks.
+    const client = desktopTitleClient || await ensureAppServer(config, "codex");
     // A timed-out rename may have applied. Do not retain an older success key.
     lastSupervisorTitleSuccessKey = null;
     await client.setThreadName(threadId, title);
@@ -825,7 +857,8 @@ function scheduleSupervisorThreadTitleSync(config) {
 }
 
 async function loadTaskThread(taskPath, execution, worktreePath, config) {
-  const client = await ensureAppServer(config);
+  const runner = runnerOf(config);
+  const client = await ensureAppServer(config, runner);
   let task = readTask(taskPath);
   let thread = task.metadata.codexThread;
   const common = {
@@ -834,7 +867,7 @@ async function loadTaskThread(taskPath, execution, worktreePath, config) {
     approvalPolicy: "never",
     sandbox: config.codexSandbox,
   };
-  if (!thread || threadIsForeign(thread)) {
+  if (!threadResumable(thread, runner)) {
     const started = await client.startThread({
       ...common,
       serviceName: "todo",
@@ -842,13 +875,14 @@ async function loadTaskThread(taskPath, execution, worktreePath, config) {
     thread = updateTaskCodexThread(taskPath, {
       id: started.id,
       host: HOST_ID,
+      runner,
       state: "active",
       createdAt: new Date().toISOString(),
       name: undefined,
       lastTurnId: undefined,
       archivedAt: undefined,
     });
-    log("task_thread_created", { task: task.id, threadId: thread.id });
+    log("task_thread_created", { task: task.id, threadId: thread.id, runner });
     await nameTaskThread(client, taskPath, task);
     return thread;
   }
@@ -889,7 +923,7 @@ async function archiveTaskThread(taskPath, config) {
   updateTaskCodexThread(taskPath, { state: "archive-pending" });
   // Another host's thread is not reachable from this executor.
   if (!threadIsForeign(thread)) {
-    const client = await ensureAppServer(config);
+    const client = await ensureAppServer(config, threadRunner(thread));
     await archiveThreadIdempotently(client, thread.id);
   }
   updateTaskCodexThread(taskPath, {
@@ -932,7 +966,7 @@ async function processPendingThreadArchives(config) {
     try {
       receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
       if (!threadIsForeign(receipt.codexThread)) {
-        const client = await ensureAppServer(config);
+        const client = await ensureAppServer(config, threadRunner(receipt.codexThread));
         await archiveThreadIdempotently(client, receipt.codexThread.id);
       }
       markClosedTaskThreadArchived(receiptPath);
@@ -1046,6 +1080,8 @@ async function executeDeliveryOnly(taskPath, claim, workerId, config) {
 }
 
 async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
+  const runner = runnerOf(config);
+  const labels = runnerLabel(runner);
   let task = readTask(taskPath);
   const isMergeRepair = task.metadata.git?.phase === "merge-conflict";
   if (
@@ -1102,7 +1138,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
   const promptPath = path.join(attemptDir, "prompt.txt");
   const executionPrompt = isMergeRepair
     ? buildMergeConflictPrompt(task, preparedGit.worktreePath, claim)
-    : buildAppServerPrompt(task, preparedGit.worktreePath, claim);
+    : buildAppServerPrompt(task, preparedGit.worktreePath, claim, runner);
   const outputSchema = singleBranchOutputSchema(JSON.parse(readFileSync(resultSchema, "utf8")), task);
   writeFileSync(promptPath, `${executionPrompt}\n`, "utf8");
   const claimedAt = Date.parse(claim.claimedAt);
@@ -1120,6 +1156,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
     startedAt: new Date(startedAt).toISOString(),
     worker: workerId,
     backend: "app-server",
+    runner,
     modelProfile: execution.modelProfile,
     model: execution.model,
     reasoningEffort: execution.reasoningEffort,
@@ -1143,7 +1180,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
     model: execution.model,
     reasoningEffort: execution.reasoningEffort,
     threadId: task.metadata.codexThread?.id || null,
-    source: "codex app-server JSON-RPC",
+    source: labels.source,
     eventsFile: path.basename(stdoutPath),
     promptFile: path.basename(promptPath),
     tokenUsage: emptyTokenUsage(),
@@ -1168,7 +1205,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
     threadId = thread.id;
     const client = await ensureAppServer(config);
     const entry = active.get(task.id);
-    if (entry) entry.threadId = threadId;
+    if (entry) Object.assign(entry, { threadId, runner });
     recordSingleBranchExecutor(repoRoot, taskPath, claim, "app-server", { pid: client.pid });
     turnId = await client.startTurn(
       {
@@ -1198,7 +1235,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
     recordSingleBranchExecutor(repoRoot, taskPath, claim, "app-server", null);
     if (turn.status !== "completed") {
       const error = new Error(
-        turn.error?.message || `Codex turn ended with status ${turn.status}`,
+        turn.error?.message || `${labels.turn} ended with status ${turn.status}`,
       );
       error.kind = turn.status === "interrupted" ? "interrupted" : "app_server";
       throw error;
@@ -1209,7 +1246,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
         .find((candidate) => candidate?.type === "agentMessage");
       finalMessage = item?.text || null;
     }
-    if (!finalMessage) throw new Error("Codex app-server returned no final result");
+    if (!finalMessage) throw new Error(`${labels.client} returned no final result`);
     writeFileSync(resultPath, finalMessage, "utf8");
   } catch (error) {
     runError = error;
@@ -1405,7 +1442,7 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
           model: execution.model,
           reasoningEffort: execution.reasoningEffort,
           stats: executionStats,
-          source: "codex app-server JSON-RPC",
+          source: labels.source,
         }),
         attemptId: claim.attemptId,
         retryOf: claim.retryOf,
@@ -1436,6 +1473,8 @@ async function executeTaskWithAppServer(taskPath, claim, workerId, config) {
 }
 
 async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
+  const runner = runnerOf(config);
+  const labels = runnerLabel(runner);
   let task = readTask(taskPath);
   if (
     ["model-completed", "committing", "committed", "delivered"].includes(
@@ -1548,7 +1587,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
       preparedGit.worktreePath,
       step,
       context,
-      { continueThread: threadTurns > 0 },
+      { continueThread: threadTurns > 0, runner },
     );
     writeFileSync(promptPath, `${prompt}\n`, "utf8");
     const thread = await loadTaskThread(
@@ -1560,7 +1599,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
     threadId = thread.id;
     const client = await ensureAppServer(config);
     const entry = active.get(task.id);
-    if (entry) { entry.threadId = threadId; entry.turnId = null; }
+    if (entry) Object.assign(entry, { threadId, runner, turnId: null });
     let finalMessage = null;
     log("pipeline_step_start", {
       task: task.id,
@@ -1600,7 +1639,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
       recordSingleBranchExecutor(repoRoot, taskPath, claim, "app-server", null);
       if (turn.status !== "completed") {
         const error = new Error(
-          turn.error?.message || `Codex turn ended with status ${turn.status}`,
+          turn.error?.message || `${labels.turn} ended with status ${turn.status}`,
         );
         error.kind = turn.status === "interrupted" ? "interrupted" : "app_server";
         throw error;
@@ -1611,7 +1650,7 @@ async function executeTaskWithPipeline(taskPath, claim, workerId, config) {
           .find((candidate) => candidate?.type === "agentMessage");
         finalMessage = item?.text || null;
       }
-      if (!finalMessage) throw new Error("Codex app-server returned no pipeline result");
+      if (!finalMessage) throw new Error(`${labels.client} returned no pipeline result`);
       writeFileSync(resultPath, finalMessage, "utf8");
     } catch (error) {
       appendFileSync(stderrPath, `${error.stack || error.message}\n`, "utf8");
@@ -2011,9 +2050,10 @@ async function executeTask(taskPath, claim, workerId, config) {
         log("task_model_refreshed", { task: task.id, profile: execution.modelProfile,
           previousModel: previous.model, model: execution.model, reasoningEffort: execution.reasoningEffort });
       }
-      let catalog = await refreshModelCatalog(repoRoot, config.codexCommand);
+      const runner = runnerOf(config);
+      let catalog = await refreshModelCatalog(repoRoot, runnerExecutable(config), { runner });
       try { assertProfilesAvailable(profiles, catalog); }
-      catch { catalog = await refreshModelCatalog(repoRoot, config.codexCommand, { force: true }); }
+      catch { catalog = await refreshModelCatalog(repoRoot, runnerExecutable(config), { force: true, runner }); }
       assertProfilesAvailable(profiles, catalog);
       config = { ...config, modelCatalog: catalog };
     } catch (error) {
@@ -2426,8 +2466,9 @@ async function shutdown(signal) {
   const interrupted = [...active.values()];
   for (const entry of interrupted) {
     entry.abortController?.abort();
-    if (appServer && entry.threadId && entry.turnId) {
-      appServer.interruptTurn(entry.threadId, entry.turnId).catch((error) => {
+    const client = executors.get(entry.runner || runnerOf(runtimeConfig));
+    if (client && entry.threadId && entry.turnId) {
+      client.interruptTurn(entry.threadId, entry.turnId).catch((error) => {
         log("turn_interrupt_error", {
           task: entry.taskId,
           error: error.message,
@@ -2482,11 +2523,7 @@ async function shutdown(signal) {
     dashboard = null;
     await closeDashboard(server);
   }
-  if (appServer) {
-    const client = appServer;
-    appServer = null;
-    await client.close();
-  }
+  await closeExecutors();
   writeState("stopped");
   const current = readDaemonState(repoRoot);
   if (current?.token === daemonToken && existsSync(daemonStatePath(repoRoot))) {
@@ -2510,11 +2547,7 @@ async function shutdownForRuntimeUpdate() {
     dashboard = null;
     await closeDashboard(server);
   }
-  if (appServer) {
-    const client = appServer;
-    appServer = null;
-    await client.close();
-  }
+  await closeExecutors();
   const current = readDaemonState(repoRoot);
   if (current?.token === daemonToken && existsSync(daemonStatePath(repoRoot))) {
     unlinkSync(daemonStatePath(repoRoot));

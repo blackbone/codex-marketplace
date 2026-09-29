@@ -1,8 +1,8 @@
 import { withRepositoryExecution, reserveSingleBranch, checkpointSingleBranch, singleBranchIdentity,
   singleBranchPlan, prepareSingleBranch, commitSingleBranch, singleBranchFiles, singleBranchInstructions, activeSingleBranchExecutors, verifySingleBranchDelivery, assertSingleBranchCancellation, recoverSingleBranchHead } from "./single-branch.mjs";
-import { DEFAULT_MODEL_PROFILES, readModelCatalog, profileDiagnostic, profileUsable, assertProfilesAvailable } from "./model-profiles.mjs";
+import { DEFAULT_MODEL_PROFILES, DEFAULT_RUNNER, RUNNERS, configRunner, readModelCatalog, profileDiagnostic, profileUsable, assertProfilesAvailable, runnerCommand, runnerDefaultProfiles, runnerModels } from "./model-profiles.mjs";
 import { runShellCommand } from "./shell-step.mjs";
-import { assertRepoHost, daemonHost, HOST_ID, hostClaimRecord, hostModels, hostName, repoHostFromConfig } from "./host.mjs";
+import { assertRepoHost, daemonHost, HOST_ID, hostClaimRecord, hostName, repoHostFromConfig } from "./host.mjs";
 import { recoverUsageRuns, combineUsage } from "./usage-recovery.mjs";
 import {
   appendFileSync,
@@ -56,6 +56,11 @@ export const DEFAULT_RETRIES = 0;
 export const DAEMON_IMPLEMENTATION = "todo";
 export const DAEMON_PROTOCOL_VERSION = 2;
 export { DEFAULT_MODEL_PROFILES } from "./model-profiles.mjs";
+
+// The command of the configured runner (Codex app-server or Claude Code CLI).
+export function runnerExecutable(config) {
+  return config.runner === "claude" ? config.claudeCommand : config.codexCommand;
+}
 export const DEFAULT_MODEL_PROFILE = "expert";
 export const DEFAULT_ROUTING_MODE = "all-mutations";
 export const DEFAULT_EXECUTION_BACKEND = "app-server";
@@ -335,8 +340,8 @@ function integerInRange(value, min, max, fallback) {
     : fallback;
 }
 
-function normalizeModelProfiles(value) {
-  if (value === undefined) return { profiles: DEFAULT_MODEL_PROFILES, warning: null };
+function normalizeModelProfiles(value, defaults = DEFAULT_MODEL_PROFILES) {
+  if (value === undefined) return { profiles: defaults, warning: null };
   if (!Array.isArray(value) || value.length === 0) {
     return { profiles: [], warning: "Custom model profiles are invalid or outdated: models must be a non-empty array. Inspect model_profiles to review an update." };
   }
@@ -393,7 +398,9 @@ export function loadConfig(repoRoot) {
       retries: DEFAULT_RETRIES,
       executionBackend: DEFAULT_EXECUTION_BACKEND,
       gitExclude: [],
+      runner: DEFAULT_RUNNER,
       codexCommand: "codex",
+      claudeCommand: "claude",
       codexSandbox: "workspace-write",
       modelProfiles: DEFAULT_MODEL_PROFILES,
       defaultModelProfile: DEFAULT_MODEL_PROFILE,
@@ -437,7 +444,11 @@ export function loadConfig(repoRoot) {
   if (raw.executionBackend !== undefined && !["app-server", "exec"].includes(raw.executionBackend)) {
     warning = warning ? `${warning}; executionBackend must be app-server` : "executionBackend must be app-server";
   }
-  const normalizedProfiles = normalizeModelProfiles(hostModels(raw.models));
+  const runner = configRunner(raw);
+  if (raw.runner !== undefined && raw.runner !== runner) {
+    warning = warning ? `${warning}; runner must be ${RUNNERS.join(" or ")}` : `runner must be ${RUNNERS.join(" or ")}`;
+  }
+  const normalizedProfiles = normalizeModelProfiles(runnerModels(raw.models, runner), runnerDefaultProfiles(runner));
   if (normalizedProfiles.warning) {
     warning = warning ? `${warning}; ${normalizedProfiles.warning}` : normalizedProfiles.warning;
     readError = `Invalid custom model profiles: ${normalizedProfiles.warning}. Use model_profiles to inspect and update; no fallback model was selected.`;
@@ -560,16 +571,15 @@ export function loadConfig(repoRoot) {
     retries,
     executionBackend,
     gitExclude,
-    codexCommand:
-      typeof raw.codexCommand === "string" && raw.codexCommand.trim()
-        ? raw.codexCommand.trim()
-        : "codex",
+    runner,
+    codexCommand: runnerCommand(raw, "codex"),
+    claudeCommand: runnerCommand(raw, "claude"),
     codexSandbox: sandboxes.has(raw.codexSandbox)
       ? raw.codexSandbox
       : "workspace-write",
-    modelCatalog: readModelCatalog(repoRoot, typeof raw.codexCommand === "string" && raw.codexCommand.trim() ? raw.codexCommand.trim() : "codex"),
+    modelCatalog: readModelCatalog(repoRoot, runnerCommand(raw, runner), runner),
     modelDiagnostics: normalizedProfiles.profiles.map(profile => profileDiagnostic(profile,
-      readModelCatalog(repoRoot, typeof raw.codexCommand === "string" && raw.codexCommand.trim() ? raw.codexCommand.trim() : "codex"))),
+      readModelCatalog(repoRoot, runnerCommand(raw, runner), runner))),
     modelProfiles: normalizedProfiles.profiles,
     defaultModelProfile,
     routingMode,
@@ -970,7 +980,7 @@ function escalatedExecution(config, current) {
     (currentIndex >= 0 ? currentIndex : Math.max(0, fallbackIndex)) + 1,
   );
   const retryTargets = { mini: "fast", standard: "medium", proven: "advanced", fast: "medium", medium: "advanced", advanced: "expert", expert: "ultra", ultra: "ultra" };
-  const builtin = DEFAULT_MODEL_PROFILES.find(p => p.name === current.modelProfile && p.model === current.model);
+  const builtin = runnerDefaultProfiles(config.runner).find(p => p.name === current.modelProfile && p.model === current.model);
   const preferredIndex = builtin ? config.modelProfiles.findIndex(p => p.name === retryTargets[builtin.name]) : -1;
   const nextProfile = config.modelProfiles.slice(preferredIndex >= 0 ? preferredIndex : nextIndex).find(profile =>
     profileUsable(profileDiagnostic(profile, config.modelCatalog)));
