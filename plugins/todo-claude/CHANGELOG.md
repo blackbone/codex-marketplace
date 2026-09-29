@@ -1,5 +1,12 @@
 # Changelog
 
+## Model effort availability
+
+- Match the Codex fork's profile update guard: do not recommend a built-in
+  profile at a lower effort when its declared effort is unavailable.
+- Keep Claude model mappings unchanged; Sol 6.1 and Astra changes belong to the
+  Codex executor.
+
 ## Claude Code fork
 
 - Fork ToDo for Claude Code with the same `.todo/` state, tasks, pipelines,

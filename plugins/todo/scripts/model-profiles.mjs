@@ -20,12 +20,12 @@ export function runnerCommand(raw, runner = configRunner(raw)) {
 export const DEFAULT_MODEL_PROFILES = [
   { name: "mini", model: "gpt-6-luna", reasoningEffort: "low", description: "Small, mechanical edits and simple bounded fixes." },
   { name: "fast", model: "gpt-6-luna", reasoningEffort: "medium", description: "Mechanical edits, straightforward fixes, and cost-sensitive routine work." },
-  { name: "standard", model: "gpt-6-sol", reasoningEffort: "low", description: "Straightforward everyday implementation with clear requirements." },
-  { name: "medium", model: "gpt-6-sol", reasoningEffort: "medium", description: "Bounded implementation across several files; balanced everyday coding." },
-  { name: "proven", model: "gpt-6-sol", reasoningEffort: "high", description: "Multi-step engineering and debugging with high reasoning." },
-  { name: "advanced", model: "gpt-5.6-sol", reasoningEffort: "max", description: "Deep debugging and substantial refactoring with maximum reasoning." },
-  { name: "expert", model: "gpt-6-astra", reasoningEffort: "xhigh", description: "Most capable model for complex implementation work." },
-  { name: "ultra", model: "gpt-6-astra", reasoningEffort: "max", description: "Most capable model for very complex, high-risk, cross-cutting work." },
+  { name: "standard", model: "gpt-6.1-sol", reasoningEffort: "low", description: "Straightforward everyday implementation with clear requirements." },
+  { name: "medium", model: "gpt-6.1-sol", reasoningEffort: "medium", description: "Bounded implementation across several files; balanced everyday coding." },
+  { name: "proven", model: "gpt-6.1-sol", reasoningEffort: "high", description: "Multi-step engineering and debugging with high reasoning." },
+  { name: "advanced", model: "gpt-6.1-sol", reasoningEffort: "xhigh", description: "Deep debugging and substantial refactoring with extra-high reasoning." },
+  { name: "expert", model: "gpt-6.1-sol", reasoningEffort: "max", description: "Complex implementation and hard problems with maximum reasoning." },
+  { name: "ultra", model: "gpt-6.1-sol", reasoningEffort: "ultra", description: "Large, divisible tasks using Codex Ultra with subagents." },
 ];
 // Claude runner profiles keep the same names and roles; only the models differ.
 // Haiku 4.5 has no effort control, so mini and fast share one model. They are
@@ -57,6 +57,7 @@ export function withRunnerModels(raw, runner, profiles) {
 
 // Recognize exact previous defaults without overwriting intentional custom efforts or descriptions.
 const previousBuiltinProfiles = [
+  { name: "advanced", model: "gpt-5.6-sol", reasoningEffort: "max", description: "Deep debugging and substantial refactoring with maximum reasoning." },
   { name: "mini", model: "gpt-6-luna", reasoningEffort: "low", description: "Small, mechanical edits and simple bounded fixes." },
   { name: "fast", model: "gpt-6-luna", reasoningEffort: "medium", description: "Mechanical edits, straightforward fixes, and cost-sensitive routine work." },
   { name: "standard", model: "gpt-6-sol", reasoningEffort: "low", description: "Straightforward everyday implementation with clear requirements." },
@@ -75,7 +76,7 @@ const previousBuiltinProfiles = [
   { name: "expert", model: "gpt-6-astra", reasoningEffort: "xhigh", description: "Most capable model for complex implementation work." },
   { name: "ultra", model: "gpt-6-astra", reasoningEffort: "max", description: "Most capable model for very complex, high-risk, cross-cutting work." },
 ];
-const excludedModel = model => model === "gpt-5.3-codex-spark";
+const excludedModel = model => model === "gpt-5.3-codex-spark" || model === "gpt-6-astra";
 const legacyBuiltinModels = { mini: "gpt-5.4-mini", standard: "gpt-5.4", proven: "gpt-5.5", expert: "gpt-5.6-sol", ultra: "gpt-5.6-sol" };
 // Keep intentional custom profiles, but do not automatically add pre-5.6 GPT models.
 const legacyGeneration = model => {
@@ -145,7 +146,7 @@ export async function refreshModelCatalog(root, command = "codex", { force = fal
 }
 
 export function profileDiagnostic(profile, catalog) {
-  if (excludedModel(profile.model) || profile.name === "spark") return { name: profile.name, model: profile.model, status: "excluded", message: `Profile '${profile.name}' is excluded: Spark has been removed from ToDo. Use model_profiles to remove the outdated profile.` };
+  if (excludedModel(profile.model) || profile.name === "spark") return { name: profile.name, model: profile.model, status: "excluded", message: `Profile '${profile.name}' is excluded: ${profile.model === "gpt-6-astra" ? "Astra" : "Spark"} has been removed from ToDo. Use model_profiles to remove the outdated profile.` };
   if (!catalog) return { name: profile.name, model: profile.model, status: "unverified", message: "Executor availability has not been checked. Use model_profiles to refresh." };
   const model = catalog.models.find(m => m.model === profile.model);
   if (!model) return { name: profile.name, model: profile.model, status: "unsupported", message: `Profile '${profile.name}' is outdated or unavailable: model '${profile.model}' is not listed as supported by this executor. Review model_profiles before updating.` };
@@ -183,10 +184,9 @@ export function modelProfilePlan(root, catalog) {
       message: "Profiles are inherited from the plugin. Updating the plugin updates future attempts without writing a models block." };
   }
   const supported = visibleModels(catalog).filter(m => !m.hidden && !(m.retirementAt && m.retirementAt * 1000 <= Date.now()));
-  const recommended = defaults.filter(p => supported.some(m => m.model === p.model)).map(p => {
-    const model = supported.find(m => m.model === p.model);
-    return { ...p, reasoningEffort: model.efforts.includes(p.reasoningEffort) ? p.reasoningEffort : model.defaultEffort };
-  });
+  // Only recommend the declared effort; unavailable tiers must not silently downgrade.
+  const recommended = defaults.filter(p => supported.some(m =>
+    m.model === p.model && m.efforts.includes(p.reasoningEffort))).map(p => ({ ...p }));
   for (const model of supported) {
     // Former built-ins remain selectable, but migrating them must not rediscover them on the next inspection.
     if (legacyGeneration(model.model) || previousBuiltins.some(p => p.model === model.model)) continue;

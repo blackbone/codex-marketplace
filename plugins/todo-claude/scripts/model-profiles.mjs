@@ -117,10 +117,9 @@ export function modelProfilePlan(root, catalog) {
       message: "Profiles are inherited from the plugin. Updating the plugin updates future attempts without writing a models block." };
   }
   const supported = visibleModels(catalog).filter(m => !m.hidden && !(m.retirementAt && m.retirementAt * 1000 <= Date.now()));
-  const recommended = DEFAULT_MODEL_PROFILES.filter(p => supported.some(m => m.model === p.model)).map(p => {
-    const model = supported.find(m => m.model === p.model);
-    return { ...p, reasoningEffort: model.efforts.includes(p.reasoningEffort) ? p.reasoningEffort : model.defaultEffort };
-  });
+  // Only recommend the declared effort; unavailable tiers must not silently downgrade.
+  const recommended = DEFAULT_MODEL_PROFILES.filter(p => supported.some(m =>
+    m.model === p.model && m.efforts.includes(p.reasoningEffort))).map(p => ({ ...p }));
   for (const model of supported) {
     // Former built-ins remain selectable, but migrating them must not rediscover them on the next inspection.
     if (legacyGeneration(model.model) || previousBuiltinProfiles.some(p => p.model === model.model)) continue;

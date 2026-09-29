@@ -107,7 +107,7 @@ process.stdin.on("end", () => {
       "--ephemeral",
       "--dangerously-bypass-hook-trust",
       "--model",
-      "gpt-6-sol",
+      "gpt-6.1-sol",
       "--sandbox",
       "workspace-write",
       "-c",

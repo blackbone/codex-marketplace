@@ -577,9 +577,9 @@ proven → advanced, and fast → medium → advanced → expert → ultra, stay
 ultra after the highest tier is reached. Custom profiles retain array-order
 escalation. Retired or unsupported profiles are skipped; if no usable higher
 profile exists, retry stops with an update message.
-The default `expert` profile uses GPT-6 Astra with `xhigh` reasoning for complex
-work; `ultra` uses Astra with `max` reasoning for very complex work. Astra is
-OpenAI's most capable model ([model documentation](https://developers.openai.com/api/docs/models/gpt-6-astra)).
+The default `expert` profile uses GPT-6.1 Sol with `max` reasoning for complex
+work; `ultra` uses Sol 6.1 with Codex `ultra` for large tasks that benefit from
+subagents ([model and reasoning documentation](https://learn.chatgpt.com/docs/models)).
 New repositories omit `models` and inherit the plugin profiles, so a plugin
 update changes the effective models automatically. Existing explicit `models`
 arrays remain repository overrides; remove that array to inherit the plugin.
@@ -603,19 +603,29 @@ configuration without interrupting active tasks.
 
 ### Model availability and config updates
 
-Four current Codex models serve eight task profiles. Profile names remain stable
-for existing tasks; built-in profiles combine GPT-6 Luna/Sol, GPT-5.6 Sol, and GPT-6 Astra.
+Two Codex models serve eight task profiles. Profile names remain stable for
+existing tasks; GPT-6.1 Sol handles implementation and heavy work, while GPT-6
+Luna handles small, bounded tasks.
 
-| Profile | Model | Reasoning |
-| --- | --- | --- |
-| `mini` | `gpt-6-luna` | `low` |
-| `fast` | `gpt-6-luna` | `medium` |
-| `standard` | `gpt-6-sol` | `low` |
-| `medium` | `gpt-6-sol` | `medium` |
-| `proven` | `gpt-6-sol` | `high` |
-| `advanced` | `gpt-5.6-sol` | `max` |
-| `expert` | `gpt-6-astra` | `xhigh` |
-| `ultra` | `gpt-6-astra` | `max` |
+| Profile | Model | Reasoning | API input / cached input / output per 1M tokens |
+| --- | --- | --- | --- |
+| `mini` | `gpt-6-luna` | `low` | $0.10 / $0.01 / $0.50 |
+| `fast` | `gpt-6-luna` | `medium` | $0.10 / $0.01 / $0.50 |
+| `standard` | `gpt-6.1-sol` | `low` | $2 / $0.10 / $10 |
+| `medium` | `gpt-6.1-sol` | `medium` | $2 / $0.10 / $10 |
+| `proven` | `gpt-6.1-sol` | `high` | $2 / $0.10 / $10 |
+| `advanced` | `gpt-6.1-sol` | `xhigh` | $2 / $0.10 / $10 |
+| `expert` | `gpt-6.1-sol` | `max` | $2 / $0.10 / $10 |
+| `ultra` | `gpt-6.1-sol` | `ultra` | $2 / $0.10 / $10 |
+
+Prices are API Standard rates as of 2026-09-29 for requests with at most 272K
+input tokens, excluding cache writes, tools, and regional surcharges; they do
+not describe Codex subscription usage. See the [current API pricing](https://developers.openai.com/api/docs/pricing).
+Higher effort can increase total token usage. Codex Ultra uses subagents and is
+not an API reasoning effort; its row shows the base model rate, not a fixed
+price for an Ultra task. The executor must advertise `ultra` support before it
+can run that profile. Unavailable built-in efforts are not recommended at a
+lower effort during profile updates.
 
 With `"runner": "claude"` the same profiles use Claude models:
 
@@ -632,29 +642,21 @@ With `"runner": "claude"` the same profiles use Claude models:
 
 Haiku 4.5 has no effort control, so `mini` and `fast` run the same model.
 
-GPT-6 Luna/Sol handle routine work at low through high effort. Heavy debugging
-and substantial refactoring use GPT-5.6 Sol at max (`advanced`), followed by
-Astra at xhigh/max (`expert`/`ultra`). A newer generation is not an automatic
-quality upgrade.
-On [Bug Hunt Bench](https://bughunt.productcompass.pm/?preset=ceiling), as of
-2026-09-23, Sol 5.6/6 scored 43.5/29.3 and Luna 5.6/6 scored 31.3/18.3 planted
-bugs fixed out of 105 at max effort. This covers two repositories, with only two
-or three runs per configuration and different Codex CLI versions across
-generations; it is evidence for bug-fixing, not a universal intelligence ranking
-or proof of superiority at every effort level. See the
-[run notes](https://github.com/phuryn/bug-hunt-bench/blob/main/results/run-notes.md).
-The split keeps GPT-6 for cost-sensitive routine work and favors the observed
-GPT-5.6 Sol max configuration for heavy work. Supported custom models, including
-GPT-5.6 Luna, remain available.
+GPT-6.1 Sol is the primary implementation model. A newer generation is not an
+automatic quality upgrade: prior [Bug Hunt Bench](https://bughunt.productcompass.pm/?preset=ceiling)
+results comparing GPT-5.6 with GPT-6 do not establish GPT-6.1 performance.
+Supported custom models, including GPT-5.6 Sol and Luna, remain available for
+explicit selection and comparison.
 
-Explicit copies of earlier built-ins, including the GPT-6 defaults, can be
-migrated with `model_profiles`; supported custom efforts, descriptions, and named
-profiles are preserved. The update keeps the configured default and task profile
-names. A generation number alone does not mark a model unavailable or retired.
+Explicit copies of earlier built-ins, including GPT-6 defaults and GPT-5.6 Sol
+max, can be migrated with `model_profiles`. Supported custom efforts, descriptions,
+and named profiles are preserved except excluded Astra/Spark profiles. The update
+keeps task profile names and the configured default when that profile remains
+available. A generation number alone does not mark a model unavailable or retired.
 
 The executor's paginated `model/list` catalog determines availability for the
 actual account/CLI: the desktop picker can expose models that a background
-executor cannot yet use. Spark is excluded from profiles, execution, and
+executor cannot yet use. Astra and Spark are excluded from profiles, execution, and
 automatic model discovery.
 
 `task_preflight` returns model diagnostics. Before starting an agent, the runner

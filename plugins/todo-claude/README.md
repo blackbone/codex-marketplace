@@ -145,6 +145,9 @@ Built-in profiles keep the Codex names and task roles:
 | `expert` (default) | `claude-fable-5-1` | xhigh |
 | `ultra` | `claude-fable-5-1` | max |
 
+Profile updates only recommend built-ins at their declared supported effort;
+unavailable tiers are not silently downgraded.
+
 The model catalog is built in, because the Claude CLI does not list models;
 preflight checks that the CLI runs (`claude-command`). Pipelines keep their step
 types (`codex-exec`, `codex-thread`); both run as Claude sessions here.

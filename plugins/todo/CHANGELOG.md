@@ -1,5 +1,15 @@
 # Changelog
 
+## GPT-6.1 Sol profiles
+
+- Use Luna 6 for mini/fast and Sol 6.1 for standard through ultra at
+  low/medium/high/xhigh/max/ultra; explain Codex Ultra subagents and API prices.
+- Exclude Astra from execution and discovery. Migrate earlier built-in copies,
+  including Sol 5.6 max and Astra, while preserving supported custom profiles,
+  task names, pipelines, and the other runner's model configuration.
+- Do not silently downgrade unavailable built-in efforts during profile updates.
+  Claude runner models remain unchanged.
+
 ## Claude Code runner
 
 - Add an optional Claude Code CLI runner (`"runner": "claude"`) next to the

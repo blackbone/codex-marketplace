@@ -152,3 +152,23 @@ test("model updates write the Claude profiles and keep the Codex array", async (
     assert.equal(saved.models.claude.some(p => p.name === "retired"), false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+
+test("built-in recommendations do not downgrade unavailable efforts", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "todo-effort-availability-"));
+  try {
+    mkdirSync(path.join(root, ".todo"));
+    const file = path.join(root, ".todo/config.json");
+    const ultra = DEFAULT_MODEL_PROFILES.find(p => p.name === "ultra");
+    const catalog = { command: "claude", checkedAt: new Date().toISOString(), models: [
+      { model: ultra.model, efforts: ["low", "medium", "high"], defaultEffort: "medium" },
+    ] };
+    writeFileSync(file, "{}");
+    assert.equal(modelProfilePlan(root, catalog).diagnostics.find(p => p.name === "ultra").status, "unsupported-effort");
+    assert.throws(() => resolveTaskExecution({ ...loadConfig(root), modelCatalog: catalog }, { modelProfile: "ultra" }), /not supported/);
+    writeFileSync(file, JSON.stringify({ models: { claude: [] } }));
+    const plan = modelProfilePlan(root, catalog);
+    assert.ok(!plan.proposed.models.some(p => p.name === "ultra"));
+    assert.ok(plan.proposed.models.every(p => profileDiagnostic(p, catalog).status === "available"));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
