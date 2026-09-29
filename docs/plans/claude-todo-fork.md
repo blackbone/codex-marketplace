@@ -19,7 +19,11 @@
 |---|---|
 | Имя | Каталог `plugins/todo-claude`, имя в манифесте и Claude-каталоге — `todo`. Правило в `AGENTS.md` меняется |
 | Одновременная работа Codex и Claude | Запрещена; хост закрепляется за репозиторием |
-| Синхронизация форков | Без автоматической сверки; при каждом изменении ToDo — ручной агентный проход по функциональности второго форка |
+| Синхронизация форков | Без автоматической сверки; при каждом изменении ToDo — ручной агентный проход по функциональности второго форка. Правило записано в `AGENTS.md`; `CLAUDE.md` импортирует его (`@AGENTS.md`) |
+| Передача хоста | Автоматическая: репозиторий свободен, если PID из `.todo/daemon.json` не жив |
+| Права воркеров Claude | Аналоги режимов песочницы Codex (раздел 3) |
+| Профили моделей | Те же имена, что в Codex, с моделями Claude (раздел 3) |
+| Версии | Каждый форк поднимает свою версию |
 
 ## Структура
 
@@ -36,8 +40,8 @@ plugins/todo-claude/               Claude-форк
   assets/screenshots/, README.md, CHANGELOG.md
 ```
 
-Правка `AGENTS.md`: «имя записи в каталоге = имя в манифесте; каталог пакета совпадает с именем, кроме хостовых форков
-`plugins/<name>-<host>/`, которые указываются в каталоге этого хоста».
+Правка `AGENTS.md` уже сделана: исключение для хостовых форков `plugins/<name>-<host>/`, раздел «Host forks»
+(правки вносятся в оба форка, после них — агентный проход, host claim не ослаблять), валидаторы обоих хостов.
 
 ## 1. Host claim — в обоих форках
 
@@ -54,33 +58,33 @@ plugins/todo-claude/               Claude-форк
 
 | Точка | Поведение |
 |---|---|
-| Хуки `session-context.mjs` | Вместо политики маршрутизации внедряется короткое сообщение: «репозиторий закреплён за <host>; ToDo здесь выключен, передать репозиторий можно через `todo:init`» |
+| Хуки `session-context.mjs` | Если демон чужого хоста жив, вместо политики маршрутизации внедряется короткое сообщение: «репозиторий занят <host> (PID <pid>); ToDo здесь выключен». Если не жив — хост забирается автоматически (ниже) |
 | MCP | Изменяющие инструменты (`task_*`, `repo_init`, `runner_start`, `supervisor_bind` и т.д.) отказывают с кодом `HOST_MISMATCH`. Читающие (`todo_status`, `task_list`, `task_get`) работают |
 | Демон | `ensureDaemon()` не запускается; живой демон чужого хоста не трогает. Сейчас из-за перезапуска по отпечатку рантайма они вытесняли бы друг друга |
 | `daemon.json` | Хранит `host`; `manifestOwnsTodoDaemon()` проверяет свой манифест (`.codex-plugin` или `.claude-plugin`) и совпадение хоста |
 | Claims задач | В claim пишется `host`; `readClaim` и восстановление claims игнорируют чужой хост |
 
-Передача хоста (подхват): `repo_init` с `takeover: true` или отдельный инструмент `host_claim` / `host_release`.
+Передача хоста (подхват) — автоматическая, по PID демона:
 
-- **Предусловия:**
-  - нет живого демона или его удалось остановить через существующий `.daemon-stop.json` с ожиданием дренажа;
-  - нет активных claims `running`/`interactive`;
-  - merge queue пуста.
-- **Действия:**
-  - записывается `host`;
-  - у всех задач `codexThread.state` помечается как `foreign`: повтор или reopen начинают новую сессию у нового хоста, без resume;
-  - заново формируются профили моделей (раздел 3).
-- **Без предусловий** инструмент возвращает список блокирующих задач. Принудительный вариант не делаем.
+- **Проверка:** читается `.todo/daemon.json` (`readDaemonState()` в `lib.mjs`), жив ли процесс — существующие `liveDaemon()`
+  и `processIsAlive()` в `ensure-daemon.mjs`. Если `host` в конфиге совпадает со своим, ничего не делается.
+- **Демон чужого хоста жив** → репозиторий занят: изменяющие инструменты отказывают, в ответе указываются хост и PID.
+- **Демон не жив** (файла нет или PID мёртв) → при первом хуке или MCP-вызове форк забирает репозиторий:
+  - под существующим `.daemon-start.lock` записывает `host` и стартует свой демон;
+  - устаревшие claims чужого хоста снимаются тем же путём, что и сейчас при восстановлении после падения демона;
+  - у задач `codexThread.state` помечается как `foreign`: повтор или reopen начинают новую сессию у нового хоста, без resume;
+  - задачи в merge queue продолжаются новым демоном: слияние выполняет git, не модель.
+- Отдельных инструментов `host_claim` / `host_release` не нужно.
 
 Тесты в обоих форках:
 - отказ при чужом хосте (MCP и хуки);
 - демон не стартует и не вытесняет чужой;
-- подхват codex → claude и обратно;
+- подхват codex → claude и обратно при мёртвом PID; отказ при живом PID;
 - устаревший репозиторий без `host`.
 
 ## 2. Claude-форк: хост-интеграция
 
-- **Манифест** `.claude-plugin/plugin.json`: `name: "todo"`, `version` (своя линейка, например `0.1.0+claude.<ts>`), `description`, `author`, `repository`, `license`.
+- **Манифест** `.claude-plugin/plugin.json`: `name: "todo"`, `version` (своя, поднимается независимо от Codex-форка), `description`, `author`, `repository`, `license`.
 - **`.mcp.json`:** `{"todo":{"command":"node","args":["${CLAUDE_PLUGIN_ROOT}/scripts/mcp-server.mjs"],"env":{"PLUGIN_ROOT":"${CLAUDE_PLUGIN_ROOT}"}}}`.
 - **Хуки:** `SessionStart`, `UserPromptSubmit`, `SubagentStart` → `session-context.mjs`; `Stop` → `interactive-stop.mjs`.
   Exec-форма (`command: "node"`, `args: ["${CLAUDE_PLUGIN_ROOT}/scripts/…"]`) работает и на Windows. Поля `commandWindows` и `additionalContextLimit` убраны.
@@ -102,12 +106,39 @@ plugins/todo-claude/               Claude-форк
 |---|---|
 | `app-server-client.mjs` (JSON-RPC, постоянный thread) | `claude-client.mjs`: `claude -p --output-format stream-json --verbose --json-schema <schema> --model <id>`; первый ход с `--session-id <uuid>`, следующие — `--resume <uuid>` |
 | `executionBackend: app-server | exec` | `session` (resume) и `oneshot` (без resume) |
-| `codexCommand`, `codexSandbox` | `claudeCommand` (по умолчанию `claude`), `permissionMode` (`acceptEdits`/`dontAsk`), `allowedTools`; sandbox — через настройки Claude. Описать в README как поведение, чувствительное к безопасности |
+| `codexCommand`, `codexSandbox` | `claudeCommand` (по умолчанию `claude`); `codexSandbox` читается как есть и отображается на аналоги Claude (таблица ниже) |
 | Каталог моделей из `codex` | статический каталог Claude (Opus/Sonnet/Haiku), проверка в preflight |
-| Профили GPT | те же имена профилей (`mini`, `fast`, `medium`, `standard`, `advanced`, `expert`, `ultra`); модели и effort Claude |
+| Профили GPT | те же имена профилей, модели Claude (таблица ниже) |
 | Usage app-server | usage из `result`-события stream-json (input, output, cache read/write tokens, стоимость, число ходов) → `execution-stats.mjs`, attempt ledger |
 | Классификация ошибок | rate limit, overload, auth, превышение max-turns → `usage-recovery.mjs` |
 | `codex-command` в preflight | `claude-command`: версия CLI, аутентификация, доступность модели |
+
+Права воркеров — аналоги режимов Codex (воркер Codex работает с `approvalPolicy: "never"`, т.е. без вопросов):
+
+| `codexSandbox` | Claude-воркер |
+|---|---|
+| `read-only` | `--permission-mode dontAsk`, `--allowedTools` только читающие (Read, Grep, Glob, читающий Bash) |
+| `workspace-write` (по умолчанию) | `--permission-mode bypassPermissions` плюс песочница Claude (`--settings` с `sandbox.enabled: true`): запись только в worktree задачи, сеть выключена |
+| `danger-full-access` | `--permission-mode bypassPermissions` без песочницы |
+
+Описать в README как поведение, чувствительное к безопасности. Доступность песочницы проверяется в preflight; без неё
+`workspace-write` отказывает, а не расширяет права молча.
+
+Профили — те же имена и роли, модели Claude (аналоги по уровню: Luna → Haiku, Sol → Sonnet, 5.6 Sol max → Opus, Astra → Fable):
+
+| Профиль | Codex | Claude |
+|---|---|---|
+| `mini` | gpt-6-luna, low | `claude-haiku-4-5` |
+| `fast` | gpt-6-luna, medium | `claude-haiku-4-5` |
+| `standard` | gpt-6-sol, low | `claude-sonnet-5-5`, low |
+| `medium` | gpt-6-sol, medium | `claude-sonnet-5-5`, medium |
+| `proven` | gpt-6-sol, high | `claude-sonnet-5-5`, high |
+| `advanced` | gpt-5.6-sol, max | `claude-opus-5-5`, max |
+| `expert` | gpt-6-astra, xhigh | `claude-fable-5-1`, xhigh |
+| `ultra` | gpt-6-astra, max | `claude-fable-5-1`, max |
+
+Haiku 4.5 не поддерживает effort, поэтому `mini` и `fast` совпадают по модели. Если нужно различие, `fast` можно перевести на
+`claude-sonnet-5-5`, low. Флаг effort в `claude -p` проверить при реализации.
 
 - **Поле `metadata.codexThread`** в задаче не переименовывается (общий формат состояния). Добавляется `host`, по нему определяется, чей это поток.
 - **Конфиг моделей:** блок `models` в `.todo/config.json` становится хост-зависимым: `models.codex` и `models.claude`.
@@ -149,9 +180,3 @@ plugins/todo-claude/               Claude-форк
   5. `/todo:run` интерактивно; Stop освобождает claim.
   6. Codex-ToDo теперь видит чужой хост и отказывает.
 - Результат живого прогона (запись экрана или скриншоты дашборда) приложить к PR этапов 2–3.
-
-## Открытые вопросы
-
-1. Передача хоста: только явная (`todo:init` / `host_claim`) или автоматическая, когда репозиторий свободен (нет демона и claims)?
-2. Версии форков: общая линейка или раздельные (`+codex.*` / `+claude.*`)?
-3. Права воркеров Claude по умолчанию: `acceptEdits` плюс белый список инструментов или `bypassPermissions` внутри worktree?
