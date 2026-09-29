@@ -1,0 +1,34 @@
+version: 1
+name: required-quality
+steps:
+  - id: implement
+    type: codex-thread
+    prompt: |
+      Implement the task and self-review the resulting diff.
+
+  - id: build
+    type: shell
+    command: npm run build
+    timeoutSeconds: 600
+
+  - id: test
+    type: shell
+    command: npm test
+    timeoutSeconds: 900
+
+  - id: coverage
+    type: shell
+    command: npm run test:coverage
+    timeoutSeconds: 900
+
+  - id: lint
+    type: shell
+    command: npm run lint
+    timeoutSeconds: 600
+
+repair:
+  type: codex-thread
+  modelProfile: expert
+  maxRounds: 3
+  prompt: |
+    Repair the failed deterministic validation step without weakening the check.

@@ -1,6 +1,7 @@
-# blackbone Codex plugins
+# blackbone Codex and Claude Code plugins
 
-A Git-backed Codex marketplace for plugins maintained by [blackbone](https://github.com/blackbone).
+A Git-backed marketplace for Codex and Claude Code plugins maintained by
+[blackbone](https://github.com/blackbone).
 
 [![Tests](https://github.com/blackbone/codex-marketplace/actions/workflows/test.yml/badge.svg)](https://github.com/blackbone/codex-marketplace/actions/workflows/test.yml)
 
@@ -8,14 +9,26 @@ A Git-backed Codex marketplace for plugins maintained by [blackbone](https://git
 
 | Plugin | What it does | Package |
 | --- | --- | --- |
-| ToDo | Atomic repository task routing with optional YAML execution pipelines, persistent threads, deterministic gates, and telemetry. | [Documentation](plugins/todo/README.md) |
+| ToDo | Atomic repository task routing with optional YAML execution pipelines, persistent threads, deterministic gates, and telemetry. | Codex: [Documentation](plugins/todo/README.md) · Claude Code: [Documentation](plugins/todo-claude/README.md) |
 | Docs | Search local documentation with shared indexing, project-local SQLite indexes, and a live dashboard with project search. | [Documentation](plugins/docs/README.md) |
 | Unity | Open the current Unity project and run Editor actions through the official CLI, with Pipeline checks only on demand. | [Documentation](plugins/unity/README.md) |
 | Ori | Git-native product graphs, local semantic search, portable projections and isolated source execution. | [Documentation](plugins/ori/README.md) |
 
 ![ToDo plugin details](plugins/todo/assets/screenshots/plugin-details.png)
 
+Docs, Unity, and Ori are Codex plugins. ToDo ships for both hosts as two forks
+that share repository state; a repository is claimed by one host at a time.
+
 ## Install
+
+### Claude Code
+
+```text
+/plugin marketplace add blackbone/codex-marketplace
+/plugin install todo@blackbone
+```
+
+### Codex
 
 From GitHub:
 
@@ -44,8 +57,10 @@ codex plugin add todo@blackbone
 ## Repository layout
 
 ```text
-.agents/plugins/marketplace.json  Marketplace catalog
+.agents/plugins/marketplace.json  Codex marketplace catalog
+.claude-plugin/marketplace.json   Claude Code marketplace catalog
 plugins/<name>/                   Self-contained plugin packages
+plugins/<name>-claude/            Claude Code fork of a Codex plugin
 docs/ARCHITECTURE.md              Packaging and runtime boundaries
 tests/                            Marketplace contract tests
 ```
@@ -55,7 +70,8 @@ hooks, and runtime code. The root README is only the marketplace index.
 
 ## Development
 
-Requirements: Node.js 22.16 or newer, npm, Go 1.27.1 or newer, Git, and the Codex CLI.
+Requirements: Node.js 22.16 or newer, npm, Go 1.27.1 or newer, Git, the Codex
+CLI, and the Claude Code CLI for manifest validation.
 
 ```bash
 make test

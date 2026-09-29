@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["completed", "failed"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "error": {
+      "anyOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ]
+    },
+    "validation": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "requiresInteractive": {
+      "type": "boolean"
+    },
+    "interactiveReason": {
+      "anyOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ]
+    }
+  },
+  "required": [
+    "status",
+    "summary",
+    "error",
+    "validation",
+    "requiresInteractive",
+    "interactiveReason"
+  ],
+  "additionalProperties": false
+}

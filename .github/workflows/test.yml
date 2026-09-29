@@ -27,6 +27,11 @@ jobs:
         with:
           node-version: 22
 
+      - name: Validate Claude Code marketplace and plugins
+        run: |
+          npx -y @anthropic-ai/claude-code plugin validate --strict .
+          npx -y @anthropic-ai/claude-code plugin validate --strict plugins/todo-claude
+
       - name: Run tests
         run: make test
 

@@ -96,6 +96,37 @@ tasks, lets active work drain, and exits. The next hook or MCP boundary starts t
 new daemon and reloads configuration. Host-loaded skill and hook definitions need
 a new Codex session after an update.
 
+## Hosts and forks
+
+The repository serves two hosts. `.agents/plugins/marketplace.json` is the Codex
+catalog and `.claude-plugin/marketplace.json` is the Claude Code catalog. A
+package that runs on both hosts is either shared or, when its host integration
+and executor differ, split into host forks: `plugins/todo/` for Codex and
+`plugins/todo-claude/` for Claude Code, both listed as `todo` in their catalog.
+
+The ToDo forks share the `.todo/` state format, tasks, pipelines, routing rules,
+MCP tool contracts, dashboard, and model profile names. They differ only in:
+
+- the manifest, hooks, and MCP launch (`$PLUGIN_ROOT` versus exec-form hooks
+  with `${CLAUDE_PLUGIN_ROOT}`, and a second hook entry for the Ponytail contour
+  because Claude Code caps each injected context at 10,000 characters);
+- skill and prompt wording, and the managed routing file (`AGENTS.md` versus
+  `CLAUDE.md`);
+- the executor: the Codex fork drives `codex app-server`; the Claude fork's
+  `scripts/app-server-client.mjs` keeps the same client interface over
+  `claude -p` in stream-json mode, with one Claude session per task, structured
+  output for results, and a built-in model catalog;
+- interactive ownership: Codex passes thread and turn in MCP metadata; Claude
+  Code hooks record the session and prompt under the Claude process ID, which
+  the session's MCP server reads as its parent PID.
+
+`scripts/host.mjs` is identical in both forks except for the host identity. It
+records the owning host in `.todo/config.json` and refuses task changes, runner
+starts, and hook policy while a live runner or task claim of the other host
+works in the repository. A dead PID hands the repository to the host that acts
+next. Every functional change is made in both forks in the same change, followed
+by an agent pass over both forks' functionality.
+
 ## Release flow
 
 Package changes require a manifest version bump, contract and runtime validation,

@@ -1,0 +1,17 @@
+{
+  "name": "blackbone",
+  "owner": {
+    "name": "blackbone"
+  },
+  "metadata": {
+    "description": "Plugins maintained by blackbone for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "todo",
+      "source": "./plugins/todo-claude",
+      "description": "Atomic repository task routing with optional YAML execution pipelines, persistent threads, deterministic gates, and telemetry.",
+      "category": "productivity"
+    }
+  ]
+}

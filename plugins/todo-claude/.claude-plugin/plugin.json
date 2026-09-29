@@ -1,0 +1,20 @@
+{
+  "name": "todo",
+  "displayName": "ToDo",
+  "version": "0.1.0+claude.20260929125804",
+  "description": "Atomic repository task routing with optional YAML execution pipelines, persistent threads, deterministic gates, and telemetry.",
+  "author": {
+    "name": "blackbone"
+  },
+  "homepage": "https://github.com/blackbone/codex-marketplace/tree/main/plugins/todo-claude",
+  "repository": "https://github.com/blackbone/codex-marketplace",
+  "license": "MIT",
+  "keywords": [
+    "tasks",
+    "dag",
+    "pipelines",
+    "git",
+    "worktrees",
+    "dashboard"
+  ]
+}

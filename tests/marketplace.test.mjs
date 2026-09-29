@@ -150,3 +150,75 @@ test("packages exclude local Finder metadata", async () => {
     false,
   );
 });
+
+const claudeMarketplacePath = path.join(repoRoot, ".claude-plugin/marketplace.json");
+
+function claudeHookCommands(hooks) {
+  return Object.values(hooks.hooks).flatMap((groups) => groups.flatMap((group) => group.hooks));
+}
+
+test("Claude Code marketplace lists self-contained plugins and host forks", async () => {
+  const marketplace = await readJson(claudeMarketplacePath);
+  const codex = await readJson(marketplacePath);
+  assert.equal(marketplace.name, codex.name);
+  assert.equal(typeof marketplace.owner?.name, "string");
+  const readme = await readFile(path.join(repoRoot, "README.md"), "utf8");
+  const names = new Set();
+  for (const entry of marketplace.plugins) {
+    assert.equal(names.has(entry.name), false, `duplicate plugin ${entry.name}`);
+    names.add(entry.name);
+    const directory = path.basename(entry.source);
+    assert.match(entry.source, /^\.\/plugins\/[a-z0-9-]+$/);
+    assert.ok(directory === entry.name || directory === `${entry.name}-claude`, `${entry.source} is not ${entry.name} or its Claude fork`);
+    const root = path.resolve(repoRoot, entry.source);
+    const manifest = await readJson(path.join(root, ".claude-plugin/plugin.json"));
+    assert.equal(manifest.name, entry.name);
+    assert.match(manifest.version, /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
+    assert.equal(manifest.description, entry.description);
+    await access(path.join(root, "README.md"));
+    assert.match(readme, new RegExp(`plugins/${directory}/README\\.md`));
+    const codexEntry = codex.plugins.find((item) => item.name === entry.name);
+    if (codexEntry) {
+      const codexManifest = await readJson(path.join(packageRoot(codexEntry), ".codex-plugin/plugin.json"));
+      assert.equal(manifest.description, codexManifest.description, `${entry.name} descriptions diverge between hosts`);
+    }
+  }
+  assert.ok(names.has("todo"));
+});
+
+test("Claude Code hooks and MCP servers resolve from the installed plugin root", async () => {
+  const marketplace = await readJson(claudeMarketplacePath);
+  for (const entry of marketplace.plugins) {
+    const root = path.resolve(repoRoot, entry.source);
+    const hooksFile = path.join(root, "hooks/hooks.json");
+    for (const hook of claudeHookCommands(await readJson(hooksFile))) {
+      assert.equal(hook.type, "command");
+      assert.ok(Array.isArray(hook.args), "use exec form so paths stay single arguments on every platform");
+      assert.match(hook.args[0], /^\$\{CLAUDE_PLUGIN_ROOT\}\//);
+      await access(path.join(root, hook.args[0].replace("${CLAUDE_PLUGIN_ROOT}/", "")));
+      assert.doesNotMatch(JSON.stringify(hook), /\$PLUGIN_ROOT|commandWindows|additionalContextLimit/);
+    }
+    const mcp = await readJson(path.join(root, ".mcp.json"));
+    for (const server of Object.values(mcp.mcpServers)) {
+      assert.equal(server.cwd, undefined);
+      for (const arg of server.args) assert.match(arg, /^\$\{CLAUDE_PLUGIN_ROOT\}\//);
+      assert.doesNotMatch(JSON.stringify(server), /tool_timeout_sec|startup_timeout_sec|env_vars/);
+    }
+  }
+});
+
+test("ToDo host forks share skills and differ only in the host claim identity", async () => {
+  const codex = path.join(repoRoot, "plugins/todo");
+  const claude = path.join(repoRoot, "plugins/todo-claude");
+  const skills = async (root) => (await readdir(path.join(root, "skills"), { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+  assert.deepEqual(await skills(claude), await skills(codex));
+  const host = async (root) => (await readFile(path.join(root, "scripts/host.mjs"), "utf8"))
+    .replace(/^export const HOST_(?:ID|MANIFEST) = .*$/gm, "");
+  assert.equal(await host(claude), await host(codex));
+  assert.match(await readFile(path.join(codex, "scripts/host.mjs"), "utf8"), /^export const HOST_ID = "codex";$/m);
+  assert.match(await readFile(path.join(claude, "scripts/host.mjs"), "utf8"), /^export const HOST_ID = "claude";$/m);
+  const claudeManifest = await readJson(path.join(claude, ".claude-plugin/plugin.json"));
+  const codexManifest = await readJson(path.join(codex, ".codex-plugin/plugin.json"));
+  assert.equal(claudeManifest.name, codexManifest.name);
+});

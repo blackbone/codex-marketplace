@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "npm run test:contract && npm run test:docs && npm run test:unity && npm run test:models && npm run test:safety && npm run test:preflight && npm run test:pipeline && npm run test:app-server && npm run test:windows && npm run test:runtime && npm run test:git && npm run test:smoke && npm run test:ori",
+    "test": "npm run test:contract && npm run test:docs && npm run test:unity && npm run test:models && npm run test:safety && npm run test:preflight && npm run test:pipeline && npm run test:app-server && npm run test:windows && npm run test:runtime && npm run test:git && npm run test:smoke && npm run test:todo-claude && npm run test:ori",
     "test:unity": "node --test plugins/unity/scripts/test.mjs",
     "test:contract": "node --test tests/*.test.mjs plugins/todo/scripts/routing-policy-test.mjs",
     "test:docs": "node --test plugins/docs/scripts/test.mjs plugins/docs/scripts/dashboard-test.mjs",
@@ -17,6 +17,7 @@
     "test:models": "node --test plugins/todo/scripts/model-profiles-test.mjs",
     "test:safety": "node --test plugins/todo/scripts/host-claim-test.mjs plugins/todo/scripts/single-branch-test.mjs plugins/todo/scripts/runtime-safety-test.mjs plugins/todo/scripts/task-status-test.mjs plugins/todo/scripts/interactive-runtime-test.mjs plugins/todo/scripts/merge-repair-test.mjs",
     "test:ori": "sh plugins/ori/scripts/test.sh",
-    "test:windows": "node --test plugins/todo/scripts/windows-compat-test.mjs"
+    "test:windows": "node --test plugins/todo/scripts/windows-compat-test.mjs plugins/todo-claude/scripts/windows-compat-test.mjs",
+    "test:todo-claude": "node --test plugins/todo-claude/scripts/host-claim-test.mjs plugins/todo-claude/scripts/claude-executor-test.mjs plugins/todo-claude/scripts/routing-policy-test.mjs plugins/todo-claude/scripts/model-profiles-test.mjs plugins/todo-claude/scripts/single-branch-test.mjs plugins/todo-claude/scripts/runtime-safety-test.mjs plugins/todo-claude/scripts/task-status-test.mjs plugins/todo-claude/scripts/interactive-runtime-test.mjs plugins/todo-claude/scripts/dashboard-settings-test.mjs plugins/todo-claude/scripts/git-push-test.mjs && node plugins/todo-claude/scripts/preflight-test.mjs && node plugins/todo-claude/scripts/pipeline-test.mjs && node plugins/todo-claude/scripts/execution-stats-test.mjs && node plugins/todo-claude/scripts/usage-recovery-test.mjs && node plugins/todo-claude/scripts/runtime-update-test.mjs && node plugins/todo-claude/scripts/merge-queue-daemon-test.mjs && node plugins/todo-claude/scripts/git-worktree.mjs --self-check"
   }
 }

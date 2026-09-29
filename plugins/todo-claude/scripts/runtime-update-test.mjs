@@ -401,11 +401,11 @@ try {
     startedAt: previousStartedAt,
     heartbeatAt: previousStartedAt,
   });
-  const previousCodexHomeValue = process.env.CODEX_HOME;
-  process.env.CODEX_HOME = previousCodexHome;
+  const previousCodexHomeValue = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = previousCodexHome;
   const previousResult = ensureDaemon(repoRoot);
-  if (previousCodexHomeValue === undefined) delete process.env.CODEX_HOME;
-  else process.env.CODEX_HOME = previousCodexHomeValue;
+  if (previousCodexHomeValue === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+  else process.env.CLAUDE_CONFIG_DIR = previousCodexHomeValue;
   assert.equal(previousResult.status, "restart-pending");
   assert.equal(previousResult.runtimeUpdate.status, "stopping");
   assert.equal(existsSync(stopPath), true);
@@ -441,10 +441,10 @@ try {
     startedAt: wrongVersionStartedAt,
     heartbeatAt: wrongVersionStartedAt,
   });
-  process.env.CODEX_HOME = previousCodexHome;
+  process.env.CLAUDE_CONFIG_DIR = previousCodexHome;
   const wrongVersionResult = ensureDaemon(repoRoot);
-  if (previousCodexHomeValue === undefined) delete process.env.CODEX_HOME;
-  else process.env.CODEX_HOME = previousCodexHomeValue;
+  if (previousCodexHomeValue === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+  else process.env.CLAUDE_CONFIG_DIR = previousCodexHomeValue;
   assert.equal(wrongVersionResult.status, "conflict");
   assert.equal(processIsAlive(wrongVersion.pid), true);
   assert.equal(existsSync(stopPath), false);
@@ -480,10 +480,10 @@ try {
     `${racingTask}.lock`,
     `${JSON.stringify({ pid: racingChild.pid, host: HOST_ID })}\n`,
   );
-  process.env.CODEX_HOME = previousCodexHome;
+  process.env.CLAUDE_CONFIG_DIR = previousCodexHome;
   const racingResult = ensureDaemon(repoRoot);
-  if (previousCodexHomeValue === undefined) delete process.env.CODEX_HOME;
-  else process.env.CODEX_HOME = previousCodexHomeValue;
+  if (previousCodexHomeValue === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+  else process.env.CLAUDE_CONFIG_DIR = previousCodexHomeValue;
   assert.equal(racingResult.status, "restart-pending");
   assert.equal(racingResult.runtimeUpdate.status, "pending");
   assert.equal(processIsAlive(racingChild.pid), true);
