@@ -18,6 +18,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # Fall back to the origin on any proxy error, not only on 404/410.
+      GOPROXY: https://proxy.golang.org|direct
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -31,7 +34,18 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: plugins/ori/go.mod
-          cache: false
+          cache-dependency-path: plugins/ori/go.sum
+
+      - name: Download Go modules
+        working-directory: plugins/ori
+        shell: bash
+        run: |
+          # The module proxy occasionally resets streams; retry before the suite.
+          for attempt in 1 2 3; do
+            go mod download && exit 0
+            sleep $((attempt * 10))
+          done
+          exit 1
 
       - name: Validate Claude Code marketplace and plugins
         run: |

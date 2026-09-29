@@ -27,6 +27,20 @@ const replaceFile = (file, content) => {
   rmSync(file, { force: true });
   writeFileSync(file, content);
 };
+// A finished test must not fail because Windows still reports its fixture as in
+// use. Report which node/git processes remain instead; the runner discards temp.
+const removeFixture = (t, root) => {
+  try {
+    rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  } catch (error) {
+    if (process.platform !== "win32" || error.code !== "EBUSY") throw error;
+    const processes = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+      "Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'node.exe','git.exe' } | " +
+      "Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress"],
+    { encoding: "utf8", windowsHide: true, timeout: 20000 });
+    t.diagnostic(`fixture still in use: ${root}; node/git processes: ${String(processes.stdout).slice(0, 6000)}`);
+  }
+};
 const waitFor = async (check, message) => {
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
@@ -82,7 +96,7 @@ test("runtime validation follows imports with native path separators", () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("native daemon reuses its PID, polls authorized stop files and stops through packaged MCP", { timeout: 60000 }, async () => {
+test("native daemon reuses its PID, polls authorized stop files and stops through packaged MCP", { timeout: 60000 }, async (t) => {
   const root = mkdtempSync(path.join(os.tmpdir(), process.platform === "win32" ? "todo Windows тест " : "todo Windows "));
   let pid;
   const git = (...args) => {
@@ -99,6 +113,8 @@ test("native daemon reuses its PID, polls authorized stop files and stops throug
     git("init", "-b", "main");
     git("config", "user.name", "Test"); git("config", "user.email", "test@example.invalid");
     git("config", "core.autocrlf", "false");
+    // Detached background maintenance would keep the fixture directory in use.
+    git("config", "maintenance.auto", "false"); git("config", "gc.auto", "0");
     writeFileSync(path.join(root, "README.md"), "fixture\n");
     git("add", "."); git("commit", "-m", "fixture");
     initializeRepo(root);
@@ -139,7 +155,7 @@ test("native daemon reuses its PID, polls authorized stop files and stops throug
     assert.equal(readDaemonState(root), null);
   } finally {
     if (processIsAlive(pid)) { process.kill(pid, "SIGKILL"); await waitFor(() => !processIsAlive(pid), "cleanup"); }
-    rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    removeFixture(t, root);
   }
 });
 
