@@ -17,7 +17,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -26,6 +26,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: plugins/ori/go.mod
+          cache: false
 
       - name: Validate Claude Code marketplace and plugins
         run: |

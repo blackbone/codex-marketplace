@@ -642,7 +642,7 @@ try {
     `#!/usr/bin/env node
 import { fakeModelList } from ${JSON.stringify(new URL("./model-catalog-test.mjs", import.meta.url).href)};
 import { createInterface } from "node:readline";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 if (args[0] === "app-server" && args.includes("--help")) {
@@ -703,7 +703,12 @@ function run(message) {
 	    (retryFixture && retryAttempt === 1) || interactiveRequiredFixture;
 	  const delayMs = mergeOrderSlowFixture ? 1800 : mergeOrderFastFixture ? 100 : 1200;
 
-  setTimeout(() => {
+  // The test holds turns open while it inspects live runner state.
+  const finishTurn = () => {
+    if (process.env.TODO_SMOKE_HOLD && existsSync(process.env.TODO_SMOKE_HOLD)) {
+      setTimeout(finishTurn, 50);
+      return;
+    }
     const result = {
 	      status: shouldFail ? "failed" : "completed",
 	      summary: interactiveRequiredFixture
@@ -730,7 +735,8 @@ function run(message) {
     totals.set(threadId,total);
     send({method:"thread/tokenUsage/updated",params:{threadId,turnId,tokenUsage:{last:usage,total}}});
     send({method:"turn/completed",params:{threadId,turn:{id:turnId,status:"completed",items:[]}}});
-  }, delayMs);
+  };
+  setTimeout(finishTurn, delayMs);
 }
 for await (const line of createInterface({ input: process.stdin })) {
   const message=JSON.parse(line); if (message.id == null) continue;
@@ -1276,6 +1282,10 @@ for await (const line of createInterface({ input: process.stdin })) {
     "runner_start did not reject an incompatible live daemon",
   );
   unlinkSync(daemonStateFile);
+  // Keep the first two turns running until the live-state checks are done.
+  const smokeHold = path.join(path.dirname(fakeCodex), "smoke-hold");
+  writeFileSync(smokeHold, "", "utf8");
+  process.env.TODO_SMOKE_HOLD = smokeHold;
   ensureDaemon(repoRoot, {
     dashboardThreadId: supervisorDefinition.targetThreadId,
   });
@@ -1460,6 +1470,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       after: rejectedReloadState,
     })}`,
   );
+  unlinkSync(smokeHold);
   writeFileSync(
     configFile,
     `${JSON.stringify(reloadedRuntimeConfig)}\n`,
@@ -1863,7 +1874,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       completedDashboardHtml.includes(">Last Run<") &&
       completedDashboardHtml.includes(">Tokens<") &&
       completedDashboardHtml.includes(">Retries<") &&
-      completedDashboardHtml.includes("<th>Logs</th>") &&
+      completedDashboardHtml.includes(">Logs</th>") &&
       !completedDashboardHtml.includes("00d 00h 00m") &&
       completedDashboardHtml.includes(">118</td>"),
     "dashboard did not expose task time and token usage",

@@ -21,6 +21,12 @@ const repo = String.raw`C:\Users\Тест User\my project`;
 const daemon = String.raw`C:\Users\Тест User\.codex\plugins\cache\blackbone\todo\1\scripts\daemon.mjs`;
 const node = String.raw`C:\Program Files\nodejs\node.exe`;
 const command = `"${node}" "${daemon}" --repo "${repo}"`;
+// Git for Windows hides .git pointer files; Windows refuses to truncate a
+// hidden file in place, so replace it instead.
+const replaceFile = (file, content) => {
+  rmSync(file, { force: true });
+  writeFileSync(file, content);
+};
 const waitFor = async (check, message) => {
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
@@ -133,7 +139,7 @@ test("native daemon reuses its PID, polls authorized stop files and stops throug
     assert.equal(readDaemonState(root), null);
   } finally {
     if (processIsAlive(pid)) { process.kill(pid, "SIGKILL"); await waitFor(() => !processIsAlive(pid), "cleanup"); }
-    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });
 
@@ -167,7 +173,7 @@ test("polling shares the execution registry across Git directory layouts without
     git(main, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "fixture");
     git(main, "worktree", "add", "-b", "linked", linked);
     git(separate, "init", "--separate-git-dir", admin);
-    writeFileSync(path.join(separate, ".git"), `gitdir: ${path.relative(separate, admin)}\r\n`);
+    replaceFile(path.join(separate, ".git"), `gitdir: ${path.relative(separate, admin)}\r\n`);
     const common = realpathSync(path.join(main, ".git"));
     withRepositoryExecution(main, (state, save) => save({ ...state, marker: "shared" }));
     withRepositoryExecution(linked, state => assert.equal(state.marker, "shared"));
@@ -177,9 +183,9 @@ test("polling shares the execution registry across Git directory layouts without
     // Re-read the pointer each time; a moved/repaired worktree must not use a stale cache.
     const pointer = path.join(linked, ".git");
     const original = readFileSync(pointer, "utf8");
-    writeFileSync(pointer, "malformed\n");
+    replaceFile(pointer, "malformed\n");
     assert.throws(() => withRepositoryExecution(linked, () => assert.fail("invalid pointer accepted")), /Invalid Git directory pointer/);
-    writeFileSync(pointer, original);
+    replaceFile(pointer, original);
     withRepositoryExecution(linked, state => assert.equal(state.marker, "shared"));
   } finally { rmSync(root, { recursive: true, force: true, maxRetries: 10 }); }
 });
