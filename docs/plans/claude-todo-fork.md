@@ -137,8 +137,8 @@ plugins/todo-claude/               Claude-форк
 | `expert` | gpt-6-astra, xhigh | `claude-fable-5-1`, xhigh |
 | `ultra` | gpt-6-astra, max | `claude-fable-5-1`, max |
 
-Haiku 4.5 не поддерживает effort, поэтому `mini` и `fast` совпадают по модели. Если нужно различие, `fast` можно перевести на
-`claude-sonnet-5-5`, low. Флаг effort в `claude -p` проверить при реализации.
+Haiku 4.5 не поддерживает effort: `mini` и `fast` осознанно остаются на одной модели (решение согласовано), effort для них
+не передаётся. Флаг effort в `claude -p` проверить при реализации.
 
 - **Поле `metadata.codexThread`** в задаче не переименовывается (общий формат состояния). Добавляется `host`, по нему определяется, чей это поток.
 - **Конфиг моделей:** блок `models` в `.todo/config.json` становится хост-зависимым: `models.codex` и `models.claude`.
