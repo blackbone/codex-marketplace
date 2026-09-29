@@ -78,6 +78,16 @@ test("Windows inspection uses bounded hidden CIM and fails closed on inaccessibl
     { status: 0, stdout: JSON.stringify({ startedAt, command: null }) },
     { status: 0, stdout: JSON.stringify({ startedAt: "invalid", command }) },
   ]) assert.equal(inspectProcess(123, { platform: "win32", run: () => response }), null);
+  const timeouts = [];
+  assert.deepEqual(inspectProcess(123, { platform: "win32", run(exe, args, options) {
+    timeouts.push(options.timeout);
+    return timeouts.length === 1 ? { status: null, signal: "SIGTERM", error: new Error("spawnSync powershell.exe ETIMEDOUT") }
+      : { status: 0, stdout: JSON.stringify({ startedAt, command }) };
+  } }), { startedAt: Date.parse(startedAt), command });
+  assert.deepEqual(timeouts, [5000, 15000], "a timed-out query is retried once with a longer bound");
+  let missingQueries = 0;
+  assert.equal(inspectProcess(123, { platform: "win32", run: () => { missingQueries += 1; return { status: 1 }; } }), null);
+  assert.equal(missingQueries, 1, "a missing process is not retried");
   assert.equal(inspectProcess("123; exit", { platform: "win32", run: () => assert.fail("must not run") }), null);
   // Sending SIGTERM to ourselves would kill this test if Windows took the Unix branch.
   signalDaemon(process.pid, "SIGTERM", "win32");

@@ -66,9 +66,13 @@ export function inspectProcess(pid, { platform = process.platform, run = spawnSy
       "if ($null -eq $p) { exit 1 }",
       "@{ startedAt = $p.CreationDate.ToUniversalTime().ToString('o'); command = $p.CommandLine } | ConvertTo-Json -Compress",
     ].join("; ");
-    const result = run("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
-      encoding: "utf8", windowsHide: true, timeout: 5000,
+    const query = timeout => run("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+      encoding: "utf8", windowsHide: true, timeout,
     });
+    let result = query(5000);
+    // A busy machine can exceed the first bound; retry a timeout once. A missing
+    // or inaccessible process still fails closed immediately.
+    if (result.error || (result.status === null && result.signal)) result = query(15000);
     if (result.status !== 0 || result.error) return null;
     try {
       const value = JSON.parse(result.stdout.replace(/^\uFEFF/, ""));
