@@ -237,7 +237,7 @@ repair:
   const file = spawnSync("git", ["show", `${receipt.git.branch}:piped.txt`], { cwd: root, encoding: "utf8" });
   assert.equal(file.status, 0, file.stderr);
   const step = calls().find((call) => call.args.includes("--json-schema"));
-  assert.equal(step.args[step.args.indexOf("--model") + 1], "claude-haiku-4-5");
-  assert.equal(step.args.includes("--effort"), false, "Haiku has no effort control");
+  assert.equal(step.args[step.args.indexOf("--model") + 1], "claude-sonnet-5-5");
+  assert.equal(step.args[step.args.indexOf("--effort") + 1], "medium");
   daemon.kill("SIGTERM");
 });

@@ -136,14 +136,18 @@ Built-in profiles keep the Codex names and task roles:
 
 | Profile | Model | Effort |
 | --- | --- | --- |
-| `mini` | `claude-haiku-4-5` | not configurable |
-| `fast` | `claude-haiku-4-5` | not configurable |
-| `standard` | `claude-sonnet-5-5` | low |
-| `medium` | `claude-sonnet-5-5` | medium |
-| `proven` | `claude-sonnet-5-5` | high |
-| `advanced` | `claude-opus-5-5` | max |
-| `expert` (default) | `claude-fable-5-1` | xhigh |
-| `ultra` | `claude-fable-5-1` | max |
+| `mini` | `claude-sonnet-5-5` | low |
+| `fast` | `claude-sonnet-5-5` | medium |
+| `standard` | `claude-sonnet-5-5` | high |
+| `medium` | `claude-sonnet-5-5` | xhigh |
+| `proven` | `claude-opus-5-5` | medium |
+| `advanced` | `claude-opus-5-5` | high |
+| `expert` (default) | `claude-opus-5-5` | xhigh |
+| `ultra` | `claude-opus-5-5` | max |
+
+Built-ins use only Sonnet and Opus. Haiku and Fable stay in the executor
+catalog for custom profiles; saved former Haiku and Fable built-ins are offered
+for migration by `model_profiles`.
 
 Profile updates only recommend built-ins at their declared supported effort;
 unavailable tiers are not silently downgraded.

@@ -1,5 +1,14 @@
 # Changelog
 
+## Sonnet and Opus profiles
+
+- Built-in profiles use only Claude Sonnet 5.5 (`mini` low, `fast` medium,
+  `standard` high, `medium` xhigh) and Opus 5.5 (`proven` medium, `advanced`
+  high, `expert` xhigh, `ultra` max). Haiku and Fable remain selectable for
+  custom profiles.
+- `model_profiles` recognizes saved former Claude built-ins and offers their
+  Sonnet and Opus replacements instead of keeping Haiku or Fable.
+
 ## Model effort availability
 
 - Match the Codex fork's profile update guard: do not recommend a built-in

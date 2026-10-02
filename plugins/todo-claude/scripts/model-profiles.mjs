@@ -5,9 +5,20 @@ import { AppServerClient } from "./app-server-client.mjs";
 import { hostModels, withHostModels } from "./host.mjs";
 
 // Task roles, not a benchmark ranking. Keep profile names identical to the
-// Codex fork; only the models differ. Haiku 4.5 has no effort control, so mini
-// and fast share one model.
+// Codex fork; only the models differ. Built-ins use only Sonnet and Opus:
+// Sonnet efforts cover routine work, Opus efforts cover the heavy tiers.
 export const DEFAULT_MODEL_PROFILES = [
+  { name: "mini", model: "claude-sonnet-5-5", reasoningEffort: "low", description: "Small, mechanical edits and simple bounded fixes." },
+  { name: "fast", model: "claude-sonnet-5-5", reasoningEffort: "medium", description: "Mechanical edits, straightforward fixes, and cost-sensitive routine work." },
+  { name: "standard", model: "claude-sonnet-5-5", reasoningEffort: "high", description: "Straightforward everyday implementation with clear requirements." },
+  { name: "medium", model: "claude-sonnet-5-5", reasoningEffort: "xhigh", description: "Bounded implementation across several files; balanced everyday coding." },
+  { name: "proven", model: "claude-opus-5-5", reasoningEffort: "medium", description: "Multi-step engineering and debugging with moderate reasoning." },
+  { name: "advanced", model: "claude-opus-5-5", reasoningEffort: "high", description: "Deep debugging and substantial refactoring with high reasoning." },
+  { name: "expert", model: "claude-opus-5-5", reasoningEffort: "xhigh", description: "Complex implementation work with extra-high reasoning." },
+  { name: "ultra", model: "claude-opus-5-5", reasoningEffort: "max", description: "Very complex, high-risk, cross-cutting work with maximum reasoning." },
+];
+// Recognize exact previous defaults without overwriting intentional custom efforts or descriptions.
+const previousBuiltinProfiles = [
   { name: "mini", model: "claude-haiku-4-5", reasoningEffort: "low", description: "Small, mechanical edits and simple bounded fixes." },
   { name: "fast", model: "claude-haiku-4-5", reasoningEffort: "medium", description: "Mechanical edits, straightforward fixes, and cost-sensitive routine work." },
   { name: "standard", model: "claude-sonnet-5-5", reasoningEffort: "low", description: "Straightforward everyday implementation with clear requirements." },
@@ -17,8 +28,6 @@ export const DEFAULT_MODEL_PROFILES = [
   { name: "expert", model: "claude-fable-5-1", reasoningEffort: "xhigh", description: "Most capable model for complex implementation work." },
   { name: "ultra", model: "claude-fable-5-1", reasoningEffort: "max", description: "Most capable model for very complex, high-risk, cross-cutting work." },
 ];
-// No earlier Claude defaults exist yet; list former built-ins here when they change.
-const previousBuiltinProfiles = [];
 const excludedModel = () => false;
 const legacyBuiltinModels = {};
 const legacyGeneration = () => false;
