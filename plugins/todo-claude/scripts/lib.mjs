@@ -2696,10 +2696,36 @@ export function writeHistory(repoRoot, id, value) {
   });
 }
 
+// Closed tasks keep their dependency list so history can show the task graph.
+// Records closed before this field existed fall back to the task body's
+// "## Dependencies" section, which lists blocker ids one per line.
+function historicalBlockers(record) {
+  if (Array.isArray(record.blockers)) return record.blockers;
+  const section = /^## Dependencies\s*\n([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(
+    typeof record.taskBody === "string" ? record.taskBody : "",
+  );
+  if (!section) return [];
+  return [
+    ...new Set(
+      section[1]
+        .split("\n")
+        .map((line) => line.replace(/^[-*]\s*/, "").replace(/`/g, "").trim())
+        .map(taskIdFromFilename)
+        .filter((id) => TASK_NAME_PATTERN.test(`${id}.md`)),
+    ),
+  ];
+}
+
+function closedRecord(repoRoot, record, recoverUsage) {
+  const withBlockers = { ...record, blockers: historicalBlockers(record) };
+  return recoverUsage
+    ? { ...withBlockers, metrics: recoveredTaskMetrics(repoRoot, record.id, record.metrics) }
+    : withBlockers;
+}
+
 function closedTaskStatus(repoRoot, id, recoverUsage = true) {
   try {
-    const record = readJson(existingHistoryPath(repoRoot, id));
-    return recoverUsage ? { ...record, metrics: recoveredTaskMetrics(repoRoot, record.id, record.metrics) } : record;
+    return closedRecord(repoRoot, readJson(existingHistoryPath(repoRoot, id)), recoverUsage);
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
     return { id: String(id), status: "unknown" };
@@ -2834,8 +2860,7 @@ export function listTaskStatuses(
   const closed = selectedClosedNames
     .map((name) => {
       try {
-        const record = readJson(path.join(historyDir, name));
-        return recoverUsage ? { ...record, metrics: recoveredTaskMetrics(repoRoot, record.id, record.metrics) } : record;
+        return closedRecord(repoRoot, readJson(path.join(historyDir, name)), recoverUsage);
       } catch {
         return null;
       }
@@ -3794,7 +3819,7 @@ export function reopenTask(repoRoot, id) {
     body: receipt.taskBody,
     metadata: {
       version: 1,
-      blockers: [],
+      blockers: historicalBlockers(receipt).map(taskFilenameFromId),
       error: null,
       execution: receipt.execution,
       ...(receipt.pipeline ? { pipeline: receipt.pipeline } : {}),
@@ -4274,6 +4299,7 @@ export async function cancelTask(repoRoot, id) {
     writeHistory(repoRoot, task.id, {
       title: titleFromBody(task.body, task.id),
       status: "canceled",
+      blockers: task.metadata.blockers.map(taskIdFromFilename),
       closedAt: new Date().toISOString(),
       execution: storedTaskExecution(repoRoot, task),
       codexThread,
@@ -4556,6 +4582,7 @@ export function completeTask(repoRoot, taskPath, result, metrics = null) {
   writeHistory(repoRoot, task.id, {
     title: titleFromBody(task.body, task.id),
     status: "completed",
+    blockers: task.metadata.blockers.map(taskIdFromFilename),
     closedAt: metrics?.completedAt || new Date().toISOString(),
     execution: storedTaskExecution(repoRoot, task),
     codexThread: task.metadata.codexThread || null,

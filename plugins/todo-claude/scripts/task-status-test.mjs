@@ -5,7 +5,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import test from "node:test";
-import { initializeRepo, createTask, completeTask, getTaskStatus } from "./lib.mjs";
+import { initializeRepo, createTask, completeTask, getTaskStatus, listTaskStatuses } from "./lib.mjs";
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "todo-status-race-"));
@@ -82,4 +82,26 @@ test("non-ENOENT stat failures are not hidden by history fallback", t => {
   assert.throws(() => interceptTaskRead(t, "statSync", task.path, () => {
     throw Object.assign(new Error("access denied"), { code: "EACCES" });
   }, () => getTaskStatus(root, task.id)), { code: "EACCES" });
+});
+
+test("closed tasks keep their dependency list for history", t => {
+  const { root, task: first } = fixture(t);
+  const second = createTask(root, { title: "Dependent", description: "Needs the first.", blockers: [first.id] });
+  completeTask(root, first.path, { summary: "done", validation: [] });
+  assert.deepEqual(getTaskStatus(root, second.id).blockers, [first.id]);
+  assert.deepEqual(getTaskStatus(root, second.id).existingBlockers, []);
+  completeTask(root, second.path, { summary: "done", validation: [] });
+  assert.deepEqual(getTaskStatus(root, second.id).blockers, [first.id]);
+  assert.deepEqual(listTaskStatuses(root, { includeClosed: true }).find(item => item.id === second.id).blockers, [first.id]);
+});
+
+test("history closed before blockers were recorded falls back to the Dependencies section", t => {
+  const { root, task } = fixture(t);
+  const record = path.join(root, ".todo", "history", `${task.id}.json`);
+  completeTask(root, task.path, { summary: "done", validation: [] });
+  const legacy = JSON.parse(fs.readFileSync(record, "utf8"));
+  delete legacy.blockers;
+  legacy.taskBody = "# T\n\n## Dependencies\n\n001-a\n- 002-b.md\n\n## Done when\n\n- x\n";
+  fs.writeFileSync(record, JSON.stringify(legacy));
+  assert.deepEqual(getTaskStatus(root, task.id).blockers, ["001-a", "002-b"]);
 });

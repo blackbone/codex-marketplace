@@ -13,6 +13,7 @@ import { commandDaemonPath, inspectProcess, signalDaemon } from "./daemon-proces
 import { ensureDaemon, verifyDaemonProcess } from "./ensure-daemon.mjs";
 import { atomicWriteJson, daemonStopRequestPath, processIsAlive, readDaemonState,
   initializeRepo, createTask } from "./lib.mjs";
+import { seedCliModels } from "./test-cli-models.mjs";
 import { withRepositoryExecution } from "./single-branch.mjs";
 import { runtimeDescriptor, requestDaemonRestart } from "./runtime-update.mjs";
 
@@ -131,6 +132,7 @@ test("native daemon reuses its PID, polls authorized stop files and stops throug
     const configPath = path.join(root, ".todo", "config.json");
     const config = JSON.parse(readFileSync(configPath, "utf8"));
     atomicWriteJson(configPath, { ...config, git: { ...config.git, targetBranch: "main" }, pollIntervalMs: 60000, dashboardPort: 0 });
+    seedCliModels(root);
     let state = start();
     assert.equal(verifyDaemonProcess(root, state).ok, true);
     assert.equal(ensureDaemon(root).daemon.pid, pid);
@@ -229,6 +231,7 @@ test("real daemon polls tasks, claims and config without creating child processe
     const configFile = path.join(root, ".todo", "config.json");
     const config = JSON.parse(readFileSync(configFile, "utf8"));
     atomicWriteJson(configFile, { ...config, pollIntervalMs: 250, configReloadIntervalMs: 1000, dashboardPort: 0 });
+    seedCliModels(root);
     const task = createTask(root, { title: "Waiting for interactive work", description: "Polling fixture", runMode: "interactive" });
     const audit = path.join(root, ".todo", "audit.mjs");
     const marker = path.join(root, ".todo", "audit-enabled"), trace = path.join(root, ".todo", "children.jsonl");

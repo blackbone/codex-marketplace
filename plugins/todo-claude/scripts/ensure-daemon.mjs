@@ -42,6 +42,7 @@ import {
 } from "./runtime-update.mjs";
 
 import { commandDaemonPath, inspectProcess, signalDaemon } from "./daemon-process.mjs";
+import { cliModelsSync, formatProfileProblems, profileProblems } from "./claude-models.mjs";
 import { HOST_MANIFEST, HOST_MISMATCH } from "./host.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -636,6 +637,17 @@ export function ensureDaemon(
         status: "start-blocked",
         reason: config.readError || "current plugin runtime is incomplete",
         missing: targetRuntime.missing,
+        addedExcludes,
+      };
+    }
+    // Every model profile must name a model from the Claude CLI model list.
+    const problems = profileProblems(config.modelProfiles, config.defaultModelProfile,
+      cliModelsSync(repoRoot, config.codexCommand) || { models: [], error: "the Claude CLI did not report its models" });
+    if (problems.length) {
+      return {
+        status: "start-blocked",
+        reason: `Model profiles need attention before the runner can start:\n${formatProfileProblems(problems)}\nFix them in the ToDo dashboard Settings → Model profiles (/todo-dashboard), then start the runner again.`,
+        profileProblems: problems,
         addedExcludes,
       };
     }

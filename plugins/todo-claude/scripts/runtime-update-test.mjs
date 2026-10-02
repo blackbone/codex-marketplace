@@ -36,6 +36,7 @@ import {
   readDaemonRestartRequest,
   runtimeDescriptor,
 } from "./runtime-update.mjs";
+import { seedCliModels } from "./test-cli-models.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(scriptDir, "..");
@@ -202,6 +203,7 @@ try {
     '{"gitExclude":[]}\n',
   );
   assert.equal(spawnSync("git", ["init", "-q", repoRoot]).status, 0);
+  seedCliModels(repoRoot);
   const statePath = daemonStatePath(repoRoot);
   const restartPath = daemonRestartRequestPath(repoRoot);
   const stopPath = daemonStopRequestPath(repoRoot);
@@ -547,6 +549,7 @@ try {
     '{"gitExclude":[]}\n',
   );
   assert.equal(spawnSync("git", ["init", "-q", brokenRepo]).status, 0);
+  seedCliModels(brokenRepo);
   const { ensureDaemon: ensureBrokenDaemon } = await import(
     `${pathToFileURL(path.join(brokenPlugin, "scripts", "ensure-daemon.mjs"))}?test=${Date.now()}`
   );

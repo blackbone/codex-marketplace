@@ -77,6 +77,53 @@ Ponytail full contour, so project mutations are routed through ToDo even when
 ToDo is not mentioned. The contour arrives through a second hook entry because
 Claude Code caps each injected context at 10,000 characters.
 
+### Dashboard in Claude Code
+
+The plugin ships a Claude Code mod (`mod/register.tsx`) that draws the
+dashboard natively, in the terminal and in the desktop Code tab. Open it with
+`/todo-dashboard`, or from the band above the prompt: it always shows a
+colored count per task state (running, waiting, failed, queued, blocked,
+merging) beside a button with the state's colored circle that opens the table
+filtered to that state, and **ToDo** opens it unfiltered. The pane has the web dashboard's
+task table and columns, the task graph, one window per task (ⓘ in the
+table, **Details** in the graph) with Overview, Chat and Logs tabs, header sorting, the same filter syntax
+(`status:failed|blocked profile:advanced text`) with status and profile chips,
+task files, chat with reply, steer and continue, task and runner logs, and the
+settings form. The desktop also draws status tiles, a progress bar and worker
+lanes. The status line carries a task summary, and toasts report tasks that
+fail, wait for input, or complete.
+
+**Graph** (desktop only; the terminal has no Graph button) draws the
+dependency graph: arrows run from a blocker to the task that waited for it,
+columns follow dependency depth, colors follow status. It shows the active tasks
+with everything they depend on, the whole history, or one task's ancestors and
+dependents (**Focus**), as a pipeline view of task cards. It opens at 100%
+centered on running work (else a task waiting for input, else a failed one).
+Pan and zoom with the buttons above it (arrows, − / +, Fit, Center, 100%). The drawing
+is a script-less image, so it takes no mouse drags, wheel zoom or clicks: the 🔍
+button beside each task in the table opens the graph centered on that task, and
+**Details** opens the selected task's window.
+
+Hovering a card lights it, its dependencies and the tasks they reach in their
+status colors and fades the rest; hovering an arrow lights it and its two cards.
+Running tasks glow blue slowly, failed ones red quickly, tasks waiting for input
+amber. The graph redraws only when a task's status, title or dependencies
+change, not while a running task's duration or tokens grow, so hover highlights
+stay.
+
+The table and the graph fill the pane's height. The surface reports its size
+only in cells, so on the desktop **Taller** / **Shorter** tune the fit; the
+setting is kept across sessions.
+
+Closed tasks keep their dependencies in `.todo/history`; records written before
+dependencies were kept fall back to the `## Dependencies` section of the task
+body, so older history may lack edges.
+
+The mod polls `scripts/mod-api.mjs` every three seconds. Reads and settings
+saves work without a runner; task input goes through the running dashboard and
+keeps its same-origin checks. Mods are not sandboxed: the mod runs with Claude
+Code's own access, like the plugin's hooks.
+
 ### Background workers
 
 Each background attempt is one `claude -p` process in stream-json mode, started
@@ -144,6 +191,24 @@ Built-in profiles keep the Codex names and task roles:
 | `advanced` | `claude-opus-5-5` | high |
 | `expert` (default) | `claude-opus-5-5` | xhigh |
 | `ultra` | `claude-opus-5-5` | max |
+
+Profiles are edited in the dashboard settings, both in the Claude Code pane
+(`/todo-dashboard` → Settings) and in the web dashboard: add, rename, remove
+(not while open tasks use the profile), and choose each profile's model,
+effort, and description. Saving writes `models.claude`; until then the
+built-ins below apply.
+
+Profile models come from the Claude CLI model list: the models the CLI
+reports to an SDK `initialize` request (what `/model` offers), with each
+model's effort levels. Reading it makes no model request; it is cached in
+`.todo/claude-models.json` for an hour. A profile may name a model id, an
+alias such as `opus`, or a dated id's base (`claude-haiku-4-5`). The settings
+refuse a model outside the list or an effort the model does not support, and
+while any profile is invalid `runner_start` and the dashboard **Start runner**
+button return `start-blocked` with the problems; the runner does not start until
+the profiles are fixed in settings. The list says which models the CLI knows,
+not which the account may use: a listed model that needs usage credits still
+fails at the first task attempt.
 
 Built-ins use only Sonnet and Opus. Haiku and Fable stay in the executor
 catalog for custom profiles; saved former Haiku and Fable built-ins are offered

@@ -1,7 +1,7 @@
 {
   "name": "todo",
   "displayName": "ToDo",
-  "version": "0.1.0+claude.20261001145310",
+  "version": "0.1.0+claude.20261002190037",
   "description": "Atomic repository task routing with optional YAML execution pipelines, persistent threads, deterministic gates, and telemetry.",
   "author": {
     "name": "blackbone"
@@ -16,5 +16,6 @@
     "git",
     "worktrees",
     "dashboard"
-  ]
+  ],
+  "types": "./mod/types/index.d.ts"
 }

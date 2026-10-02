@@ -24,6 +24,7 @@ import {
   threadIsForeign,
   withHostModels,
 } from "./host.mjs";
+import { seedCliModels } from "./test-cli-models.mjs";
 
 // Identical in every fork: the other host is derived from HOST_ID.
 const FOREIGN = HOST_ID === "codex" ? "claude" : "codex";
@@ -38,6 +39,7 @@ function fixture(t) {
     assert.equal(spawnSync("git", args, { cwd: root }).status, 0);
   }
   initializeRepo(root);
+  seedCliModels(root);
   return root;
 }
 

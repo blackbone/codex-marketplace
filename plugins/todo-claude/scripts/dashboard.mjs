@@ -1,6 +1,8 @@
 import { readSettings, saveSettings, SETTINGS_SCRIPT, SETTINGS_STYLE, SETTINGS_HTML } from "./dashboard-settings.mjs";
+import { GRAPH_SCRIPT, GRAPH_STYLE, GRAPH_HTML } from "./dashboard-graph.mjs";
 import { readLogPreview } from "./bounded-log.mjs";
 import { readTaskChat } from "./task-chat.mjs";
+import { cliModels } from "./claude-models.mjs";
 import { createServer } from "node:http";
 import {
   existsSync,
@@ -122,7 +124,7 @@ function taskAttemptDirectory(repoRoot, taskId, attempt) {
   return attemptRoot;
 }
 
-function taskLogInventory(repoRoot, selectedTask = null) {
+export function taskLogInventory(repoRoot, selectedTask = null) {
   if (selectedTask !== null && !TASK_LOG_ID_PATTERN.test(selectedTask)) {
     throw new Error("Invalid task log ID");
   }
@@ -284,7 +286,7 @@ function readableExecutionTranscript(attemptRoot) {
   return `${sections.join("\n\n")}\n`;
 }
 
-function readDashboardLog(repoRoot, query) {
+export function readDashboardLog(repoRoot, query) {
   const scope = query.get("scope");
   if (scope === "runner") {
     const runnerPath = path.join(todoDir(repoRoot), "runner.log");
@@ -357,7 +359,7 @@ function blockerLinks(task, tasks) {
     .join(", ");
 }
 
-function compactDuration(durationMs) {
+export function compactDuration(durationMs) {
   const totalSeconds = Math.max(0, Math.round((Number(durationMs) || 0) / 1000));
   const units = [
     ["d", Math.floor(totalSeconds / 86400)],
@@ -371,7 +373,7 @@ function compactDuration(durationMs) {
   return visible.length > 0 ? visible.join(" ") : "0s";
 }
 
-function tokenUsageView(task) {
+export function tokenUsageView(task) {
   const usage = task.metrics?.tokenUsage || {};
   const coverage = usage.available === true
     ? usage.coverage === "full" ? "full" : "partial"
@@ -398,7 +400,7 @@ function tokenUsageView(task) {
   };
 }
 
-function retryStatsView(task) {
+export function retryStatsView(task) {
   const stats = task.retryStats || task.attemptLedger?.retryStats || {};
   const number = (value) => Math.max(0, Number(value) || 0);
   const model = number(stats.modelRetries);
@@ -543,7 +545,7 @@ function filterTasks(tasks, query) {
   });
 }
 
-function dashboardTaskMarkdown(repoRoot, taskId) {
+export function dashboardTaskMarkdown(repoRoot, taskId) {
   if (!TASK_LOG_ID_PATTERN.test(taskId || "")) return null;
   const task = listTaskStatuses(repoRoot).find((item) => item.id === taskId);
   if (!task?.path || !regularFile(task.path) || path.extname(task.path) !== ".md") {
@@ -1676,7 +1678,7 @@ function sortLink(field, label, currentField, currentDirection, query = "") {
   return `<a href="/?${escapeHtml(params.toString())}" data-sort="${field}" data-label="${escapeHtml(label)}">${escapeHtml(label)}${marker}</a>`;
 }
 
-function statusPayload(repoRoot) {
+export function statusPayload(repoRoot) {
   const now = Date.now();
   const config = loadConfig(repoRoot);
   const tasks = listTaskStatuses(repoRoot, {
@@ -1780,6 +1782,7 @@ function renderDashboard(repoRoot, requestUrl) {
   <title>ToDo — ${escapeHtml(path.basename(repoRoot))}</title>
   <style>
     ${SETTINGS_STYLE}
+    ${GRAPH_STYLE}
     :root { color-scheme: light dark; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     body { margin: 20px; font-size: 13px; }
     h1 { margin: 0; font-size: 20px; }
@@ -1857,7 +1860,7 @@ function renderDashboard(repoRoot, requestUrl) {
 <body>
   <div class="heading">
     <h1>ToDo — ${escapeHtml(path.basename(repoRoot))}</h1>
-    <div><button type="button" id="settings-open">Settings</button> <button type="button" data-log-all>All logs</button></div>
+    <div><button type="button" id="graph-open">Graph</button> <button type="button" id="settings-open">Settings</button> <button type="button" data-log-all>All logs</button></div>
   </div>
   <p class="summary">${tasks.length}${tasks.length === payload.tasks.length ? "" : ` of ${payload.tasks.length}`} tasks · ${taskCounts.running || 0} running · ${taskCounts.queued || 0} queued/blocked · ${taskCounts.failed || 0} failed · ${payload.tasks.filter(task => task.status === "waiting-input").length} waiting · merge ${escapeHtml(payload.runner?.mergeWorker?.status || "offline")} · ${escapeHtml(payload.runner?.implementation || "unknown runner")} ${escapeHtml(payload.runner?.pluginVersion || "")} · runtime ${escapeHtml(payload.runner?.runtimeState || "offline")} · config ${escapeHtml(Math.round((payload.config.configReloadIntervalMs || 5000) / 1000))}s · live 1s</p>
   <div class="filters" role="search">
@@ -1890,6 +1893,7 @@ function renderDashboard(repoRoot, requestUrl) {
     <tbody>${rows || '<tr data-empty-state><td colspan="16">No tasks</td></tr>'}</tbody>
   </table></div>
   ${SETTINGS_HTML}
+  ${GRAPH_HTML}
   <dialog id="input-dialog" aria-labelledby="input-title">
     <div class="chat-header"><h2 id="input-title">Task chat</h2><span id="input-state"></span><span id="chat-status" role="status"></span></div>
     <div id="chat-content" tabindex="0" aria-label="Execution messages"></div>
@@ -1966,6 +1970,28 @@ function persistDashboardPort(repoRoot, threadId, port) {
 function createDashboardServer(repoRoot, port, onTaskAction) {
   const server = createServer(async (request, response) => {
     try {
+      if (request.url === "/api/models") {
+        const host = `${DASHBOARD_HOST}:${server.address().port}`;
+        if (request.method !== "POST" || request.headers.host !== host || request.headers.origin !== `http://${host}` ||
+            request.headers["x-todo-action"] !== "1" || !request.headers["content-type"]?.startsWith("application/json")) {
+          response.writeHead(403); response.end("Same-origin model list request required"); return;
+        }
+        let body = "";
+        for await (const chunk of request) {
+          body += chunk;
+          if (Buffer.byteLength(body) > 32768) { response.writeHead(413); response.end("Input too large"); return; }
+        }
+        try {
+          const input = JSON.parse(body);
+          const catalog = await cliModels(repoRoot, loadConfig(repoRoot).codexCommand, { force: input.force === true });
+          response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          response.end(JSON.stringify(catalog));
+        } catch (error) {
+          response.writeHead(409, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          response.end(JSON.stringify({ error: error.message }));
+        }
+        return;
+      }
       if (request.url === "/api/settings") {
         const host = `${DASHBOARD_HOST}:${server.address().port}`;
         if (request.headers.host !== host || (request.method === "POST" &&
@@ -1984,7 +2010,7 @@ function createDashboardServer(repoRoot, port, onTaskAction) {
               body += chunk;
               if (Buffer.byteLength(body) > 32768) { response.writeHead(413); response.end("Input too large"); return; }
             }
-            result = saveSettings(repoRoot, JSON.parse(body));
+            result = await saveSettings(repoRoot, JSON.parse(body));
           } else result = readSettings(repoRoot);
           response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
           response.end(JSON.stringify(result));
@@ -2111,7 +2137,7 @@ function createDashboardServer(repoRoot, port, onTaskAction) {
           "Content-Type": "text/javascript; charset=utf-8",
           "Cache-Control": "no-store",
         });
-        response.end(`${DASHBOARD_SCRIPT}\n${SETTINGS_SCRIPT}\n`);
+        response.end(`${DASHBOARD_SCRIPT}\n${SETTINGS_SCRIPT}\n${GRAPH_SCRIPT}\n`);
         return;
       }
       if (requestUrl.pathname !== "/") {
